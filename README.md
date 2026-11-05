@@ -81,7 +81,8 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
   until the next `dotnet build` recompiles it.
 - **Platforms:** Linux only so far. The client uses a Unix socket and `setsid`.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
-  by a real solution. Razor, NUnit and MSTest in the warm host, and large graphs are untested.
+  by a real solution. NUnit and MSTest are covered by the fixture check through `dotnet test`; Razor,
+  NUnit and MSTest in the warm host, and large graphs are untested.
 - **Memory:** the daemon holds a few GB (about 2.3 GB for jellyfin).
 
 ## Layout

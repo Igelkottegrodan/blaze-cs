@@ -36,7 +36,10 @@ string[] lib = ["Lib (net10.0)", "Lib (net8.0)"], consumer = ["Consumer (net10.0
         () => Replace("Lib/Greeter.cs", "    public static int Twice",
             "    public static string Farewell(string name) => \"Bye, \" + name;\n\n    public static int Twice"),
         [.. consumer, .. lib], "build"),
-    ("test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
+    // A test run must also show each rebuilt test project's tests passing (RanTests).
+    ("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
+    ("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
+    ("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
 ];
 
 if (Directory.Exists(work))
@@ -54,6 +57,8 @@ try
         var rebuilt = Rebuilt(output);
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
+        if (command == "test")
+            RanTests(name, output, expected);
         Verify(name, rebuilt);
     }
     passed = true;
@@ -92,6 +97,19 @@ HashSet<string> Rebuilt(string output)
     if (!match.Success)
         Fail($"no rebuilt line in blaze-cs output:\n{output}");
     return [.. match.Groups[1].Value.Split(", ")];
+}
+
+// The test projects a run reports, from their summary lines ("Passed!  - Failed: 0, Passed: 2, ... - Tests.dll",
+// printed alike by the warm host and dotnet test): exactly the expected ones, once each, with both tests passed.
+void RanTests(string name, string output, string[] expected)
+{
+    var summaries = Regex.Matches(output, @"^\s*(?:Passed|Failed)!\s+- Failed:\s+(\d+), Passed:\s+(\d+), .* - (\S+)\.dll\b", RegexOptions.Multiline)
+        .Select(m => (Project: m.Groups[3].Value, Failed: int.Parse(m.Groups[1].Value), Passed: int.Parse(m.Groups[2].Value)))
+        .ToList();
+    if (!summaries.Select(s => s.Project).Order().SequenceEqual(expected.Order()))
+        Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Select(s => s.Project).Order())}:\n{output}");
+    if (summaries.FirstOrDefault(s => s is not { Failed: 0, Passed: 2 }) is { Project: not null } wrong)
+        Fail($"{name}: {wrong.Project}: expected 2 tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
 }
 
 // Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources.

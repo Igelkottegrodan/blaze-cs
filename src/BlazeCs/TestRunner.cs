@@ -131,8 +131,9 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var references = unit.References.Select(r => Path.GetFileName(r.Reference)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (references.Contains("xunit.v3.core.dll"))
             return "xunit3";
+        // MSTest's framework assembly is MSTest.TestFramework.dll from v4 on, and the longer name before.
         if (references.Contains("xunit.core.dll") || references.Contains("nunit.framework.dll")
-            || references.Contains("Microsoft.VisualStudio.TestPlatform.TestFramework.dll"))
+            || references.Contains("MSTest.TestFramework.dll") || references.Contains("Microsoft.VisualStudio.TestPlatform.TestFramework.dll"))
             return "vstest";
         return null;
     }
