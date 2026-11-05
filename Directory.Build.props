@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- The CLI starts the test host from its own directory, so both land in one place. -->
+    <OutDir>$(MSBuildThisFileDirectory)artifacts/bin/</OutDir>
+  </PropertyGroup>
+</Project>

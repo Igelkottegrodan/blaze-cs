@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>blaze-cs-testhost</AssemblyName>
+    <RootNamespace>BlazeCs.TestHost</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Test projects often need ASP.NET Core; the shared framework must be in the host's
+         default load context because collectible contexts cannot load it. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+</Project>

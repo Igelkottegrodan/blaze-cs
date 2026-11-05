@@ -1,0 +1,174 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "dotnet-sdk_10@10.0.403": {
+      "last_modified": "2026-11-03T19:55:20Z",
+      "resolved": "github:NixOS/nixpkgs/9d3b8db48266c17be0b5f9c6360c3ecfbac3d1f5#dotnet-sdk_10",
+      "source": "devbox-search",
+      "version": "10.0.403",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/qk2id6g434dfxsl8ibnrzxhlw1dl992i-dotnet-sdk-wrapped-10.0.403",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/34h1pcddksh771bnfv2ls7h5p68mgvv3-dotnet-sdk-wrapped-10.0.403-man",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/qk2id6g434dfxsl8ibnrzxhlw1dl992i-dotnet-sdk-wrapped-10.0.403"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/smkidyygawhfqa31ha4xmf7bwj893852-dotnet-sdk-wrapped-10.0.403",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/29k9i672p91i0x6lr9rmfy7c6757f7q4-dotnet-sdk-wrapped-10.0.403-man",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/smkidyygawhfqa31ha4xmf7bwj893852-dotnet-sdk-wrapped-10.0.403"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/fs4azbnadc3bvjdqsl0l05fimvpc96zs-dotnet-sdk-wrapped-10.0.403",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/lxgqnlqpq8x9mwfwfv71d84vh27l4anp-dotnet-sdk-wrapped-10.0.403-man",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/fs4azbnadc3bvjdqsl0l05fimvpc96zs-dotnet-sdk-wrapped-10.0.403"
+        }
+      }
+    },
+    "fontconfig@latest": {
+      "last_modified": "2026-11-03T19:55:20Z",
+      "resolved": "github:NixOS/nixpkgs/9d3b8db48266c17be0b5f9c6360c3ecfbac3d1f5#fontconfig",
+      "source": "devbox-search",
+      "version": "2.18.3",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/1y0wlckbpfcrkfdqk5fd338fzws4fj30-fontconfig-2.18.3-bin",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/06zvv906f6c7y3x813aqihbphzzjqdy9-fontconfig-2.18.3-dev"
+            },
+            {
+              "name": "lib",
+              "path": "/nix/store/84s5m4x28v2i426v7rq7di8r1f4rvdpy-fontconfig-2.18.3-lib"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/n0laab7nggyrdn3my2hgw0izlyv0l0mc-fontconfig-2.18.3"
+            }
+          ],
+          "store_path": "/nix/store/1y0wlckbpfcrkfdqk5fd338fzws4fj30-fontconfig-2.18.3-bin"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/1i1pgw19a5c52vbfx3xnp152xf25c6lc-fontconfig-2.18.3-bin",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/wkj9f14z5dh31v137zz8352ncyjp5dk8-fontconfig-2.18.3-dev"
+            },
+            {
+              "name": "lib",
+              "path": "/nix/store/zhgfpikknsczj1dzqzgxfncwnpyip7k2-fontconfig-2.18.3-lib"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/ncj94ifl2w1d0pfwq2dn4789bk7a1zkl-fontconfig-2.18.3"
+            }
+          ],
+          "store_path": "/nix/store/1i1pgw19a5c52vbfx3xnp152xf25c6lc-fontconfig-2.18.3-bin"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/a8hfazxxb69rgvlgbl2mn3zn6khvrb8r-fontconfig-2.18.3-bin",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/nbdi0r6jklg8r7lnzz5pw51aa1h1fhih-fontconfig-2.18.3-dev"
+            },
+            {
+              "name": "lib",
+              "path": "/nix/store/p3y4rk4gjnhs80339qq7jixjbhplqc16-fontconfig-2.18.3-lib"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/wv3n2jd5f80wq4qiphhd4k6yrlv25p8q-fontconfig-2.18.3"
+            }
+          ],
+          "store_path": "/nix/store/a8hfazxxb69rgvlgbl2mn3zn6khvrb8r-fontconfig-2.18.3-bin"
+        }
+      }
+    },
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-10-08T19:21:32Z",
+      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30?lastModified=1791487292&narHash=sha256-tqM7xDEsaeK1p6VvRygeZ9LkQRpUUkbRT02BHv6hnTM%3D"
+    },
+    "hyperfine@latest": {
+      "last_modified": "2026-11-03T19:55:20Z",
+      "resolved": "github:NixOS/nixpkgs/9d3b8db48266c17be0b5f9c6360c3ecfbac3d1f5#hyperfine",
+      "source": "devbox-search",
+      "version": "2.0.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/nirl8dzlw12gfc03s4ng7bzxwvanav59-hyperfine-2.0.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/nirl8dzlw12gfc03s4ng7bzxwvanav59-hyperfine-2.0.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/x5bajbhid7sxqwc6a1rk2pf67w2nvnm9-hyperfine-2.0.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/x5bajbhid7sxqwc6a1rk2pf67w2nvnm9-hyperfine-2.0.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/li3z6xnjj65z8hfdlcx3lb48vaphl51w-hyperfine-2.0.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/li3z6xnjj65z8hfdlcx3lb48vaphl51w-hyperfine-2.0.0"
+        }
+      }
+    }
+  }
+}

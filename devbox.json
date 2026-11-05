@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.19.0/.schema/devbox.schema.json",
+  "packages": {
+    "dotnet-sdk_10": "10.0.403",
+    "hyperfine": "latest",
+    "fontconfig": {
+      "version": "latest",
+      "outputs": ["lib"]
+    }
+  },
+  "env": {
+    "LD_LIBRARY_PATH": "$DEVBOX_PACKAGES_DIR/lib"
+  }
+}

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>blaze-cs</AssemblyName>
+    <RootNamespace>BlazeCs</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Compiled against 5.9; at run time the daemon loads the Roslyn that ships with the
+         solution's SDK (see SdkRoslyn), so its output matches csc byte for byte. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" ExcludeAssets="runtime" />
+    <PackageReference Include="MSBuild.StructuredLogger" Version="2.3.269" />
+  </ItemGroup>
+</Project>
