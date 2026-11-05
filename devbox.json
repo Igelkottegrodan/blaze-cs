@@ -6,7 +6,8 @@
     "fontconfig": {
       "version": "latest",
       "outputs": ["lib"]
-    }
+    },
+    "go-task": "latest"
   },
   "env": {
     "LD_LIBRARY_PATH": "$DEVBOX_PACKAGES_DIR/lib"
