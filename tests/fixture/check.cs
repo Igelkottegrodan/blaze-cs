@@ -14,22 +14,28 @@ var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
 var blaze = Path.Combine(root, "blaze-cs");
 
-// (name, edit, projects blaze-cs must rebuild, command); the edits build on each other.
+// (name, edit, units blaze-cs must rebuild, command); the edits build on each other. Lib and Consumer
+// target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
+string[] lib = ["Lib (net10.0)", "Lib (net8.0)"], consumer = ["Consumer (net10.0)", "Consumer (net8.0)"];
 (string Name, Action Edit, string[] Expected, string Command)[] cases =
 [
-    ("body", () => Replace("Lib/Greeter.cs", "\"Hello, \"", "\"Hello there, \""), ["Lib"], "build"),
+    ("body", () => Replace("Lib/Greeter.cs", "\"Hello, \"", "\"Hello there, \""), lib, "build"),
     ("signature used by Consumer",
         () => Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + name", "Greet(string person) => \"Hello there, \" + person"),
-        ["Consumer", "Lib"], "build"),
+        [.. consumer, .. lib], "build"),
     ("signature unused by Consumer",
-        () => Replace("Lib/Greeter.cs", "Twice(int value) => value * 2", "Twice(int amount) => amount * 2"), ["Lib"], "build"),
+        () => Replace("Lib/Greeter.cs", "Twice(int value) => value * 2", "Twice(int amount) => amount * 2"), lib, "build"),
+    // Lib (net8.0) recompiles because its source changed, but its API doesn't, so Consumer (net8.0) doesn't.
+    ("net10.0-only signature",
+        () => Replace("Lib/Greeter.cs", "Shout(string name) => name.ToUpperInvariant()", "Shout(string who) => who.ToUpperInvariant()"),
+        ["Consumer (net10.0)", .. lib], "build"),
     ("new file",
         () => File.WriteAllText(Path.Combine(work, "Lib/Probe.cs"), "namespace Lib;\n\ninternal static class Probe\n{\n    internal const int Edit = 1;\n}\n"),
-        ["Lib"], "build"),
+        lib, "build"),
     ("generator output",
         () => Replace("Lib/Greeter.cs", "    public static int Twice",
             "    public static string Farewell(string name) => \"Bye, \" + name;\n\n    public static int Twice"),
-        ["Consumer", "Lib"], "build"),
+        [.. consumer, .. lib], "build"),
     ("test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
 ];
 
@@ -51,6 +57,11 @@ try
         Verify(name, rebuilt);
     }
     passed = true;
+}
+catch (CheckFailed failure)
+{
+    Console.Error.WriteLine(failure.Message);
+    return 1;
 }
 finally
 {
@@ -92,7 +103,7 @@ void Verify(string name, HashSet<string> rebuilt)
     if (!ours.Keys.ToHashSet().SetEquals(theirs.Keys))
         Fail($"{name}: assembly sets differ: {string.Join(", ", ours.Keys.ToHashSet().Except(theirs.Keys).Union(theirs.Keys.Except(ours.Keys)))}");
     var differing = ours.Keys.Where(path => !ours[path].AsSpan().SequenceEqual(theirs[path])).ToList();
-    var inRebuilt = differing.Where(path => rebuilt.Contains(path.Split('/')[0])).ToList();
+    var inRebuilt = differing.Where(path => CompiledBy(rebuilt, path)).ToList();
     if (inRebuilt.Count > 0)
         Fail($"{name}: blaze-cs compiled these but they differ from dotnet build: {string.Join(", ", inRebuilt)}");
     var beyondIdentity = differing.Where(path => !PeIdentity.SameCode(ours[path], theirs[path])).ToList();
@@ -101,6 +112,11 @@ void Verify(string name, HashSet<string> rebuilt)
     Console.WriteLine($"ok  {name}: rebuilt {(rebuilt.Count == 0 ? "nothing" : string.Join(", ", rebuilt.Order()))}; "
         + $"{ours.Count - differing.Count} of {ours.Count} assemblies identical, {differing.Count} same code");
 }
+
+// Whether blaze-cs compiled an obj/ assembly (Project/obj/<configuration>/<tfm>/...): its unit is named
+// "Project", or "Project (tfm)" when the project multi-targets.
+static bool CompiledBy(HashSet<string> rebuilt, string path) => path.Split('/') is [var project, "obj", _, var framework, ..]
+    && (rebuilt.Contains(project) || rebuilt.Contains($"{project} ({framework})"));
 
 Dictionary<string, byte[]> Assemblies() =>
     Directory.EnumerateFiles(work, "*.dll", SearchOption.AllDirectories)
@@ -129,9 +145,9 @@ static void CopyFixture(string from, string to)
         CopyFixture(directory, Path.Combine(to, Path.GetFileName(directory)));
 }
 
+// Thrown rather than exiting, so the finally above still stops the daemon: one left running would
+// serve the next check with this run's build of blaze-cs.
 [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-static void Fail(string message)
-{
-    Console.Error.WriteLine(message);
-    Environment.Exit(1);
-}
+static void Fail(string message) => throw new CheckFailed(message);
+
+sealed class CheckFailed(string message) : Exception(message);
