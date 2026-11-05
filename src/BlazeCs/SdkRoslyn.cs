@@ -11,6 +11,29 @@ namespace BlazeCs;
 /// </summary>
 static class SdkRoslyn
 {
+    /// <summary>
+    /// Why this solution's SDK cannot be used, or null if it can. The daemon is compiled against the
+    /// Roslyn of SDK 10; an older SDK's Roslyn would fail with MissingMethod and TypeLoad errors. The
+    /// client checks this before it starts a daemon, so the message reaches the user's terminal.
+    /// </summary>
+    public static string? Unsupported(string solutionDir)
+    {
+        try
+        {
+            var version = Run(solutionDir, "--version").Trim();
+            if (int.TryParse(version.Split('.')[0], out var major) && major < MinimumMajor)
+                return $"needs .NET SDK {MinimumMajor} or later; this solution's global.json selects SDK {version}. " +
+                    $"Pin {MinimumMajor}.0.x (or set rollForward) to use blaze-cs.";
+            return null;
+        }
+        catch (InvalidOperationException e)
+        {
+            return $"could not select a .NET SDK for this solution; check its global.json against `dotnet --list-sdks` ({e.Message})";
+        }
+    }
+
+    const int MinimumMajor = 10;
+
     public static string Install(string solutionDir)
     {
         var sdkDir = FindSdkDirectory(solutionDir);
@@ -52,13 +75,16 @@ static class SdkRoslyn
         {
             WorkingDirectory = workingDirectory,
             RedirectStandardOutput = true,
+            RedirectStandardError = true,
             UseShellExecute = false,
         };
         using var process = Process.Start(start)!;
         var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
         process.WaitForExit();
         if (process.ExitCode != 0)
-            throw new InvalidOperationException($"dotnet {arguments} exited with {process.ExitCode}");
+            throw new InvalidOperationException(
+                $"dotnet {arguments} exited with {process.ExitCode}: {error.Split('\n').FirstOrDefault(l => l.StartsWith("Requested SDK", StringComparison.Ordinal)) ?? error.Trim()}");
         return output;
     }
 }
