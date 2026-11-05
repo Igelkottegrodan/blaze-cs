@@ -57,7 +57,14 @@ static class Program
     static int Send(string solutionPath, string command)
     {
         var socketPath = SocketPath(solutionPath);
-        using var socket = Connect(socketPath) ?? StartDaemon(solutionPath, socketPath);
+        var connected = Connect(socketPath);
+        // Only a new daemon picks an SDK, so warm commands skip the extra `dotnet --version`.
+        if (connected is null && command != "stop" && SdkRoslyn.Unsupported(Path.GetDirectoryName(solutionPath)!) is { } problem)
+        {
+            Console.Error.WriteLine($"blaze-cs: {problem}");
+            return 1;
+        }
+        using var socket = connected ?? StartDaemon(solutionPath, socketPath);
         if (socket is null)
         {
             if (command == "stop")
