@@ -1,5 +1,5 @@
+using System.Collections;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text.Json;
 using System.Xml.Linq;
@@ -7,9 +7,11 @@ using System.Xml.Linq;
 namespace BlazeCs.TestHost;
 
 /// <summary>
-/// A long-lived process that runs xUnit v3 test assemblies in-process, one per line read from stdin.
-/// Each run gets a fresh collectible load context, so statics start clean and the next build's DLLs
-/// load without restarting the runtime. Test output goes to stdout; the result is the last line.
+/// A single-use test host. The daemon starts it ahead of time, so the runtime is already up when a run
+/// needs it; it reads one "framework assembly" line from stdin, runs that test assembly in-process, writes
+/// the result as the last line and exits. Test output goes to stdout. Exiting keeps every run's statics,
+/// threads and console redirections apart, and lets the tests load into an ordinary (non-collectible)
+/// context, where precompiled code is used: measured on the fixture, about twice as fast as a collectible one.
 /// </summary>
 static class Program
 {
@@ -18,20 +20,19 @@ static class Program
     static void Main()
     {
         var protocol = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
-        while (Console.ReadLine() is { } assemblyPath)
-        {
-            var (result, context) = Run(assemblyPath);
-            var unloaded = Unload(context);
-            Console.Out.Flush();
-            protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result with { Unloaded = unloaded }));
-        }
+        // End of input means the daemon stopped (or died) without needing this host.
+        if (Console.ReadLine() is not { } request)
+            return;
+        var separator = request.IndexOf(' ');
+        var result = Run(request[..separator], request[(separator + 1)..]);
+        Console.Out.Flush();
+        protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result));
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    static (Result, WeakReference) Run(string assemblyPath)
+    static Result Run(string framework, string assemblyPath)
     {
-        var context = new TestContext(assemblyPath);
-        var reportPath = Path.Combine(Path.GetTempPath(), $"blaze-cs-{Environment.ProcessId}.xml");
+        var (output, error) = (Console.Out, Console.Error);
+        Func<Result> run;
         try
         {
             // Tests find files relative to their output directory, as under `dotnet test`: through the
@@ -39,62 +40,218 @@ static class Program
             var directory = Path.GetDirectoryName(assemblyPath)!;
             Environment.CurrentDirectory = directory;
             AppContext.SetData("APP_CONTEXT_BASE_DIRECTORY", directory + Path.DirectorySeparatorChar);
-            using (context.EnterContextualReflection())
+            var context = new TestContext(assemblyPath);
+            _ = context.EnterContextualReflection(); // for the rest of this process
+            var assembly = context.LoadFromAssemblyPath(assemblyPath);
+            run = framework switch
             {
-                var assembly = context.LoadFromAssemblyPath(assemblyPath);
-                // The assembly's own Main would run whatever Assembly.GetEntryAssembly() is: this host.
-                // xUnit's in-process runner also takes the test assembly explicitly.
-                var runnerType = context.LoadFromAssemblyName(new AssemblyName("xunit.v3.runner.inproc.console"))
-                    .GetType("Xunit.Runner.InProc.SystemConsole.ConsoleRunner", throwOnError: true)!;
-                string[] arguments = ["-noLogo", "-noColor", "-xml", reportPath];
-                var runner = (IDisposable)Activator.CreateInstance(runnerType, [arguments, assembly])!;
-                using (runner)
-                {
-                    // Not Console.In: this process's stdin is the daemon's channel.
-                    var run = (Task<int>)runnerType.GetMethod("EntryPoint")!.Invoke(runner, [TextReader.Null, Console.Out])!;
-                    run.GetAwaiter().GetResult();
-                }
-            }
-            return (Report(reportPath), new WeakReference(context));
+                "xunit3" => XunitV3(context, assembly, output),
+                "nunit" => NUnit(context, assembly, output),
+                "mstest" => MSTest(context, assembly, output),
+                _ => throw new NotSupportedException($"no runner for {framework}"),
+            };
         }
         catch (Exception e)
         {
-            var error = e is TargetInvocationException { InnerException: { } inner } ? inner : e;
-            return (new Result(0, 0, 0, 0, false, error.ToString()), new WeakReference(context));
+            // Nothing ran: the daemon falls back to `dotnet test`.
+            var cause = Unwrap(e);
+            return new Result(0, 0, 0, 0, null, $"{cause.GetType().Name}: {cause.Message}");
+        }
+
+        try
+        {
+            return run();
+        }
+        catch (Exception e)
+        {
+            return new Result(0, 0, 0, 0, Unwrap(e).ToString(), null);
         }
         finally
         {
-            context.Unload();
-            File.Delete(reportPath);
+            // MSTest leaves its own writers installed.
+            Console.SetOut(output);
+            Console.SetError(error);
         }
     }
-
-    /// <summary>Totals from xUnit's XML report: assemblies/assembly[@total,@passed,@failed,@skipped].</summary>
-    static Result Report(string path)
-    {
-        var assembly = XDocument.Load(path).Root!.Element("assembly")
-            ?? throw new InvalidOperationException("xUnit wrote no results");
-        int Count(string name) => int.Parse(assembly.Attribute(name)?.Value ?? "0");
-        return new Result(Count("total"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), false, null);
-    }
-
-    static bool Unload(WeakReference context)
-    {
-        for (var i = 0; i < 10 && context.IsAlive; i++)
-        {
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-        }
-        return !context.IsAlive;
-    }
-
-    sealed record Result(int Total, int Passed, int Failed, int Skipped, bool Unloaded, string? Error);
 
     /// <summary>
-    /// Resolves the test project's own dependencies from its deps.json; the shared frameworks
-    /// (.NET, ASP.NET Core) come from this process.
+    /// xUnit's in-process runner, which takes the test assembly explicitly: the assembly's own Main would
+    /// run whatever Assembly.GetEntryAssembly() is, this host. Totals come from its XML report.
     /// </summary>
-    sealed class TestContext(string assemblyPath) : AssemblyLoadContext($"tests:{assemblyPath}", isCollectible: true)
+    static Func<Result> XunitV3(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    {
+        var reportPath = Path.Combine(Path.GetTempPath(), $"blaze-cs-{Environment.ProcessId}.xml");
+        var runnerType = context.LoadFromAssemblyName(new AssemblyName("xunit.v3.runner.inproc.console"))
+            .GetType("Xunit.Runner.InProc.SystemConsole.ConsoleRunner", throwOnError: true)!;
+        string[] arguments = ["-noLogo", "-noColor", "-xml", reportPath];
+        var runner = (IDisposable)Activator.CreateInstance(runnerType, [arguments, assembly])!;
+        var entryPoint = runnerType.GetMethod("EntryPoint") ?? throw new MissingMethodException(runnerType.FullName, "EntryPoint");
+        return () =>
+        {
+            using (runner)
+            {
+                // Not Console.In: this process's stdin is the daemon's channel.
+                ((Task<int>)entryPoint.Invoke(runner, [TextReader.Null, output])!).GetAwaiter().GetResult();
+            }
+            try
+            {
+                var report = XDocument.Load(reportPath).Root!.Element("assembly")
+                    ?? throw new InvalidOperationException("xUnit wrote no results");
+                int Count(string name) => int.Parse(report.Attribute(name)?.Value ?? "0");
+                return new Result(Count("total"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null);
+            }
+            finally
+            {
+                File.Delete(reportPath);
+            }
+        };
+    }
+
+    /// <summary>
+    /// NUnit's FrameworkController, which its engine and VSTest adapter drive too: RunTests returns the
+    /// results as XML (a test-suite with totals, and a test-case per test with any failure and output).
+    /// </summary>
+    static Func<Result> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    {
+        var type = context.LoadFromAssemblyName(new AssemblyName("nunit.framework"))
+            .GetType("NUnit.Framework.Api.FrameworkController", throwOnError: true)!;
+        var settings = new Hashtable { ["WorkDirectory"] = Path.GetDirectoryName(assembly.Location)! };
+        var controller = Activator.CreateInstance(type, [assembly, "0-", settings])!;
+        var load = type.GetMethod("LoadTests", Type.EmptyTypes) ?? throw new MissingMethodException(type.FullName, "LoadTests");
+        var runTests = type.GetMethod("RunTests", [typeof(string)]) ?? throw new MissingMethodException(type.FullName, "RunTests");
+        return () =>
+        {
+            load.Invoke(controller, []);
+            var suite = XElement.Parse((string)runTests.Invoke(controller, ["<filter/>"])!);
+            foreach (var test in suite.Descendants("test-case").Where(t => t.Attribute("result")?.Value == "Failed"))
+            {
+                var failure = test.Element("failure");
+                ReportFailure(output, test.Attribute("fullname")?.Value, failure?.Element("message")?.Value,
+                    failure?.Element("stack-trace")?.Value, test.Element("output")?.Value);
+            }
+            int Count(string name) => int.Parse(suite.Attribute(name)?.Value ?? "0");
+            // As the VSTest adapter does by default: warnings and inconclusive results count as skipped.
+            return new Result(Count("total"), Count("passed"), Count("failed"),
+                Count("skipped") + Count("inconclusive") + Count("warnings"), null, null);
+        };
+    }
+
+    /// <summary>
+    /// MSTest's VSTest executor, as vstest's testhost runs it. Its run context and framework handle are
+    /// proxies for the test's own copy of the VSTest object model, so the host doesn't reference it.
+    /// </summary>
+    static Func<Result> MSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    {
+        var executor = Activator.CreateInstance(context.LoadFromAssemblyName(new AssemblyName("MSTest.TestAdapter"))
+            .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!)!;
+        var objectModel = context.LoadFromAssemblyName(new AssemblyName("Microsoft.VisualStudio.TestPlatform.ObjectModel"));
+        Type Adapter(string name) => objectModel.GetType($"Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter.{name}", throwOnError: true)!;
+        var runTests = Adapter("ITestExecutor").GetMethod("RunTests", [typeof(IEnumerable<string>), Adapter("IRunContext"), Adapter("IFrameworkHandle")])
+            ?? throw new MissingMethodException("ITestExecutor", "RunTests");
+        var settings = Proxy.Create(Adapter("IRunSettings"), (method, _) =>
+            method.Name == "get_SettingsXml" ? "<RunSettings><RunConfiguration /></RunSettings>" : null);
+        var runContext = Proxy.Create(Adapter("IRunContext"), (method, _) => method.Name switch
+        {
+            "get_RunSettings" => settings,
+            "get_TestRunDirectory" => Path.GetDirectoryName(assembly.Location),
+            _ => null,
+        });
+        var recorder = new MSTestRecorder(output);
+        var handle = Proxy.Create(Adapter("IFrameworkHandle"), recorder.Invoke);
+        return () =>
+        {
+            runTests.Invoke(executor, [new[] { assembly.Location }, runContext, handle]);
+            return recorder.Result();
+        };
+    }
+
+    /// <summary>Counts what MSTest records; tests run in parallel, so from many threads.</summary>
+    sealed class MSTestRecorder(TextWriter output)
+    {
+        int _total, _passed, _failed, _skipped;
+
+        public Result Result() => new(_total, _passed, _failed, _skipped, null, null);
+
+        public object? Invoke(MethodInfo method, object?[] arguments)
+        {
+            if (method.Name == "RecordResult")
+                Record(arguments[0]!);
+            else if (method.Name == "SendMessage" && arguments[0]?.ToString() is "Warning" or "Error")
+            {
+                lock (output)
+                    output.WriteLine($"  {arguments[0]}: {arguments[1]}");
+            }
+            return null;
+        }
+
+        void Record(object result)
+        {
+            Interlocked.Increment(ref _total);
+            switch (Get(result, "Outcome")?.ToString())
+            {
+                case "Passed":
+                    Interlocked.Increment(ref _passed);
+                    break;
+                case "Failed":
+                    Interlocked.Increment(ref _failed);
+                    var stdout = ((IEnumerable)Get(result, "Messages")!).Cast<object>()
+                        .Where(m => Get(m, "Category") as string == "StdOutMsgs").Select(m => Get(m, "Text") as string);
+                    ReportFailure(output, Get(result, "DisplayName") as string ?? Get(Get(result, "TestCase")!, "FullyQualifiedName") as string,
+                        Get(result, "ErrorMessage") as string, Get(result, "ErrorStackTrace") as string, string.Concat(stdout));
+                    break;
+                default: // skipped, not found, none
+                    Interlocked.Increment(ref _skipped);
+                    break;
+            }
+        }
+
+        static object? Get(object target, string property) => target.GetType().GetProperty(property)!.GetValue(target);
+    }
+
+    /// <summary>A failed test as `dotnet test` prints it: name, message, stack trace and its output.</summary>
+    static void ReportFailure(TextWriter output, string? name, string? message, string? stackTrace, string? stdout)
+    {
+        lock (output)
+        {
+            output.WriteLine($"  Failed {name}");
+            foreach (var (heading, text) in new[] { ("Error Message", message), ("Stack Trace", stackTrace), ("Standard Output Messages", stdout) })
+            {
+                if (string.IsNullOrWhiteSpace(text))
+                    continue;
+                output.WriteLine($"  {heading}:");
+                foreach (var line in text.Trim().Split('\n'))
+                    output.WriteLine($"   {line.TrimEnd('\r')}");
+            }
+        }
+    }
+
+    static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;
+
+    sealed record Result(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
+
+    /// <summary>Implements an interface from the test's load context by handing each call to a function.</summary>
+    class Proxy : DispatchProxy
+    {
+        Func<MethodInfo, object?[], object?> _handler = null!;
+
+        public static object Create(Type interfaceType, Func<MethodInfo, object?[], object?> handler)
+        {
+            var proxy = DispatchProxy.Create(interfaceType, typeof(Proxy));
+            ((Proxy)proxy)._handler = handler;
+            return proxy;
+        }
+
+        // Members the handler doesn't answer return their type's default (false, 0, null).
+        protected override object? Invoke(MethodInfo? method, object?[]? arguments) =>
+            _handler(method!, arguments ?? []) ?? (method!.ReturnType is { IsValueType: true } type && type != typeof(void)
+                ? Activator.CreateInstance(type) : null);
+    }
+
+    /// <summary>
+    /// Resolves the test project's own dependencies from its deps.json; the shared frameworks (.NET,
+    /// ASP.NET Core) come from this process.
+    /// </summary>
+    sealed class TestContext(string assemblyPath) : AssemblyLoadContext($"tests:{assemblyPath}")
     {
         readonly AssemblyDependencyResolver _resolver = new(assemblyPath);
 
