@@ -1,2 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Multi-targeted, so each target framework is its own unit; only net10.0 needs to run. The empty
+         TargetFramework undoes Directory.Build.props', which would otherwise make this a single target. -->
+    <TargetFramework />
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+  </PropertyGroup>
 </Project>
