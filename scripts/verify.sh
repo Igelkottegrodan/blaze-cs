@@ -10,7 +10,7 @@ set -e
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="${TMPDIR:-/tmp}/blaze-cs-verify"
 cd "$root/bench/jellyfin"
-python3 "$root/scripts/edit.py" "$1" .
+dotnet run "$root/scripts/edit.cs" -- "$1" .
 "$root/blaze-cs" build | grep -E '^blaze-cs: (rebuilt|up to date|build failed)' | cut -c1-220
 
 rm -rf "$work"; mkdir -p "$work"
