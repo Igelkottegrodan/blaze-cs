@@ -1,0 +1,25 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build the blaze-cs CLI, daemon and test host
+    cmds:
+      - dotnet build BlazeCs.slnx -nologo -v:q
+
+  check:
+    desc: Edit the fixture solution every way blaze-cs handles and compare its output with dotnet build
+    deps: [build]
+    cmds:
+      - dotnet run tests/fixture/check.cs
+
+  bench:
+    desc: Time each edit kind on bench/jellyfin (task bench -- [runs])
+    deps: [build]
+    cmds:
+      - scripts/bench.sh {{.CLI_ARGS}}
+
+  verify:
+    desc: Compare blaze-cs output on bench/jellyfin with dotnet build (task verify -- body|signature|file)
+    deps: [build]
+    cmds:
+      - scripts/verify.sh {{.CLI_ARGS}}

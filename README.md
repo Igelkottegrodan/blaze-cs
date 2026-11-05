@@ -46,8 +46,8 @@ It needs the .NET 10 SDK. The repo pins one with [devbox](https://www.jetify.com
 
 ```sh
 git clone https://github.com/igelkottegrodan/blaze-cs && cd blaze-cs
-devbox shell          # .NET SDK 10.0.403, hyperfine, fontconfig
-dotnet build BlazeCs.slnx
+devbox shell          # .NET SDK 10.0.403, go-task, hyperfine, fontconfig
+task build
 cd /path/to/your/solution
 /path/to/blaze-cs/blaze-cs build
 ```
@@ -69,8 +69,8 @@ blaze-cs doesn't run analyzers, so the fair comparison is the middle column: 6 t
 |---|---:|---:|
 | Edit a test file, rerun its project (219 tests) | 4.54 s | **1.04 s** |
 
-To reproduce, clone jellyfin into `bench/jellyfin`, then run `scripts/bench.sh` (timings) and
-`scripts/verify.sh body|signature|file` (compares output with `dotnet build --no-incremental`).
+To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timings) and
+`task verify -- body|signature|file` (compares output with `dotnet build --no-incremental`).
 
 ## Limitations
 
@@ -91,3 +91,4 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `scripts/bench.sh` 
 | `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
 | `src/BlazeCs.TestHost` | the warm xUnit v3 test host |
 | `scripts/` | benchmark edits, timing, and output verification |
+| `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
