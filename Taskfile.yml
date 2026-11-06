@@ -24,7 +24,7 @@ tasks:
       - scripts/bench.sh {{.CLI_ARGS}}
 
   verify:
-    desc: Compare blaze-cs output on bench/jellyfin with dotnet build (task verify -- body|signature|file)
+    desc: Compare blaze-cs output on bench/jellyfin (or bench/bitwarden) with dotnet build (task verify -- [bitwarden] body|signature|file|...)
     deps: [build]
     cmds:
       - scripts/verify.sh {{.CLI_ARGS}}

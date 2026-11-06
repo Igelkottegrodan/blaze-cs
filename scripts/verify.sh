@@ -5,18 +5,22 @@
 #   same code            differs only in debug identity (scripts/pe-equal.cs): a dependent blaze-cs
 #                        found unaffected keeps its DLL, whose PDB records the reference's old MVID
 #   anything else fails
-# usage: verify.sh body|signature|file
+# usage: verify.sh [bitwarden] <edit kind>   (jellyfin: scripts/edit.cs; bitwarden: scripts/edit-bitwarden.cs)
 set -e
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="${TMPDIR:-/tmp}/blaze-cs-verify"
-cd "$root/bench/jellyfin"
-dotnet run "$root/scripts/edit.cs" -- "$1" .
-"$root/blaze-cs" build | grep -E '^blaze-cs: (rebuilt|up to date|build failed)' | cut -c1-220
+case "$1" in
+  bitwarden) bench=bitwarden; sln=bitwarden-server.slnx; edit=edit-bitwarden.cs; shift ;;
+  *) bench=jellyfin; sln=Jellyfin.slnx; edit=edit.cs ;;
+esac
+cd "$root/bench/$bench"
+dotnet run "$root/scripts/$edit" -- "$1" .
+"$root/blaze-cs" build | grep -E '^blaze-cs: ' | cut -c1-220
 
 rm -rf "$work"; mkdir -p "$work"
 find . -path ./.blaze-cs -prune -o -path '*/obj/*' -name '*.dll' -print | grep -v '/refint/' > "$work/list"
 tar -cf "$work/blaze.tar" -T "$work/list"
-dotnet build Jellyfin.slnx -nologo -v:q -clp:ErrorsOnly --no-incremental >/dev/null
+dotnet build "$sln" -nologo -v:q -clp:ErrorsOnly --no-incremental >/dev/null
 mkdir "$work/blaze"; tar -xf "$work/blaze.tar" -C "$work/blaze"
 
 identical=0; : > "$work/pairs"
