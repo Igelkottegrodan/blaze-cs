@@ -5,11 +5,21 @@ namespace BlazeCs;
 
 /// <summary>
 /// Serves one solution over a Unix socket, one command at a time. Each command streams its output
-/// lines back and ends with an exit-code line.
+/// lines back and ends with an exit-code line. A daemon that serves no command for two hours exits,
+/// and one asked by a client from another build of blaze-cs hands over: it answers with its process id
+/// and exits, and the client starts a daemon of its own build.
 /// </summary>
 static class Daemon
 {
     public const string ExitPrefix = "\u0001exit:";
+    public const string RestartPrefix = "\u0001restart:";
+
+    /// <summary>The identity of this build of blaze-cs: clients send theirs with each command.</summary>
+    public static readonly Guid Build = typeof(Daemon).Module.ModuleVersionId;
+
+    /// <summary>BLAZE_CS_IDLE_SECONDS lets the fixture check see an idle exit without waiting two hours.</summary>
+    static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(
+        int.TryParse(Environment.GetEnvironmentVariable("BLAZE_CS_IDLE_SECONDS"), out var seconds) && seconds > 0 ? seconds : 2 * 60 * 60);
 
     public static int Run(string solutionPath, string socketPath, string sdkDirectory)
     {
@@ -17,7 +27,7 @@ static class Daemon
         File.Delete(socketPath);
         listener.Bind(new UnixDomainSocketEndPoint(socketPath));
         listener.Listen(16);
-        Console.WriteLine($"{DateTime.Now:O} serving {solutionPath} on {socketPath}");
+        Console.WriteLine($"{DateTime.Now:O} serving {solutionPath} on {socketPath} (pid {Environment.ProcessId}, exits after {IdleTimeout.TotalSeconds:F0} s idle)");
 
         // Projects compile in parallel and Roslyn parallelizes inside each one; both block on the
         // shared thread pool, which otherwise adds threads one at a time while cores sit idle.
@@ -30,7 +40,18 @@ static class Daemon
 
         while (true)
         {
-            using var client = listener.Accept();
+            Socket accepted;
+            using (var idle = new CancellationTokenSource(IdleTimeout))
+            {
+                try { accepted = listener.AcceptAsync(idle.Token).AsTask().GetAwaiter().GetResult(); }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine($"{DateTime.Now:O} no command for {IdleTimeout.TotalSeconds:F0} s; exiting");
+                    File.Delete(socketPath);
+                    return 0;
+                }
+            }
+            using var client = accepted;
             using var stream = new NetworkStream(client);
             using var reader = new StreamReader(stream);
             using var writer = new StreamWriter(stream) { AutoFlush = true };
@@ -52,6 +73,14 @@ static class Daemon
                 {
                     Log("blaze-cs: daemon stopped");
                     writer.WriteLine($"{ExitPrefix}0");
+                    File.Delete(socketPath);
+                    return 0;
+                }
+
+                if (request?.Build != Build)
+                {
+                    Console.WriteLine($"{DateTime.Now:O} a client of another build sent {request?.Command}; exiting");
+                    writer.WriteLine($"{RestartPrefix}{Environment.ProcessId}");
                     File.Delete(socketPath);
                     return 0;
                 }
