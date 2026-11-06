@@ -21,7 +21,8 @@ namespace BlazeCs;
 /// hosted projects target: a project without a host of its own takes it, so its run starts no runtime.
 /// A Debug project's host, once it has run the project, stays up as the project's host: the next run sends it
 /// the edit as a delta (hot reload, HotReload.cs) when the edit is one the runtime can apply, and the tests run
-/// again in the same process; otherwise the project runs in a new host, as it would without.
+/// again in the same process; otherwise the project runs in a new host, as it would without, the output says why in
+/// one line, and the new host stays up in the old one's place.
 /// </summary>
 sealed class TestRunner(SolutionBuilder builder) : IDisposable
 {
@@ -292,30 +293,40 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         LiveHost? live;
         lock (_idleHosts)
             _live.Remove(request.Assembly, out live);
-        if (live is not null && HotReload(unit, request, live, inputs, kept, log) is { } reloaded)
-            return reloaded;
-        return RunInHost(unit, request, inputs, kept, log);
+        if (live is not null)
+            return HotReload(unit, request, live, inputs, kept, log);
+
+        var stopwatch = Stopwatch.StartNew();
+        var output = new List<string>();
+        var key = Key(request.Framework, request.Assembly, request.RunSettings, unit.Debug);
+        var (host, hotReload) = TakeHost(request.Assembly, key, replacing: false);
+        // A host that died while idle gives no result, so the run fails below.
+        var result = Send(host, request) ? ReadResult(host, output) : null;
+        return Finish(unit, request, inputs, key, host, hotReload, result, stopwatch, output, kept, log);
     }
 
     /// <summary>
-    /// Runs one assembly in a host that loads it and logs its output in one piece; null if the host ran no
-    /// tests, which `dotnet test` then settles.
+    /// After a run in a host that loaded the project: keeps the host as the project's live host if it can take
+    /// the next edit, otherwise stops it, with why in the daemon log; then reports the run.
     /// </summary>
-    Outcome? RunInHost(ProjectCompiler unit, TestHostRequest request, string inputs, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
+    Outcome? Finish(ProjectCompiler unit, TestHostRequest request, string inputs, HostKey key, Process host, bool hotReload, TestHostResult? result,
+        Stopwatch stopwatch, List<string> output, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
     {
-        var stopwatch = Stopwatch.StartNew();
-        var output = new List<string>();
-        var assembly = request.Assembly;
-        var key = Key(request.Framework, assembly, request.RunSettings, unit.Debug);
-        var (host, hotReload) = TakeHost(assembly, key);
-        // A host that died while idle gives no result, so the run fails below.
-        var result = Send(host, request) ? ReadResult(host, output) : null;
         if (hotReload && result is { CannotHotReload: null })
             kept.Add((unit, new LiveHost(host, key, inputs)));
         else
+        {
+            var why = result is null ? "it exited mid-run"
+                : !unit.Debug ? $"{unit.Unit.Name} is compiled with optimizations (Release), so its hosts never take updates"
+                : !hotReload ? "it was started for no project, without DOTNET_MODIFIABLE_ASSEMBLIES"
+                : result.CannotHotReload;
+            // Without the engine, nothing stays up, and the first test command said so.
+            if (Engine is not null)
+                Console.WriteLine($"{DateTime.Now:O} hot reload: test host {host.Id} ({Path.GetFileName(request.Assembly)}) doesn't stay up: {why}");
             Stop(host);
+        }
         result ??= new TestHostResult(0, 0, 0, 0, Error: "the test host exited mid-run", Unsupported: null);
-        return Report(assembly, result, stopwatch, output, log);
+        return Report(request.Assembly, result, stopwatch, output, log);
     }
 
     /// <summary>
@@ -351,9 +362,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     }
 
     /// <summary>
-    /// Sends a live host the edit since its last run as a delta and reports the run that follows, if the
-    /// edit hot reloads (<see cref="Plan"/>); otherwise ends the host and returns null, and the project runs
-    /// as it would without hot reload.
+    /// Runs a test project in its live host: sends it the edit since its last run as a delta and reports the run
+    /// that follows, if the edit hot reloads (<see cref="Plan"/>) and the host applies it. Otherwise the project
+    /// runs as it would without hot reload (<see cref="RunLive"/>): the live host and its session end, and the
+    /// project runs in a new host, which can stay up for the next edit with a session of its own.
     /// </summary>
     Outcome? HotReload(ProjectCompiler unit, TestHostRequest request, LiveHost live, string inputs, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
     {
@@ -361,45 +373,102 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var name = Path.GetFileName(request.Assembly);
         var pid = live.Process.Id;
         HotReloadSession? session = null;
+        TestHostUpdate? update = null;
         string? reason;
         try
         {
-            (session, var update, reason) = Plan(live, inputs);
-            if (update is not null)
-            {
-                var output = new List<string>();
-                var result = Send(live.Process, update) ? ReadResult(live.Process, output) : null;
-                reason = result is null ? "the host exited" : result.Unsupported;
-                if (result is not null && reason is null)
-                {
-                    session!.Commit();
-                    var modules = session.Modules.ToDictionary(module => module.Mvid);
-                    static string Types(TestHostDelta delta) => delta.UpdatedTypes?.Length is 1 ? "1 type" : $"{delta.UpdatedTypes?.Length ?? 0} types";
-                    var applied = string.Join(", ", update.Deltas.Select(delta => $"{modules[delta.Module].Name} ({Types(delta)})"));
-                    foreach (var delta in update.Deltas)
-                        Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) applied a delta to module {modules[delta.Module].Name} "
-                            + $"({delta.Module}): {Types(delta)} updated");
-                    output.Insert(0, $"blaze-cs: {name}: hot reloaded {applied} into its test host (pid {pid})");
-                    if (result.CannotHotReload is null)
-                    {
-                        live.Inputs = inputs;
-                        kept.Add((unit, live));
-                    }
-                    else
-                        End(live);
-                    return Report(request.Assembly, result, stopwatch, output, log, hotReloaded: true);
-                }
-            }
+            (session, update, reason) = Plan(live, inputs);
         }
         catch (Exception e)
         {
             // The engine, or a Workspaces API this blaze-cs was compiled against, failed: today's path settles it.
-            reason = $"internal error: {e}";
+            Console.WriteLine($"{DateTime.Now:O} hot reload: {e}");
+            reason = $"internal error: {e.Message}";
         }
-        Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) ends, and {name} runs in a new host: {reason}");
-        End(live);
-        return null;
+        var key = Key(request.Framework, request.Assembly, request.RunSettings, unit.Debug);
+        var hotReload = false;
+        var output = new List<string>();
+        var run = RunLive(live.Process, update, reason, request, () =>
+        {
+            (var host, hotReload) = TakeHost(request.Assembly, key, replacing: true);
+            return host;
+        }, output, announce: !(update is null && reason == NothingChanged));
+        if (run.Fallback is not null)
+        {
+            Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) ends, and {name} runs in a new host ({run.Host.Id}): {run.Fallback}");
+            End(live);
+            return Finish(unit, request, inputs, key, run.Host, hotReload, run.Result, stopwatch, output, kept, log);
+        }
+
+        var result = run.Result!;
+        var keep = result.CannotHotReload is null;
+        {
+            var modules = session!.Modules.ToDictionary(module => module.Mvid);
+            static string Types(TestHostDelta delta) => delta.UpdatedTypes?.Length is 1 ? "1 type" : $"{delta.UpdatedTypes?.Length ?? 0} types";
+            var applied = string.Join(", ", update!.Deltas.Select(delta => $"{modules[delta.Module].Name} ({Types(delta)})"));
+            foreach (var delta in update.Deltas)
+                Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) applied a delta to module {modules[delta.Module].Name} "
+                    + $"({delta.Module}): {Types(delta)} updated");
+            output.Insert(0, $"blaze-cs: {name}: hot reloaded {applied} into its test host (pid {pid})");
+            try
+            {
+                session.Commit();
+            }
+            catch (Exception e)
+            {
+                // The host runs the edit, but the session no longer knows what it runs: the next edit takes a new host.
+                Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) ends after this run: committing its update failed: {e}");
+                keep = false;
+            }
+        }
+        if (keep)
+        {
+            live.Inputs = inputs;
+            kept.Add((unit, live));
+        }
+        else
+            End(live);
+        return Report(request.Assembly, result, stopwatch, output, log, hotReloaded: true);
     }
+
+    /// <summary>A run in a host: the host, its result (null if the host exited first), and why the run left the live host for a new one, if it did.</summary>
+    internal sealed record HostRun(Process Host, TestHostResult? Result, string? Fallback);
+
+    /// <summary>
+    /// Runs a test assembly in its live host with the update that carries the edit since the host's last run,
+    /// and returns that run. If the edit doesn't hot reload (no update, and <paramref name="reason"/> says why),
+    /// or the host doesn't apply the update or run tests after it, the assembly, as rebuilt, runs in a host that
+    /// <paramref name="restart"/> starts instead, and the output starts with a line that says so
+    /// (<see cref="FallbackLine"/>) in place of the live host's, unless <paramref name="announce"/> is false. Ending
+    /// the live host is the caller's.
+    /// </summary>
+    internal static HostRun RunLive(Process live, TestHostUpdate? update, string? reason, TestHostRequest request, Func<Process> restart, List<string> output,
+        bool announce = true)
+    {
+        if (update is not null)
+        {
+            var result = Send(live, update) ? ReadResult(live, output) : null;
+            reason = result is null ? "the host exited"
+                : result.Unsupported
+                // After an update, a run without tests means the framework didn't find them again; a new host settles it.
+                ?? (result is { Total: 0, Error: null } ? "it found no tests after the update" : null);
+            if (reason is null)
+                return new(live, result, null);
+        }
+        reason ??= "it has no update";
+        output.Clear();
+        if (announce)
+            output.Add(FallbackLine(request.Assembly, reason));
+        var host = restart();
+        return new(host, Send(host, request) ? ReadResult(host, output) : null, reason);
+    }
+
+    /// <summary>Why a rerun with nothing changed runs in a new host: no edit failed to hot reload, so the output says nothing of it.</summary>
+    const string NothingChanged = "nothing its tests run with changed, and a new host starts their statics anew";
+
+    /// <summary>The line that tells the user a test project's edit didn't hot reload, and why.</summary>
+    internal static string FallbackLine(string assembly, string reason) =>
+        $"blaze-cs: {Path.GetFileName(assembly)}: not hot reloaded: {reason.ReplaceLineEndings(" ")}; running it in a new test host";
 
     /// <summary>
     /// Whether an edit hot reloads into a live host, and the update that carries it; otherwise why not. The
@@ -421,7 +490,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return (null, null, "the set of files its tests run with changed");
         var changed = now.Where(input => before[input.Key] != input.Value).Select(input => input.Key).ToList();
         if (changed.Count == 0)
-            return (null, null, "nothing its tests run with changed, and a new host starts their statics anew");
+            return (null, null, NothingChanged);
 
         // A session still starting isn't waited for: the project runs in a new host at once.
         Task<HotReloadSession?>? started;
@@ -438,6 +507,9 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return (session, null, $"{resourced.Name}'s resources changed, which a delta doesn't carry");
 
         var units = builder.Units.ToDictionary(u => u.Unit.AssemblyPath, PathComparer.Instance);
+        // The runtime edits only modules compiled without optimizations: the engine isn't asked for the others.
+        if (changed.Select(path => loaded[path]).FirstOrDefault(module => units.TryGetValue(module.Key, out var unit) && !unit.Debug) is { } optimized)
+            return (session, null, $"{optimized.Name} is compiled with optimizations (Release)");
         var sources = new Dictionary<string, UnitSources>(PathComparer.Instance);
         foreach (var module in session.Modules)
         {
@@ -449,7 +521,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         if (updates.Status != "ReadyToApply")
             return (session, null, updates.Errors.FirstOrDefault() ?? $"the engine's status is {updates.Status}");
         if (updates.ProjectsToRestartOrRebuild > 0)
-            return (session, null, "the engine asks for a restart or rebuild");
+            return (session, null, "the engine asks for a restart or rebuild" + (updates.RudeEdits.FirstOrDefault() is { } rude ? $": {rude}" : ""));
         var updated = updates.Deltas.Select(delta => keys[delta.Project]).ToHashSet(PathComparer.Instance);
         if (changed.Select(path => loaded[path]).FirstOrDefault(module => !updated.Contains(module.Key)) is { } missed)
             return (session, null, $"{missed.Name} changed, and the engine has no delta for it");
@@ -552,7 +624,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             // writes: the sources, the assembly it wrote and its PDB are of one compile.
             lock (unit)
             {
-                if (unit.Sources is not { } current || !builder.Reproduces(unit))
+                // Reproduces first: a unit it compiles holds that compile's sources after it.
+                if (!builder.Reproduces(unit) || unit.Sources is not { } current)
                     throw new InvalidOperationException($"{unit.Unit.Name}'s assembly on disk isn't what the daemon compiles from its sources");
                 // The same before and after the copy: the copy has the bytes the run loaded, which are the
                 // compile's (a served compile writes the assembly before MSBuild copies it next to the tests).
@@ -755,8 +828,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// The idle host prepared for a test project, if it was prepared from what the project has now; otherwise
     /// the spare on its runtime, replaced in the background, or a new host: a host started for no project
     /// loads everything when the run starts. Only a host prepared for the project can take updates after it.
+    /// <paramref name="replacing"/> a live host whose edit didn't hot reload, a project that can hot reload takes
+    /// a new host started for it, not the spare, so that the host stays up for the next edit.
     /// </summary>
-    (Process Host, bool HotReload) TakeHost(string assembly, HostKey key)
+    (Process Host, bool HotReload) TakeHost(string assembly, HostKey key, bool replacing)
     {
         IdleHost? idle;
         lock (_idleHosts)
@@ -765,6 +840,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return (idle.Process, key.HotReload);
         if (idle is not null)
             Stop(idle.Process);
+        if (replacing && key.HotReload)
+            return (StartHost(key.Runtime, (key.Framework, assembly, key.RunSettings, WarmUp: null), hotReload: true), true);
         Process? spare;
         lock (_idleHosts)
             _spares.Remove(key.Runtime, out spare);

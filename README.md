@@ -142,9 +142,13 @@ its own:
   `dotnet watch` uses), sends the host the metadata deltas, and the tests run again in the same process:
   `blaze-cs: Tests.dll: hot reloaded Lib (net10.0) (1 type) into its test host (pid …)`. Any other edit
   (a signature, a new member, a static field's initializer, a changed resource, package or `.runsettings`),
-  a run with nothing changed (`--all`, or a project whose last run failed), a Release project, or an SDK
-  whose engine blaze-cs doesn't know (such as 10.0.100's) runs the project in a new host as before;
-  `.blaze-cs/daemon.log` says why. The assemblies on disk are still what `dotnet build` makes. Limits:
+  a delta the host fails to apply, or a run after it that finds no tests ends that host and runs the project
+  in a new one as before, which then stays up for the next edit; the output says so in one line:
+  `blaze-cs: Tests.dll: not hot reloaded: <why>; running it in a new test host`. A run with nothing changed
+  (`--all`, or a project whose last run failed) runs in a new host too. A Release project (compiled with
+  optimizations), or an SDK whose engine blaze-cs doesn't know (such as 10.0.100's), runs in a new host
+  each time; `.blaze-cs/daemon.log` says why. The assemblies on disk are still what `dotnet build` makes.
+  Limits:
   - Static state carries over from one hot reloaded run to the next, which `dotnet test` starts fresh, so
     tests that depend on it can pass or fail where `dotnet test` doesn't ([#129](https://github.com/Igelkottegrodan/blaze-cs/issues/129)).
     That includes statics computed by code an edit changed: a `static readonly` field whose initializer

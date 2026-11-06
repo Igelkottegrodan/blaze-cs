@@ -177,6 +177,68 @@ public class HotReloadTests
         Assert.Equal(pid, host.Process.Id);
     }
 
+    /// <summary>
+    /// A live host that fails to apply its update (here, a delta for a module it hasn't loaded) is given up: the
+    /// project, rebuilt, runs in a new host, and the output says so in one line before that run's.
+    /// </summary>
+    [Fact]
+    public void AHostThatFailsToApplyADeltaGivesWayToANewHost()
+    {
+        using var subject = new Subject("xunit3");
+        using var live = new Host(hotReload: true);
+        Assert.Equal((2, 1, 1), Counts(live.Send(subject.Run)));
+        Host? fresh = null;
+        try
+        {
+            var output = new List<string>();
+            var run = TestRunner.RunLive(live.Process, new TestHostUpdate([subject.Fix() with { Module = Guid.NewGuid() }]), null, subject.Run, () =>
+            {
+                // The host ends itself after a failed update; the build replaces its files only then (Windows).
+                Assert.True(live.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the live host should exit after a failed update");
+                subject.Rebuild();
+                fresh = new Host(hotReload: true);
+                return fresh.Process;
+            }, output);
+
+            Assert.Contains("no assembly with module", run.Fallback);
+            Assert.Same(fresh?.Process, run.Host);
+            Assert.NotEqual(live.Process.Id, run.Host.Id);
+            Assert.Equal((2, 2, 0), Counts(run.Result!));
+            Assert.Equal([TestRunner.FallbackLine(subject.AssemblyPath, run.Fallback!)], output.Where(line => line.StartsWith("blaze-cs:", StringComparison.Ordinal)));
+            Assert.Equal(0, output.IndexOf(TestRunner.FallbackLine(subject.AssemblyPath, run.Fallback!)));
+            Assert.Matches(@"^blaze-cs: \w+\.dll: not hot reloaded: .*no assembly with module.*; running it in a new test host$", output[0]);
+        }
+        finally
+        {
+            fresh?.Dispose();
+        }
+
+        static (int, int, int) Counts(TestHostResult result) => (result.Total, result.Passed, result.Failed);
+    }
+
+    /// <summary>
+    /// An edit that doesn't hot reload (a rude edit: the engine has no update, only a reason) sends the live host
+    /// nothing; the project runs in a new host, after a line that says why.
+    /// </summary>
+    [Fact]
+    public void AnEditThatDoesNotHotReloadRunsInANewHost()
+    {
+        using var subject = new Subject("xunit3");
+        using var live = new Host(hotReload: true);
+        Assert.Null(live.Send(subject.Run).CannotHotReload);
+        using var fresh = new Host(hotReload: true);
+
+        var output = new List<string>();
+        const string reason = "the engine asks for a restart or rebuild";
+        var run = TestRunner.RunLive(live.Process, null, reason, subject.Run, () => fresh.Process, output);
+
+        Assert.Equal(reason, run.Fallback);
+        Assert.Same(fresh.Process, run.Host);
+        Assert.Equal((2, 1, 1), (run.Result!.Total, run.Result.Passed, run.Result.Failed));
+        Assert.Equal(TestRunner.FallbackLine(subject.AssemblyPath, reason), output[0]);
+        Assert.False(live.Process.HasExited, "the live host is the caller's to end");
+    }
+
     /// <summary>A test host process, as the daemon starts one, with or without the runtime's switch for updates.</summary>
     sealed class Host : IDisposable
     {
@@ -298,6 +360,13 @@ public class HotReloadTests
 
 
         public TestHostRequest Run => new(_framework, AssemblyPath, null);
+
+        /// <summary>Writes the build with <see cref="Fix"/>'s edit (Answer.Value returns 42) over the test assembly, as a rebuild does.</summary>
+        public void Rebuild()
+        {
+            Assert.Null(Baseline); // the tests' own assembly holds Answer
+            Emit(_compilation.ReplaceSyntaxTree(_compilation.SyntaxTrees.Single(), Parse(_source(42))), AssemblyPath);
+        }
 
         /// <summary>The delta that makes Answer.Value return 42, as the daemon would send it.</summary>
         public TestHostDelta Fix()
