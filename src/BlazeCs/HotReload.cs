@@ -107,7 +107,10 @@ sealed class HotReloadEngine
         var directory = Environment.GetEnvironmentVariable(DirectoryOverride) is { Length: > 0 } given ? given : WatchDirectory(sdkDirectory);
         if (directory is null)
         {
-            unavailable = $"the SDK has no dotnet-watch in {Path.Combine(sdkDirectory, "DotnetTools")}";
+            var watch = Path.Combine(sdkDirectory, "DotnetTools", "dotnet-watch");
+            unavailable = Directory.Exists(watch)
+                ? $"the SDK's dotnet-watch has no Microsoft.CodeAnalysis.ExternalAccess.HotReload.dll in {watch}"
+                : $"the SDK has no dotnet-watch in {Path.Combine(sdkDirectory, "DotnetTools")}";
             return null;
         }
         if (Assemblies.FirstOrDefault(name => !File.Exists(Path.Combine(directory, name + ".dll"))) is { } missing)

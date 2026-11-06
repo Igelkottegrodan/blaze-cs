@@ -142,8 +142,9 @@ its own:
   `dotnet watch` uses), sends the host the metadata deltas, and the tests run again in the same process:
   `blaze-cs: Tests.dll: hot reloaded Lib (net10.0) (1 type) into its test host (pid …)`. Any other edit
   (a signature, a new member, a changed package or `.runsettings`), a Release project, or an SDK whose
-  engine blaze-cs doesn't know runs the project in a new host as before; `.blaze-cs/daemon.log` says why.
-  The assemblies on disk are still what `dotnet build` makes.
+  engine blaze-cs doesn't know (such as 10.0.100's) runs the project in a new host as before;
+  `.blaze-cs/daemon.log` says why. The assemblies on disk are still what `dotnet build` makes. Not on
+  Windows yet: a host that stays up would keep the project outputs it loaded locked.
 - **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
   (its own, and every project output copied next to it), its `.deps.json` or its `.runsettings` differs
   from when it last ran in this daemon, when it hasn't run in this daemon yet, or when its last run

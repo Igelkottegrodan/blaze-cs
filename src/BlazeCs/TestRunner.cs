@@ -85,7 +85,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     // The hot reload engine (HotReload.cs), loaded in the background from the solution's SDK, or why it's unavailable.
     readonly Task<(HotReloadEngine? Engine, string? Unavailable)> _engine = Task.Run(() =>
     {
-        var engine = HotReloadEngine.Load(builder.SdkDirectory, out var unavailable);
+        // Windows keeps a loaded assembly's file locked: a host that stays up would keep the build (blaze-cs's
+        // copies, and any dotnet build) from replacing the project outputs next to its test assembly.
+        string? unavailable = WindowsUnavailable;
+        var engine = OperatingSystem.IsWindows() ? null : HotReloadEngine.Load(builder.SdkDirectory, out unavailable);
         Console.WriteLine($"{DateTime.Now:O} " + (engine is null ? $"hot reload is unavailable: {unavailable}" : "hot reload engine loaded"));
         // Snapshots of daemons that died without their Dispose.
         var roots = Path.Combine(builder.StateDirectory, "hotreload");
@@ -100,6 +103,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         return (engine, unavailable);
     });
+
+    const string WindowsUnavailable = "on Windows, a test host that stays up keeps the project outputs it loaded locked, and builds couldn't replace them";
 
     static bool Running(int pid)
     {

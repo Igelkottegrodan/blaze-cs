@@ -20,6 +20,17 @@ public sealed class HotReloadEngineTests : IDisposable
         Assert.Equal($"the SDK has no dotnet-watch in {Path.Combine(_sdk.FullName, "DotnetTools")}", unavailable);
     }
 
+    // As in SDK 10.0.100: a dotnet-watch, but without the engine's ExternalAccess.HotReload.
+    [Fact]
+    public void ADotnetWatchWithoutTheHotReloadServiceHasNoEngine()
+    {
+        var watch = Directory.CreateDirectory(Path.Combine(_sdk.FullName, "DotnetTools", "dotnet-watch")).FullName;
+        Directory.CreateDirectory(Path.Combine(watch, "10.0.100", "tools", "net10.0", "any"));
+
+        Assert.Null(HotReloadEngine.Load(_sdk.FullName, out var unavailable));
+        Assert.Equal($"the SDK's dotnet-watch has no Microsoft.CodeAnalysis.ExternalAccess.HotReload.dll in {watch}", unavailable);
+    }
+
     [Fact]
     public void ADotnetWatchWithoutTheEngineAssembliesHasNoEngine()
     {

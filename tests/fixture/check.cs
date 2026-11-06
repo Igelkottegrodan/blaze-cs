@@ -1024,6 +1024,25 @@ void PreparedHostsSeeNewBytes()
         + (OperatingSystem.IsLinux() ? ", which had loaded no project output" : ""));
 }
 
+// Why the running daemon has no hot reload engine (on Windows, or an SDK without the one blaze-cs knows), or null if it has.
+string? HotReloadUnavailableBecause()
+{
+    var log = ReadLog("daemon.log");
+    var since = log.LastIndexOf($"(pid {Daemons().Last().Pid}, exits after", StringComparison.Ordinal);
+    var deadline = Stopwatch.StartNew();
+    while (deadline.Elapsed < TimeSpan.FromSeconds(30))
+    {
+        var current = ReadLog("daemon.log")[Math.Max(0, since)..];
+        if (current.Contains(" hot reload engine loaded"))
+            return null;
+        if (Regex.Match(current, @"^\S+ hot reload is unavailable: (.+?)\r?$", RegexOptions.Multiline) is { Success: true } unavailable)
+            return unavailable.Groups[1].Value;
+        Thread.Sleep(100);
+    }
+    Fail($"expected the daemon to log whether hot reload is available:\n{log}");
+    return null;
+}
+
 // Hosts that stay up after their run (TestRunner.Keep), by pid, with their project, as the daemon logs them; only
 // those still running.
 Dictionary<int, string> LiveHosts() =>
@@ -1039,6 +1058,11 @@ Dictionary<int, string> LiveHosts() =>
 // stay up for the four run most recently.)
 void HotReloadBodyEdit()
 {
+    if (HotReloadUnavailableBecause() is { } reason)
+    {
+        Console.WriteLine($"ok  hot reload: unavailable here ({reason}); the test runs above took the path without it");
+        return;
+    }
     var reloadedInto = new HashSet<string>();
     foreach (var undo in new[] { false, true })
     {
@@ -1127,7 +1151,8 @@ void HotReloadUnavailable()
     {
         Run(blaze, "build", environment: new() { ["BLAZE_CS_DOTNET_WATCH"] = empty });
         var daemon = Daemons().Last().Pid;
-        var unavailable = $"blaze-cs: hot reload is unavailable: the SDK has no Microsoft.CodeAnalysis.Workspaces.dll in {empty}";
+        var unavailable = OperatingSystem.IsWindows() ? "blaze-cs: hot reload is unavailable: on Windows"
+            : $"blaze-cs: hot reload is unavailable: the SDK has no Microsoft.CodeAnalysis.Workspaces.dll in {empty}";
         var first = Run(blaze, "test");
         if (Regex.Matches(first, "^blaze-cs: hot reload", RegexOptions.Multiline).Count != 1 || !first.Contains(unavailable))
             Fail($"hot reload unavailable: expected one line \"{unavailable}\":\n{first}");
@@ -1333,7 +1358,8 @@ void FailedRunsAgain()
         {
             var (output, exitCode) = RunWithExit(blaze, "test", check: false);
             if (exitCode == 0 || !Regex.IsMatch(output, @"^\s*Failed!\s+- Failed:\s+1, .* - Tests\.dll\b", RegexOptions.Multiline)
-                || run == 2 && (Rebuilt(output).Count != 0 || !Regex.IsMatch(output, @"^blaze-cs: Tests\.dll: ran again in its test host \(pid \d+\)", RegexOptions.Multiline)))
+                || run == 2 && (Rebuilt(output).Count != 0
+                    || HotReloadUnavailableBecause() is null && !Regex.IsMatch(output, @"^blaze-cs: Tests\.dll: ran again in its test host \(pid \d+\)", RegexOptions.Multiline)))
                 Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? ", in its test host, and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
         }
     }
