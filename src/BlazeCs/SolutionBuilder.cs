@@ -27,6 +27,7 @@ sealed partial class SolutionBuilder
     Dictionary<ProjectCompiler, List<ProjectCompiler>> _dependents = [];
     Dictionary<string, HashSet<string>> _copies = new(PathComparer.Instance);
     IReadOnlyDictionary<string, string> _runSettings = new Dictionary<string, string>();
+    IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> _globalProperties = new Dictionary<string, IReadOnlyDictionary<string, string>>();
     Dictionary<string, string> _imagePaths = new(PathComparer.Instance);
     Dictionary<string, ProjectCompiler> _producers = new(PathComparer.Instance);
     Dictionary<string, Image> _images = new(PathComparer.Instance);
@@ -113,6 +114,7 @@ sealed partial class SolutionBuilder
         UnitsCache.Write(units.Values);
 
         _runSettings = info.RunSettings;
+        _globalProperties = info.GlobalProperties;
         _copies = new(PathComparer.Instance);
         foreach (var (from, to) in info.Copies)
         {
@@ -336,13 +338,17 @@ sealed partial class SolutionBuilder
         if (!Settle(log))
             return false;
         var stopwatch = Stopwatch.StartNew();
-        if (ChangedMSBuildInput() is { } input)
+        var (inputs, changedInputs) = ChangedMSBuildInputs();
+        IReadOnlyList<ProjectCompiler> reevaluated = [];
+        if (changedInputs.Count > 0)
         {
-            log($"blaze-cs: {Path.GetRelativePath(_solutionDirectory, input)} changed, running dotnet build");
-            return Load(log);
+            if (ReevaluateProjectFiles(log, inputs, changedInputs) is not { } replaced)
+                return Load(log);
+            reevaluated = replaced;
         }
 
         var changed = _units.AsParallel().Where(u => u.Refresh()).ToHashSet();
+        changed.UnionWith(reevaluated);
         var scanned = stopwatch.ElapsedMilliseconds;
         if (changed.FirstOrDefault(u => u.Unit.SlowPathReason is not null || u.StaleArguments is not null || _analyzerUnits.Contains(u)) is { } special)
         {
@@ -953,11 +959,115 @@ sealed partial class SolutionBuilder
         return inputs;
     }
 
-    string? ChangedMSBuildInput()
+    /// <summary>The MSBuild inputs now, and those that changed, were added or were deleted since the last load.</summary>
+    (Dictionary<string, DateTime> Current, List<string> Changed) ChangedMSBuildInputs()
     {
         var current = MSBuildInputs();
-        return current.Keys.Union(_msbuildInputs.Keys, PathComparer.Instance)
-            .FirstOrDefault(path => current.GetValueOrDefault(path) != _msbuildInputs.GetValueOrDefault(path));
+        return (current, [.. current.Keys.Union(_msbuildInputs.Keys, PathComparer.Instance)
+            .Where(path => current.GetValueOrDefault(path) != _msbuildInputs.GetValueOrDefault(path))]);
+    }
+
+    /// <summary>The SDK's MSBuild in this process, once a project file edit has started it.</summary>
+    MSBuildHost? _msbuild;
+
+    /// <summary>Why MSBuild can't run in this process, once starting it failed: edits then go through dotnet build.</summary>
+    string? _msbuildUnavailable;
+
+    /// <summary>
+    /// When every changed MSBuild input is the project file of held units, evaluates those units again in this
+    /// process and takes the compiler arguments the design-time pass gives them: a unit whose arguments
+    /// changed is replaced, the others stay as they are. Returns the units replaced, which must compile; or
+    /// null, with the reason logged, when the edit needs dotnet build.
+    /// </summary>
+    List<ProjectCompiler>? ReevaluateProjectFiles(Action<string> log, Dictionary<string, DateTime> inputs, List<string> changedInputs)
+    {
+        List<ProjectCompiler>? FallBack(string reason)
+        {
+            log($"blaze-cs: {reason}; running dotnet build");
+            return null;
+        }
+        var edited = changedInputs.ToHashSet(PathComparer.Instance);
+        var reached = _units.Where(u => edited.Contains(u.Unit.ProjectFile)).ToList();
+        // Anything but an edit to an existing project file of the solution's units: a new or deleted file, an
+        // import, the solution, config.
+        if (changedInputs.FirstOrDefault(path => !path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)
+                || !inputs.ContainsKey(path) || !_msbuildInputs.ContainsKey(path)
+                || !reached.Any(u => PathComparer.Instance.Equals(u.Unit.ProjectFile, path))) is { } other)
+        {
+            // As before: "<file> changed, running dotnet build".
+            log($"blaze-cs: {Path.GetRelativePath(_solutionDirectory, other)} changed, running dotnet build");
+            return null;
+        }
+        if (_msbuildUnavailable is { } unavailable)
+            return FallBack($"in-process MSBuild: {unavailable}");
+        if (reached.FirstOrDefault(u => !_globalProperties.ContainsKey(u.Unit.Key)) is { } unrecorded)
+            return FallBack($"{unrecorded.Unit.Name}: its build's global properties weren't recorded");
+
+        var stopwatch = Stopwatch.StartNew();
+        Dictionary<string, MSBuildHost.Evaluated> evaluated;
+        try
+        {
+            _msbuild ??= MSBuildHost.Start(_stateDirectory);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"{DateTime.Now:O} {e}");
+            _msbuildUnavailable = e.Message.Split('\n')[0];
+            return FallBack($"in-process MSBuild: {_msbuildUnavailable}");
+        }
+        try
+        {
+            var (units, fallback) = _msbuild.Pass(
+                [.. reached.Select(u => new MSBuildHost.Request(u.Unit.Key, u.Unit.ProjectFile, _globalProperties[u.Unit.Key]))], edited);
+            if (fallback is not null)
+                return FallBack(fallback);
+            evaluated = units!;
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"{DateTime.Now:O} {e}");
+            return FallBack($"in-process MSBuild: {e.Message.Split('\n')[0]}");
+        }
+
+        // Dependents and copies are keyed by the paths csc writes, which stay as they were.
+        var replaced = new Dictionary<ProjectCompiler, ProjectCompiler>();
+        foreach (var held in reached)
+        {
+            var unit = held.Unit with { Arguments = evaluated[held.Unit.Key].Arguments };
+            if (!PathComparer.Instance.Equals(unit.AssemblyPath, held.Unit.AssemblyPath)
+                || !PathComparer.Instance.Equals(unit.ReferenceAssemblyPath ?? "", held.Unit.ReferenceAssemblyPath ?? ""))
+                return FallBack($"{held.Unit.Name}: its output path changed");
+            if (held.Matches(unit))
+                continue;
+            try
+            {
+                replaced[held] = new ProjectCompiler(unit, ResolveReference, _analyzers);
+            }
+            catch (InvalidOperationException e)
+            {
+                return FallBack(e.Message);
+            }
+        }
+
+        // A replaced unit compiles against the images its references have, and its dependents see what changed
+        // in its API since the image they compiled against. As when the compiler server replaces one: this runs in
+        // a daemon command, which holds the server's write lock, so no request compiles a unit meanwhile. What the
+        // last build left for the old unit to retry is dropped: the new one compiles in full below.
+        foreach (var (old, unit) in replaced)
+            ReplaceUnit(old, unit);
+        var runSettings = new Dictionary<string, string>(_runSettings, PathComparer.Instance);
+        foreach (var held in reached)
+        {
+            if (evaluated[held.Unit.Key].RunSettingsFilePath is { } path)
+                runSettings[held.Unit.Key] = path;
+            else
+                runSettings.Remove(held.Unit.Key);
+        }
+        _runSettings = runSettings;
+        _msbuildInputs = inputs;
+        log($"blaze-cs: evaluated {string.Join(", ", edited.Select(path => Path.GetFileName(path)).Order())} in process in {stopwatch.ElapsedMilliseconds} ms"
+            + (replaced.Count == 0 ? "; compiler arguments unchanged" : $"; new compiler arguments for {string.Join(", ", replaced.Values.Select(u => u.Unit.Name).Order())}"));
+        return [.. replaced.Values];
     }
 
     /// <summary>Runs the real `dotnet` with its output streamed to the client.</summary>
@@ -969,7 +1079,7 @@ sealed partial class SolutionBuilder
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
-        };
+        }.WithoutMSBuildEnvironment();
         foreach (var (name, value) in environment ?? new Dictionary<string, string>())
             start.Environment[name] = value;
         using var process = new Process { StartInfo = start };
