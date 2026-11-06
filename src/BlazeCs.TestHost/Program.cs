@@ -1,6 +1,9 @@
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
+using System.Reflection.Metadata;
 using System.Runtime.Loader;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -9,45 +12,162 @@ using System.Xml.Linq;
 namespace BlazeCs.TestHost;
 
 /// <summary>
-/// A single-use test host. The daemon starts it ahead of time, so the runtime is already up when a run
-/// needs it; it reads one request line from stdin, runs that test assembly in-process, writes
-/// the result as the last line and exits. Started for one test project (its framework, assembly and a
-/// warm-up assembly as arguments), it gets that project's run ready while it waits (see Prepare). Stdin
-/// closing at any point means the daemon is gone (it stopped or died), and the host exits: at once while
-/// it runs tests, and after preparing while it waits. Test output goes to stdout. Exiting keeps every run's statics,
-/// threads and console redirections apart, and lets the tests load into an ordinary (non-collectible)
-/// context, where precompiled code is used: measured on the fixture, about twice as fast as a collectible one.
+/// A test host. The daemon starts it ahead of time, so the runtime is already up when a run needs it; it
+/// reads a request from stdin, runs that test assembly in-process and writes the result as the last line
+/// (Protocol.cs has the whole exchange). Started for one test project (its framework, assembly and a warm-up
+/// assembly as arguments), it gets that project's run ready while it waits (see Prepare). Then, if the
+/// runtime lets it apply updates, it stays up: each update the daemon sends is applied to the assemblies it
+/// has loaded, and the same test assembly runs again, with its tests discovered anew; otherwise, or on an
+/// exit message, it exits. Stdin closing at any point means the daemon is gone (it stopped or died), and the
+/// host exits: at once while it runs tests, and after preparing while it waits. Test output goes to stdout.
+/// A host runs one test assembly: exiting keeps every assembly's statics, threads and console redirections
+/// apart, and lets the tests load into an ordinary (non-collectible) context, where precompiled code is used
+/// (measured on the fixture, about twice as fast as a collectible one) and updates can be applied.
 /// </summary>
 static partial class Program
 {
-    const string ResultPrefix = "\u0001result:";
-
     static void Main(string[] args)
     {
         var protocol = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+        var daemon = new Daemon();
         // Started for a test project: <framework> <assembly> [--run-settings=<file>] [--warm-up=<assembly>].
         string? Option(string name) => args.FirstOrDefault(a => a.StartsWith(name, StringComparison.Ordinal))?[name.Length..];
         var prepared = args is [var framework, var assembly, ..] ? Prepare(framework, assembly, Option("--run-settings="), Option("--warm-up=")) : null;
-        // End of input means the daemon stopped (or died) without needing this host.
-        if (Console.ReadLine() is not { } request)
+        var first = daemon.Next();
+        if (first is not TestHostRequest request)
+        {
+            Refuse(protocol, "a run", first);
             return;
-        WatchDaemon();
-        var result = Run(JsonSerializer.Deserialize(request, ProtocolJson.Default.Request)!, prepared);
+        }
+        var loaded = Load(request, prepared, out var result);
+        while (true)
+        {
+            result ??= RunTests(request.Framework, loaded!);
+            result = result with { CannotHotReload = result.CannotHotReload ?? CannotHotReload(loaded, result) };
+            Report(protocol, result);
+            if (result.CannotHotReload is not null)
+                Exit();
+            var next = daemon.Next();
+            switch (next)
+            {
+                case TestHostUpdate update:
+                    // Applied, it runs the tests again; otherwise it reports that it ran nothing, and exits.
+                    result = Apply(update) is { } failure ? new TestHostResult(0, 0, 0, 0, null, failure, failure) : null;
+                    break;
+                case TestHostExit:
+                    Exit();
+                    break;
+                default:
+                    Refuse(protocol, "an update or exit", next);
+                    break;
+            }
+        }
+    }
+
+    static void Report(StreamWriter protocol, TestHostResult result)
+    {
         Console.Out.Flush();
-        protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result, ProtocolJson.Default.Result));
+        protocol.WriteLine(TestHostProtocol.ResultPrefix + JsonSerializer.Serialize(result, ProtocolJson.Default.TestHostResult));
+    }
+
+    /// <summary>Reports a message out of turn, or one it couldn't read, as an error, and exits.</summary>
+    [DoesNotReturn]
+    static void Refuse(StreamWriter protocol, string expected, TestHostMessage message)
+    {
+        var error = $"the test host expected {expected} from the daemon, and got " + (message is Unreadable unreadable
+            ? $"a line it couldn't read ({unreadable.Reason})" : $"a {message.GetType().Name} message");
+        Report(protocol, new TestHostResult(0, 0, 0, 0, error, null, error));
+        Exit();
     }
 
     /// <summary>
-    /// Kills this process when stdin ends, on Linux and Windows alike: the daemon's end of the pipe closes with
-    /// the daemon, however it died. The daemon sends nothing after the request, so this reads nothing else.
-    /// The raw stream, since the tests may read Console.In.
+    /// Ends this process at once. Returning from Main would leave it running as long as a foreground thread
+    /// that a test started does; a host's work ends with the daemon's message or its last result.
     /// </summary>
-    static void WatchDaemon() => new Thread(() =>
+    [DoesNotReturn]
+    static void Exit()
     {
-        var stdin = Console.OpenStandardInput();
-        while (stdin.Read(new byte[256]) > 0) { }
+        Console.Out.Flush();
         Process.GetCurrentProcess().Kill();
-    }) { IsBackground = true }.Start();
+        Thread.Sleep(Timeout.Infinite); // until the kill lands
+        throw new UnreachableException();
+    }
+
+    /// <summary>Why this host can't take an update after a run, or null if it can.</summary>
+    static string? CannotHotReload(Loaded? loaded, TestHostResult result) =>
+        loaded is null || result.Unsupported is not null ? "it ran no tests"
+        : !MetadataUpdater.IsSupported ? $"the runtime applies no updates here (it needs {TestHostProtocol.ModifiableAssemblies}=debug)"
+        : null;
+
+    /// <summary>A line from the daemon that isn't a message, which the host reports and exits on.</summary>
+    sealed record Unreadable(string Reason) : TestHostMessage;
+
+    /// <summary>
+    /// The daemon's messages, read from stdin on a thread of their own, so that stdin closing is seen at once,
+    /// on Linux and Windows alike: the daemon's end of the pipe closes with the daemon, however it died. The
+    /// host then exits at once, unless it is preparing, which it finishes first. Once it has taken a message
+    /// it is busy with it, and the result would go nowhere. The raw stream: Console.In is emptied, so tests
+    /// that read it don't take the daemon's lines.
+    /// </summary>
+    sealed class Daemon
+    {
+        readonly BlockingCollection<TestHostMessage> _messages = [];
+        readonly object _gate = new();
+        bool _busy, _ended;
+
+        public Daemon()
+        {
+            Console.SetIn(TextReader.Null);
+            new Thread(() =>
+            {
+                // The serializers' code and metadata (the messages' about 120 methods), compiled while the host
+                // waits rather than when the request comes.
+                _ = JsonSerializer.Deserialize("""{"kind":"exit"}""", ProtocolJson.Default.TestHostMessage);
+                _ = JsonSerializer.Serialize(new TestHostResult(0, 0, 0, 0, null, null), ProtocolJson.Default.TestHostResult);
+                using var stdin = new StreamReader(Console.OpenStandardInput());
+                while (stdin.ReadLine() is { } line)
+                    _messages.Add(Read(line));
+                lock (_gate)
+                {
+                    _ended = true;
+                    if (_busy)
+                        Exit();
+                }
+                _messages.CompleteAdding();
+            }) { IsBackground = true }.Start();
+        }
+
+        static TestHostMessage Read(string line)
+        {
+            try
+            {
+                return JsonSerializer.Deserialize(line, ProtocolJson.Default.TestHostMessage) ?? new Unreadable("null");
+            }
+            catch (Exception e) when (e is JsonException or NotSupportedException)
+            {
+                return new Unreadable(e.Message);
+            }
+        }
+
+        /// <summary>
+        /// The next message, after which the host is busy until it asks for another. Exits if stdin has
+        /// ended, even with a message left: the daemon that sent it is gone.
+        /// </summary>
+        public TestHostMessage Next()
+        {
+            lock (_gate)
+                _busy = false;
+            _ = _messages.TryTake(out var message, Timeout.Infinite);
+            lock (_gate)
+            {
+                // Taking nothing means stdin has ended.
+                if (_ended)
+                    Exit();
+                _busy = true;
+            }
+            return message!;
+        }
+    }
 
     /// <summary>
     /// Gets a test project's run ready before the daemon asks for it: creates the project's load context, loads
@@ -117,15 +237,17 @@ static partial class Program
         return directory;
     }
 
-    static Result Run(Request request, TestContext? prepared)
+    /// <summary>A test assembly loaded in its context, with the .runsettings it runs with.</summary>
+    sealed record Loaded(TestContext Context, Assembly Assembly, Settings Settings);
+
+    /// <summary>Loads the request's test assembly, or reports why it can't run.</summary>
+    static Loaded? Load(TestHostRequest request, TestContext? prepared, out TestHostResult? failure)
     {
-        var (output, error) = (Console.Out, Console.Error);
         var assemblyPath = request.Assembly;
-        Func<Result> run;
+        failure = null;
         try
         {
             var settings = Settings.Read(request.RunSettings);
-            var directory = EnterDirectory(assemblyPath);
             var context = prepared?.AssemblyPath == assemblyPath ? prepared : new TestContext(assemblyPath);
             _ = context.EnterContextualReflection(); // for the rest of this process
             var assembly = context.LoadFromAssemblyPath(assemblyPath);
@@ -136,16 +258,42 @@ static partial class Program
                 try { _ = context.LoadFromAssemblyName(reference); }
                 catch (Exception e) when (e is IOException or BadImageFormatException)
                 {
-                    return new Result(0, 0, 0, 0, $"the test host (.NET {Environment.Version}) can't load {reference.FullName}: {e.Message}", null);
+                    failure = new TestHostResult(0, 0, 0, 0, $"the test host (.NET {Environment.Version}) can't load {reference.FullName}: {e.Message}", null);
+                    return null;
                 }
             }
-            run = Runner(request.Framework, context, assembly, directory, output, settings);
+            return new Loaded(context, assembly, settings);
         }
         catch (Exception e)
         {
             // Nothing ran: the daemon falls back to `dotnet test`.
-            var cause = Unwrap(e);
-            return new Result(0, 0, 0, 0, null, $"{cause.GetType().Name}: {cause.Message}");
+            failure = NothingRan(e);
+            return null;
+        }
+    }
+
+    static TestHostResult NothingRan(Exception e)
+    {
+        var cause = Unwrap(e);
+        return new TestHostResult(0, 0, 0, 0, null, $"{cause.GetType().Name}: {cause.Message}");
+    }
+
+    /// <summary>
+    /// Runs a loaded test assembly's tests with a new runner, which discovers them anew: after an update, the
+    /// assembly's current methods and types.
+    /// </summary>
+    static TestHostResult RunTests(string framework, Loaded loaded)
+    {
+        var (output, error) = (Console.Out, Console.Error);
+        Func<TestHostResult> run;
+        try
+        {
+            var directory = EnterDirectory(loaded.Assembly.Location);
+            run = Runner(framework, loaded.Context, loaded.Assembly, directory, output, loaded.Settings);
+        }
+        catch (Exception e)
+        {
+            return NothingRan(e);
         }
 
         try
@@ -154,7 +302,7 @@ static partial class Program
         }
         catch (Exception e)
         {
-            return new Result(0, 0, 0, 0, Unwrap(e).ToString(), null);
+            return new TestHostResult(0, 0, 0, 0, Unwrap(e).ToString(), null);
         }
         finally
         {
@@ -165,10 +313,120 @@ static partial class Program
     }
 
     /// <summary>
+    /// Applies an update's deltas to the loaded assemblies they name, then calls every loaded assembly's
+    /// metadata update handlers (the runtime's reflection caches among them) as dotnet-watch's agent does,
+    /// so the next run's reflection sees the updated types. Returns why it couldn't, or null.
+    /// </summary>
+    static string? Apply(TestHostUpdate update)
+    {
+        List<Type>? updatedTypes = [];
+        try
+        {
+            foreach (var delta in update.Deltas)
+            {
+                var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => !a.IsDynamic && a.ManifestModule.ModuleVersionId == delta.Module);
+                if (assembly is null)
+                    return $"the test host couldn't apply the update: it has loaded no assembly with module {delta.Module}";
+                MetadataUpdater.ApplyUpdate(assembly, delta.Metadata, delta.IL, delta.Pdb);
+                if (delta.UpdatedTypes is null)
+                    updatedTypes = null;
+                else
+                {
+                    foreach (var token in delta.UpdatedTypes)
+                    {
+                        try { updatedTypes?.Add(assembly.ManifestModule.ResolveType(token)); }
+                        catch (ArgumentException) { }
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            var cause = Unwrap(e);
+            return $"the test host couldn't apply the update: {cause.GetType().Name}: {cause.Message}";
+        }
+        CallUpdateHandlers(updatedTypes?.ToArray());
+        return null;
+    }
+
+    /// <summary>
+    /// Calls ClearCache, then UpdateApplication, on each [MetadataUpdateHandler] type of every loaded assembly,
+    /// as dotnet-watch's agent does (MetadataUpdateHandlerInvoker in dotnet/sdk): each assembly's references
+    /// before it (CoreLib's reflection cache first, a test framework's before the tests'), the attribute
+    /// matched by name. Null types means any may have changed. A handler that fails leaves its own cache
+    /// stale, which the run that follows shows.
+    /// </summary>
+    static void CallUpdateHandlers(Type[]? types)
+    {
+        var handlers = DependenciesFirst(AppDomain.CurrentDomain.GetAssemblies()).SelectMany(UpdateHandlers).ToList();
+        foreach (var name in new[] { "ClearCache", "UpdateApplication" })
+        {
+            foreach (var handler in handlers)
+            {
+                try { handler.GetMethod(name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic, [typeof(Type[])])?.Invoke(null, [types]); }
+                catch (Exception) { }
+            }
+        }
+    }
+
+    static List<Type> UpdateHandlers(Assembly assembly)
+    {
+        try
+        {
+            return [.. assembly.GetCustomAttributesData()
+                .Where(a => a.AttributeType.FullName == "System.Reflection.Metadata.MetadataUpdateHandlerAttribute")
+                .Select(a => a.ConstructorArguments is [{ Value: Type handler }] ? handler : null)
+                .OfType<Type>()];
+        }
+        catch (Exception) // an attribute whose type doesn't load
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Assemblies ordered so that each comes after those it references, by simple name, the first loaded of a
+    /// name standing for all (the agent's TopologicalSort).
+    /// </summary>
+    static List<Assembly> DependenciesFirst(Assembly[] assemblies)
+    {
+        static string? Name(Assembly assembly)
+        {
+            try { return assembly.GetName().Name; }
+            catch (Exception) { return null; }
+        }
+        var byName = new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
+        foreach (var assembly in assemblies)
+        {
+            if (Name(assembly) is { } name)
+                byName.TryAdd(name, assembly);
+        }
+        var sorted = new List<Assembly>(assemblies.Length);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Visit(Assembly assembly)
+        {
+            if (Name(assembly) is not { } name || !visited.Add(name))
+                return;
+            AssemblyName[] references;
+            try { references = assembly.GetReferencedAssemblies(); }
+            catch (Exception) { references = []; }
+            foreach (var reference in references)
+            {
+                if (reference.Name is { } referenceName && byName.TryGetValue(referenceName, out var dependency))
+                    Visit(dependency);
+            }
+            sorted.Add(assembly);
+        }
+        foreach (var assembly in assemblies)
+            Visit(assembly);
+        return sorted;
+    }
+
+    /// <summary>
     /// A framework's runner for one test assembly, ready to run. The directory is the test project's output
     /// directory, where xUnit v2's adapter is.
     /// </summary>
-    static Func<Result> Runner(string framework, AssemblyLoadContext context, Assembly assembly, string directory, TextWriter output, Settings settings) => framework switch
+    static Func<TestHostResult> Runner(string framework, AssemblyLoadContext context, Assembly assembly, string directory, TextWriter output, Settings settings) => framework switch
     {
         "xunit3" => XunitV3(context, assembly, output),
         "xunit2" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyPath(XunitV2Adapter(directory))
@@ -183,7 +441,7 @@ static partial class Program
     /// xUnit's in-process runner, which takes the test assembly explicitly: the assembly's own Main would
     /// run whatever Assembly.GetEntryAssembly() is, this host. Totals come from its XML report.
     /// </summary>
-    static Func<Result> XunitV3(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    static Func<TestHostResult> XunitV3(AssemblyLoadContext context, Assembly assembly, TextWriter output)
     {
         var reportPath = Path.Combine(Path.GetTempPath(), $"blaze-cs-{Environment.ProcessId}.xml");
         var runnerType = context.LoadFromAssemblyName(new AssemblyName("xunit.v3.runner.inproc.console"))
@@ -204,7 +462,7 @@ static partial class Program
                     ?? throw new InvalidOperationException("xUnit wrote no results");
                 int Count(string name) => int.Parse(report.Attribute(name)?.Value ?? "0");
                 // Its total includes explicit tests that weren't asked for, which `dotnet test` leaves out.
-                return new Result(Count("total") - Count("not-run"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null);
+                return new TestHostResult(Count("total") - Count("not-run"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null);
             }
             finally
             {
@@ -217,7 +475,7 @@ static partial class Program
     /// NUnit's FrameworkController, which its engine and VSTest adapter drive too: RunTests returns the
     /// results as XML (a test-suite with totals, and a test-case per test with any failure and output).
     /// </summary>
-    static Func<Result> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings settings)
+    static Func<TestHostResult> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings settings)
     {
         var type = context.LoadFromAssemblyName(new AssemblyName("nunit.framework"))
             .GetType("NUnit.Framework.Api.FrameworkController", throwOnError: true)!;
@@ -242,7 +500,7 @@ static partial class Program
             }
             int Count(string name) => int.Parse(suite.Attribute(name)?.Value ?? "0");
             // As the VSTest adapter does by default: warnings and inconclusive results count as skipped.
-            return new Result(Count("total"), Count("passed"), Count("failed"),
+            return new TestHostResult(Count("total"), Count("passed"), Count("failed"),
                 Count("skipped") + Count("inconclusive") + Count("warnings"), null, null);
         };
     }
@@ -252,7 +510,7 @@ static partial class Program
     /// .runsettings. Its run context and framework handle are proxies for the test's own copy of the VSTest
     /// object model, so the host doesn't reference it.
     /// </summary>
-    static Func<Result> VSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings runSettings, Type executorType)
+    static Func<TestHostResult> VSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings runSettings, Type executorType)
     {
         var executor = Activator.CreateInstance(executorType)!;
         var objectModel = context.LoadFromAssemblyName(new AssemblyName("Microsoft.VisualStudio.TestPlatform.ObjectModel"));
@@ -289,7 +547,7 @@ static partial class Program
     {
         int _total, _passed, _failed, _skipped;
 
-        public Result Result() => new(_total, _passed, _failed, _skipped, null, null);
+        public TestHostResult Result() => new(_total, _passed, _failed, _skipped, null, null);
 
         public object? Invoke(MethodInfo method, object?[] arguments)
         {
@@ -346,14 +604,9 @@ static partial class Program
 
     static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;
 
-    /// <summary>What to run: a framework (xunit3, xunit2, nunit, mstest), an assembly, and the .runsettings that applies, if any.</summary>
-    internal sealed record Request(string Framework, string Assembly, string? RunSettings);
-
-    internal sealed record Result(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
-
-    /// <summary>The request and result, serialized by generated code: it needs much less compiled at run time than reflection.</summary>
-    [JsonSerializable(typeof(Request))]
-    [JsonSerializable(typeof(Result))]
+    /// <summary>The protocol's messages, serialized by generated code: it needs much less compiled at run time than reflection.</summary>
+    [JsonSerializable(typeof(TestHostMessage))]
+    [JsonSerializable(typeof(TestHostResult))]
     sealed partial class ProtocolJson : JsonSerializerContext;
 
     /// <summary>
