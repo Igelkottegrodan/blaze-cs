@@ -149,10 +149,13 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     readonly ConcurrentDictionary<string, (FileStamp Stamp, string Hash)> _hashes = new(PathComparer.Instance);
 
     /// <summary>
-    /// What a test run reports: whether it passed, in a few words for the next unchanged run, and whether it
-    /// ran in a host that took the edit as a delta.
+    /// What a test run reports: whether it passed, in a few words for the next unchanged run, whether it ran
+    /// tests in a host that took the edit as a delta, and whether it ran any test. A hot reload whose delta
+    /// reaches no test class runs none: its project's result is the last results of classes that all passed
+    /// in a new host (TestSelection's caller runs every class that ran hot reloaded), so it counts as such a
+    /// pass, and as no run of the project when the most recently run projects get hosts.
     /// </summary>
-    readonly record struct Outcome(bool Passed, string Result, bool HotReloaded = false);
+    readonly record struct Outcome(bool Passed, string Result, bool HotReloaded = false, bool Ran = true);
 
     /// <param name="all">Run every test project, not only those whose inputs changed since they passed.</param>
     public int Run(bool all, Action<string> log)
@@ -201,7 +204,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             while (inHost.TryDequeue(out var test))
             {
                 var outcome = RunHosted(test.Unit, test.Request, inputs[test.Unit], all, kept, log);
-                if (outcome is not null)
+                if (outcome is { Ran: true })
                 {
                     lock (_recent)
                     {
@@ -382,7 +385,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         lock (_hostConfigs)
             output.ForEach(log);
         var all = (unchanged?.Values ?? Enumerable.Empty<TestCounts>()).Aggregate(new TestCounts(result.Passed, result.Failed, result.Skipped), (sum, counts) => sum + counts);
-        return new Outcome(passed, Counts(all), hotReloaded);
+        var ranNone = classes is [] && result is { Total: 0, Error: null };
+        return new Outcome(passed, Counts(all), hotReloaded && !ranNone, Ran: !ranNone);
     }
 
     /// <summary>A passing run's counts, in a few words.</summary>

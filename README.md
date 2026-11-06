@@ -172,7 +172,9 @@ its own:
   around every test (a module initializer, an assembly fixture, assembly initialize) reaches it, or when the framework
   names a test class after no type (a generic test class); the daemon log says which. A test class that
   looks types up by name (`Type.GetType`, `Assembly.GetTypes`, `Activator.CreateInstance`) runs after
-  every hot reload. `blaze-cs test --all` runs every test.
+  every hot reload. A delta that reaches no test class of a project runs none of its tests: its result is
+  the classes' passes in a new host, so it counts as such a pass (not hot reloaded), and as no run when
+  the most recently run projects keep their hosts. `blaze-cs test --all` runs every test.
 - **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
   (its own, and every project output copied next to it), its `.deps.json` or its `.runsettings` differs
   from when it last ran in this daemon, when it hasn't run in this daemon yet, or when its last run
