@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>blaze-cs-client</AssemblyName>
+    <RootNamespace>BlazeCs</RootNamespace>
+    <!-- The CLI's start-up is the runtime's (~20 ms) plus JIT-compiling the socket code (~25 ms), so
+         ReadyToRun on the CLI does not help (measured). Native AOT does: no runtime start, ~5 ms.
+         `dotnet build` publishes it next to the CLI, so one build step produces both. -->
+    <PublishAot>true</PublishAot>
+    <RuntimeIdentifier>$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <!-- Keep the managed intermediate out of artifacts/bin, where the native executable goes. -->
+    <OutDir>$(MSBuildThisFileDirectory)../../artifacts/client/</OutDir>
+    <PublishDir>$(MSBuildThisFileDirectory)../../artifacts/bin/</PublishDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../BlazeCs/DaemonClient.cs" />
+  </ItemGroup>
+  <Target Name="PublishNativeClient" AfterTargets="Build" Condition="'$(_IsPublishing)' != 'true'">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="NoBuild=true;_IsPublishing=true" />
+  </Target>
+</Project>

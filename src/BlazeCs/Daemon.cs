@@ -11,9 +11,6 @@ namespace BlazeCs;
 /// </summary>
 static class Daemon
 {
-    public const string ExitPrefix = "\u0001exit:";
-    public const string RestartPrefix = "\u0001restart:";
-
     /// <summary>The identity of this build of blaze-cs: clients send theirs with each command.</summary>
     public static readonly Guid Build = typeof(Daemon).Module.ModuleVersionId;
 
@@ -75,7 +72,7 @@ static class Daemon
                 {
                     File.Delete(socketPath);
                     Log("blaze-cs: daemon stopped");
-                    writer.WriteLine($"{ExitPrefix}0");
+                    writer.WriteLine($"{DaemonClient.ExitPrefix}0");
                     return 0;
                 }
 
@@ -83,7 +80,7 @@ static class Daemon
                 {
                     Console.WriteLine($"{DateTime.Now:O} a client of another build sent {request?.Command}; exiting");
                     File.Delete(socketPath);
-                    writer.WriteLine($"{RestartPrefix}{Environment.ProcessId}");
+                    writer.WriteLine($"{DaemonClient.RestartPrefix}{Environment.ProcessId}");
                     return 0;
                 }
 
@@ -104,7 +101,7 @@ static class Daemon
                 exitCode = 1;
             }
 
-            try { writer.WriteLine($"{ExitPrefix}{exitCode}"); }
+            try { writer.WriteLine($"{DaemonClient.ExitPrefix}{exitCode}"); }
             catch (IOException) { }
         }
     }

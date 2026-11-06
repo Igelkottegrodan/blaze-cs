@@ -229,7 +229,29 @@ void DaemonLifecycle()
     daemons = Daemons();
     if (output.Contains("another build") || daemons.Count != 3 || !Running(daemons[2].Pid) || !Regex.IsMatch(output, "^blaze-cs: up to date", RegexOptions.Multiline))
         Fail($"after an idle exit: expected the next command to start a daemon without a notice and build, got {daemons.Count} daemons:\n{output}");
-    Console.WriteLine($"ok  daemon lifecycle: another build restarted daemon {first.Pid} as {idle.Pid}, which exited on its own after 5 s idle; the next command started {daemons[2].Pid}");
+
+    // The same handover through the native client (a build has one unless it was packed as a tool): first as
+    // the client of another build, which reads its identity from the blaze-cs.dll beside it, then as this
+    // repo's launcher, whose client is the native one unless BLAZE_CS names an installed tool. Each hands
+    // the daemon over with a notice and has the CLI start the next one.
+    var native = Path.Combine(otherBuild, OperatingSystem.IsWindows() ? "blaze-cs-client.exe" : "blaze-cs-client");
+    var nativeNote = "";
+    if (File.Exists(native))
+    {
+        Handover(native, daemons[2].Pid, 4, new() { ["BLAZE_CS_IDLE_SECONDS"] = "5" });
+        Handover(blaze, Daemons()[3].Pid, 5, null);
+        nativeNote = "; the same through the native client";
+    }
+    Console.WriteLine($"ok  daemon lifecycle: another build restarted daemon {first.Pid} as {idle.Pid}, which exited on its own after 5 s idle; the next command started {daemons[2].Pid}{nativeNote}");
+}
+
+// A command whose build differs from the running daemon's: a notice, that daemon gone, one more daemon.
+void Handover(string client, int old, int expectedDaemons, Dictionary<string, string>? environment)
+{
+    var output = Run(client, "build", environment: environment);
+    var daemons = Daemons();
+    if (!output.Contains("blaze-cs: the running daemon is from another build") || daemons.Count != expectedDaemons || Running(old))
+        Fail($"daemon handshake through {Path.GetFileName(client)}: expected a notice, daemon {old} gone and {expectedDaemons} daemons, got {daemons.Count}:\n{output}");
 }
 
 static void CopyDirectory(string from, string to)
