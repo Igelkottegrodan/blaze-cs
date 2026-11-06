@@ -324,7 +324,6 @@ void NoHostsLeft(string cause)
     Console.WriteLine($"ok  no test hosts left after {cause}");
 }
 
-// This fixture copy's test host processes: blaze-cs-testhost.dll from this repo's build of blaze-cs.
 // This fixture's hosts, wherever blaze-cs runs from (the clone or an installed tool): each runs on a
 // runtimeconfig.json named after the daemon that started it.
 List<(int Pid, string Command)> TestHostProcesses()
@@ -342,6 +341,7 @@ IEnumerable<(int Pid, string Command)> Processes()
         .Select(line => line.Split(' ', 2))
         .Where(parts => parts.Length == 2 && int.TryParse(parts[0], out _))
         .Select(parts => (int.Parse(parts[0]), parts[1]));
+}
 
 // A project removed from the solution is no unit any more, though an incremental build logs nothing about
 // it: the reload drops it (here with its obj/ deleted too, which must not break the load), later builds
