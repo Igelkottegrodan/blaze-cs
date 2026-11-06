@@ -206,6 +206,9 @@ if (hasNet11)
     Replace("Fixture.slnx", "</Solution>", "  <Project Path=\"Tests11/Tests11.csproj\" />\n</Solution>");
 else
     Directory.Delete(Path.Combine(work, "Tests11"), recursive: true);
+// The projects whose tests passed hot reloaded in the last `blaze-cs test`, and in the one before: a hot reloaded
+// pass doesn't count as one, so they run again on the next `test` (RanTests), whether or not they changed.
+HashSet<string> hotReloaded = [], hotReloadedBefore = [];
 // The daemon takes the SDK's compiler-server pipe, one per user and SDK on the machine, and the checks of builds
 // through it expect it to be this check's: another check of the same SDK (another worktree's) waits for this one.
 using var pipeLock = LockSdkPipe();
@@ -213,9 +216,6 @@ var passed = false;
 var loadedProjects = 0; // from the last "loaded N projects" line a command printed
 // BLAZE_CS_COMPILER_SERVER=0 turns the daemon's compiler-server pipe off; the checks of builds through it are skipped.
 var serverOff = Environment.GetEnvironmentVariable("BLAZE_CS_COMPILER_SERVER") == "0";
-// The projects whose tests passed hot reloaded in the last `blaze-cs test`, and in the one before: a hot reloaded
-// pass doesn't count as one, so they run again on the next `test` (RanTests), whether or not they changed.
-HashSet<string> hotReloaded = [], hotReloadedBefore = [];
 string? sdkPipe = null; // once the first daemon names it
 try
 {
@@ -836,6 +836,17 @@ string SdkDirectory()
 // next dotnet build starts the SDK's server again. Ends with a daemon running, warmed up.
 void PipeHandedOver(string pipe)
 {
+    // With test hosts live for hot reload, where the daemon has the engine: giving the pipe up and taking it back
+    // leaves them, and their sessions, alone.
+    Dictionary<int, string> live = [];
+    if (HotReloadUnavailableBecause() is null)
+    {
+        Run(blaze, "test --all");
+        live = ReadyLiveHosts("before dotnet build-server shutdown", allTests);
+        if (live.Count == 0)
+            Fail($"before dotnet build-server shutdown: expected test hosts live with their hot reload sessions:\n{ReadLog("daemon.log")}");
+    }
+
     // The daemon stops serving the pipe, then answers with a process id no system gives: the command waits
     // for that process to exit (SDK 10.0.1xx's with no timeout of its own), finds it gone and exits 0.
     var mark = LogMark();
@@ -858,7 +869,10 @@ void PipeHandedOver(string pipe)
     compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
     if (!Served(LogSince(mark)).SetEquals(lib) || !compiles.Keys.ToHashSet().SetEquals(lib))
         Fail($"dotnet build after the daemon took the pipe back: expected it to answer Lib's compiles, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
-    Console.WriteLine("ok  dotnet build-server shutdown: exit 0; the daemon gave the pipe up and kept running, dotnet build started VBCSCompiler on it, and the next blaze-cs build took it back");
+    var kept = LiveHosts();
+    if (live.Any(host => !kept.ContainsKey(host.Key)))
+        Fail($"pipe handover: expected the live test hosts ({string.Join(", ", live.Select(h => $"{h.Value} (pid {h.Key})"))}) still up, got {string.Join(", ", kept.Select(h => $"{h.Value} (pid {h.Key})"))}:\n{ReadLog("daemon.log")}");
+    Console.WriteLine($"ok  dotnet build-server shutdown: exit 0; the daemon gave the pipe up and kept running, dotnet build started VBCSCompiler on it, and the next blaze-cs build took it back{(live.Count > 0 ? $"; the {live.Count} test hosts live for hot reload stayed up through it" : "")}");
 
     Run(blaze, "stop");
     if (Held(pipe) || PipeAnswers(pipe))
