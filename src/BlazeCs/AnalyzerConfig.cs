@@ -14,7 +14,7 @@ namespace BlazeCs;
 sealed class ProjectConfig
 {
     readonly AnalyzerConfigSet? _set;
-    readonly ConcurrentDictionary<string, AnalyzerConfigOptionsResult> _byPath = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<string, AnalyzerConfigOptionsResult> _byPath = new(PathComparer.Instance);
 
     public ProjectConfig(IEnumerable<string> configPaths)
     {

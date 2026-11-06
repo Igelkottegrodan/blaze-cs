@@ -49,6 +49,14 @@ static class Program
     [MethodImpl(MethodImplOptions.NoInlining)]
     static int RunDaemon(string solutionPath)
     {
+        // The daemon has no terminal: what it prints, crashes included, goes to its log.
+        var log = DaemonLog(solutionPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(log)!);
+        var writer = new StreamWriter(new FileStream(log, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) { AutoFlush = true };
+        Console.SetOut(writer);
+        Console.SetError(writer);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => Console.Error.WriteLine($"{DateTime.Now:O} {e.ExceptionObject}");
+
         // Before anything JIT-compiles a method that mentions a Roslyn type.
         var sdkDirectory = SdkRoslyn.Install(Path.GetDirectoryName(solutionPath)!);
         return Daemon.Run(solutionPath, SocketPath(solutionPath), sdkDirectory);
@@ -110,7 +118,8 @@ static class Program
         var log = DaemonLog(solutionPath);
         Directory.CreateDirectory(Path.GetDirectoryName(log)!);
 
-        // Detached into its own session so it outlives this terminal and ignores its Ctrl+C.
+        // Detached into its own session so it outlives this terminal and ignores its Ctrl+C. The daemon
+        // writes its log itself; the redirect only catches what the runtime prints when it dies.
         var start = new ProcessStartInfo("/bin/sh") { UseShellExecute = false };
         start.ArgumentList.Add("-c");
         start.ArgumentList.Add("setsid \"$0\" exec --runtimeconfig \"$1\" \"$2\" daemon \"$3\" </dev/null >>\"$4\" 2>&1 &");

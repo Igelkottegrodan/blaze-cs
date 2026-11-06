@@ -19,12 +19,12 @@ sealed class ProjectCompiler
     readonly CSharpCommandLineArguments _args;
     readonly ProjectConfig _config;
     readonly HashSet<string> _embedded;
-    readonly Dictionary<string, SourceFile> _sources = new(StringComparer.Ordinal);
+    readonly Dictionary<string, SourceFile> _sources = new(PathComparer.Instance);
     /// <summary>Source paths in compile order, which decides metadata order and so the output bytes.</summary>
     readonly List<string> _order;
-    readonly Dictionary<string, FileStamp> _additionalFiles = new(StringComparer.Ordinal);
-    readonly Dictionary<string, AdditionalText> _additionalTexts = new(StringComparer.Ordinal);
-    readonly Dictionary<string, FileStamp> _inputs = new(StringComparer.Ordinal);
+    readonly Dictionary<string, FileStamp> _additionalFiles = new(PathComparer.Instance);
+    readonly Dictionary<string, AdditionalText> _additionalTexts = new(PathComparer.Instance);
+    readonly Dictionary<string, FileStamp> _inputs = new(PathComparer.Instance);
     readonly HashSet<string> _ignoredOnDisk;
     /// <summary>Extensions the SDK's globs turn into additional files: .razor and .cshtml under the Razor SDK.</summary>
     readonly string[] _globbedAdditional;
@@ -69,7 +69,7 @@ sealed class ProjectCompiler
             : null;
 
         _config = new ProjectConfig(_args.AnalyzerConfigPaths);
-        _embedded = _args.EmbeddedFiles.Select(f => f.Path).ToHashSet(StringComparer.Ordinal);
+        _embedded = _args.EmbeddedFiles.Select(f => f.Path).ToHashSet(PathComparer.Instance);
 
         var trees = new SyntaxTree[_args.SourceFiles.Length];
         Parallel.For(0, trees.Length, i =>
@@ -80,7 +80,7 @@ sealed class ProjectCompiler
             trees[i] = file.Tree;
         });
         _order = _args.SourceFiles.Select(f => f.Path).ToList();
-        _ignoredOnDisk = DiscoverFiles([".cs"]).Where(path => !_sources.ContainsKey(path)).ToHashSet(StringComparer.Ordinal);
+        _ignoredOnDisk = DiscoverFiles([".cs"]).Where(path => !_sources.ContainsKey(path)).ToHashSet(PathComparer.Instance);
 
         foreach (var file in _args.AdditionalFiles)
         {
@@ -88,7 +88,7 @@ sealed class ProjectCompiler
             _additionalTexts[file.Path] = FileText.Read(file.Path, _args.Encoding, _args.ChecksumAlgorithm);
         }
         _globbedAdditional = AnalyzerPaths.Any(p => Path.GetFileName(p) == "Microsoft.CodeAnalysis.Razor.Compiler.dll") ? [".razor", ".cshtml"] : [];
-        _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(StringComparer.Ordinal);
+        _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(PathComparer.Instance);
         foreach (var resource in ResourcePaths())
             _inputs[resource] = FileStamp.Of(resource);
 
@@ -394,7 +394,7 @@ sealed class ProjectCompiler
         foreach (var existing in _order)
         {
             var relative = Path.GetRelativePath(Unit.ProjectDirectory, existing);
-            var inGlob = !relative.StartsWith("..", StringComparison.Ordinal) && !relative.StartsWith("obj" + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+            var inGlob = !relative.StartsWith("..", StringComparison.Ordinal) && !relative.StartsWith("obj" + Path.DirectorySeparatorChar, PathComparer.Comparison);
             if (!inGlob || string.CompareOrdinal(Key(relative), key) > 0)
                 break;
             position++;

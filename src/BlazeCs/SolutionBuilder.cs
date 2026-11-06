@@ -21,18 +21,18 @@ sealed class SolutionBuilder
     readonly string _solutionDirectory;
     readonly string _stateDirectory;
     readonly string _sdkDirectory;
-    readonly GeneratorCache _generators = new();
+    readonly GeneratorCache _generators;
     readonly ConcurrentDictionary<(string, MetadataReferenceProperties), MetadataReference> _external = new();
 
     List<ProjectCompiler> _units = [];
     Dictionary<ProjectCompiler, List<ProjectCompiler>> _dependencies = [];
     Dictionary<ProjectCompiler, List<ProjectCompiler>> _dependents = [];
-    Dictionary<string, HashSet<string>> _copies = [];
-    Dictionary<string, string> _imagePaths = [];
-    Dictionary<string, ProjectCompiler> _producers = [];
-    Dictionary<string, Image> _images = [];
+    Dictionary<string, HashSet<string>> _copies = new(PathComparer.Instance);
+    Dictionary<string, string> _imagePaths = new(PathComparer.Instance);
+    Dictionary<string, ProjectCompiler> _producers = new(PathComparer.Instance);
+    Dictionary<string, Image> _images = new(PathComparer.Instance);
     HashSet<ProjectCompiler> _analyzerUnits = [];
-    Dictionary<string, DateTime> _msbuildInputs = [];
+    Dictionary<string, DateTime> _msbuildInputs = new(PathComparer.Instance);
 
     public SolutionBuilder(string solutionPath, string sdkDirectory)
     {
@@ -41,6 +41,7 @@ sealed class SolutionBuilder
         _stateDirectory = Path.Combine(_solutionDirectory, ".blaze-cs");
         _sdkDirectory = sdkDirectory;
         Directory.CreateDirectory(_stateDirectory);
+        _generators = new GeneratorCache(Path.Combine(_stateDirectory, "shadow"));
     }
 
     public IReadOnlyList<ProjectCompiler> Units => _units;
@@ -62,34 +63,34 @@ sealed class SolutionBuilder
 
         var stopwatch = Stopwatch.StartNew();
         var info = BuildLog.Read(binlog, _sdkDirectory);
-        var units = cached.ToDictionary(u => u.AssemblyPath);
+        var units = cached.ToDictionary(u => u.AssemblyPath, PathComparer.Instance);
         foreach (var unit in info.Units)
             units[unit.AssemblyPath] = unit;
         UnitsCache.Write(units.Values);
 
-        _copies = [];
+        _copies = new(PathComparer.Instance);
         foreach (var (from, to) in info.Copies)
         {
             if (from != to)
-                (_copies.TryGetValue(from, out var set) ? set : _copies[from] = []).Add(to);
+                (_copies.TryGetValue(from, out var set) ? set : _copies[from] = new(PathComparer.Instance)).Add(to);
         }
 
         // Every copy of a unit's assembly or reference assembly stands for the unit: dependents compile
         // against its image (the reference assembly when there is one; both carry the same public API).
-        _imagePaths = [];
+        _imagePaths = new(PathComparer.Instance);
         foreach (var unit in units.Values)
         {
             var image = unit.ReferenceAssemblyPath ?? unit.AssemblyPath;
             foreach (var path in Closure(unit.AssemblyPath).Concat(unit.ReferenceAssemblyPath is { } r ? Closure(r) : []))
                 _imagePaths[path] = image;
         }
-        _images = [];
+        _images = new(PathComparer.Instance);
 
         var compilers = units.Values.AsParallel()
             .Select(unit => new ProjectCompiler(unit, ResolveReference, _generators))
             .ToList();
-        var byImage = compilers.ToDictionary(c => c.ImagePath);
-        _producers = _imagePaths.ToDictionary(p => p.Key, p => byImage[p.Value]);
+        var byImage = compilers.ToDictionary(c => c.ImagePath, PathComparer.Instance);
+        _producers = _imagePaths.ToDictionary(p => p.Key, p => byImage[p.Value], PathComparer.Instance);
         _dependencies = compilers.ToDictionary(c => c, c => c.References
             .Select(r => _producers.GetValueOrDefault(r.Reference))
             .OfType<ProjectCompiler>()
@@ -109,7 +110,7 @@ sealed class SolutionBuilder
         // A unit this build didn't compile keeps the arguments csc last ran with under the daemon. If a
         // build outside it (an IDE's, `dotnet build`) compiled the project since, with other sources, they
         // are stale and the daemon can't reproduce the assembly: compile everything once to log them all.
-        var logged = info.Units.Select(u => u.AssemblyPath).ToHashSet();
+        var logged = info.Units.Select(u => u.AssemblyPath).ToHashSet(PathComparer.Instance);
         if (!fresh && mismatched.FirstOrDefault(u => !logged.Contains(u.Unit.AssemblyPath)) is { } stale)
         {
             log($"blaze-cs: {stale.Unit.Name}: its cached compiler arguments are stale; running dotnet build --no-incremental");
@@ -417,7 +418,7 @@ sealed class SolutionBuilder
         _published[path] = new Published(bytes, info.Length, info.LastWriteTimeUtc);
     }
 
-    readonly ConcurrentDictionary<string, Published> _published = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<string, Published> _published = new(PathComparer.Instance);
 
     sealed record Published(byte[] Bytes, long Length, DateTime Modified);
 
@@ -425,13 +426,13 @@ sealed class SolutionBuilder
     public string InstalledPath(ProjectCompiler unit)
     {
         var bin = Path.Combine(unit.Unit.ProjectDirectory, "bin") + Path.DirectorySeparatorChar;
-        return Closure(unit.AssemblyPath).FirstOrDefault(p => p.StartsWith(bin, StringComparison.Ordinal)) ?? unit.AssemblyPath;
+        return Closure(unit.AssemblyPath).FirstOrDefault(p => p.StartsWith(bin, PathComparer.Comparison)) ?? unit.AssemblyPath;
     }
 
     /// <summary>A path and every place MSBuild copies it to, transitively.</summary>
     IEnumerable<string> Closure(string path)
     {
-        var seen = new HashSet<string> { path };
+        var seen = new HashSet<string>(PathComparer.Instance) { path };
         var pending = new Queue<string>([path]);
         while (pending.TryDequeue(out var current))
         {
@@ -512,7 +513,7 @@ sealed class SolutionBuilder
     /// </summary>
     Dictionary<string, DateTime> MSBuildInputs()
     {
-        var inputs = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        var inputs = new Dictionary<string, DateTime>(PathComparer.Instance);
         var pending = new Stack<string>([_solutionDirectory]);
         while (pending.Count > 0)
         {
@@ -541,7 +542,7 @@ sealed class SolutionBuilder
     string? ChangedMSBuildInput()
     {
         var current = MSBuildInputs();
-        return current.Keys.Union(_msbuildInputs.Keys)
+        return current.Keys.Union(_msbuildInputs.Keys, PathComparer.Instance)
             .FirstOrDefault(path => current.GetValueOrDefault(path) != _msbuildInputs.GetValueOrDefault(path));
     }
 
@@ -577,13 +578,13 @@ sealed class SolutionBuilder
 }
 
 /// <summary>Source generators by analyzer path, loaded once and shared by every unit; analyzers are skipped.</summary>
-sealed class GeneratorCache
+sealed class GeneratorCache(string shadowDirectory)
 {
-    readonly AnalyzerLoader _loader = new();
-    readonly ConcurrentDictionary<string, ImmutableArray<ISourceGenerator>> _byPath = new(StringComparer.Ordinal);
+    readonly AnalyzerLoader _loader = new(shadowDirectory);
+    readonly ConcurrentDictionary<string, ImmutableArray<ISourceGenerator>> _byPath = new(PathComparer.Instance);
 
     public ImmutableArray<ISourceGenerator> For(IEnumerable<string> analyzerPaths) =>
-        analyzerPaths.Distinct()
+        analyzerPaths.Distinct(PathComparer.Instance)
             .SelectMany(path => _byPath.GetOrAdd(path, p => new AnalyzerFileReference(p, _loader).GetGenerators(LanguageNames.CSharp)))
             .ToImmutableArray();
 }

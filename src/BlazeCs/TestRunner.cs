@@ -26,7 +26,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     const int MaxHosts = 4;
 
     readonly ConcurrentBag<Process> _idleHosts = [];
-    readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(PathComparer.Instance);
 
     public int Run(IReadOnlyCollection<ProjectCompiler> changed, Action<string> log)
     {
