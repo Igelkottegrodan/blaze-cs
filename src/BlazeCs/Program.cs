@@ -49,14 +49,6 @@ static class Program
     [MethodImpl(MethodImplOptions.NoInlining)]
     static int RunDaemon(string solutionPath)
     {
-        // The daemon has no terminal: what it prints, crashes included, goes to its log.
-        var log = DaemonLog(solutionPath);
-        Directory.CreateDirectory(Path.GetDirectoryName(log)!);
-        var writer = new StreamWriter(new FileStream(log, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) { AutoFlush = true };
-        Console.SetOut(writer);
-        Console.SetError(writer);
-        AppDomain.CurrentDomain.UnhandledException += (_, e) => Console.Error.WriteLine($"{DateTime.Now:O} {e.ExceptionObject}");
-
         // Before anything JIT-compiles a method that mentions a Roslyn type.
         var sdkDirectory = SdkRoslyn.Install(Path.GetDirectoryName(solutionPath)!);
         return Daemon.Run(solutionPath, SocketPath(solutionPath), sdkDirectory);
@@ -132,8 +124,7 @@ static class Program
             StartDetachedOnWindows([Environment.ProcessPath!, .. arguments], log, environment);
         else
         {
-            // Detached into its own session so it outlives this terminal and ignores its Ctrl+C. The daemon
-            // writes its log itself; the redirect only catches what the runtime prints when it dies.
+            // Detached into its own session so it outlives this terminal and ignores its Ctrl+C.
             var start = new ProcessStartInfo("/bin/sh") { UseShellExecute = false };
             start.ArgumentList.Add("-c");
             start.ArgumentList.Add("log=$1; shift; setsid \"$@\" </dev/null >>\"$log\" 2>&1 &");
@@ -158,8 +149,8 @@ static class Program
     /// Through ShellExecute, in a hidden console of its own: it gets none of this process's handles (a
     /// plain start would inherit the pipe a caller reads this process's output from, and that caller
     /// would wait for the daemon to exit), and this terminal's Ctrl+C doesn't reach it. cmd redirects
-    /// into the log what the runtime prints when it dies, as sh does on Linux. ShellExecute passes this
-    /// process's environment, so the daemon's variables are set here for the start.
+    /// its output into the log, as sh does on Linux. ShellExecute passes this process's environment, so
+    /// the daemon's variables are set here for the start.
     /// </summary>
     static void StartDetachedOnWindows(string[] command, string log, Dictionary<string, string> environment)
     {
