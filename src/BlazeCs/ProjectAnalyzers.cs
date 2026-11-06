@@ -62,21 +62,27 @@ sealed class ProjectAnalyzers(ImmutableArray<DiagnosticAnalyzer> analyzers, Anal
             return new([], []);
         // An analyzer that throws is reported as csc reports it (AD0001), not as a failed build.
         var failures = new ConcurrentDictionary<string, Diagnostic>();
-        var withAnalyzers = compilation.WithAnalyzers(analyzers, new CompilationWithAnalyzersOptions(
+        CompilationWithAnalyzers With(ImmutableArray<DiagnosticAnalyzer> these, bool concurrent) => compilation.WithAnalyzers(these, new CompilationWithAnalyzersOptions(
             new AnalyzerOptions(additionalFiles, options),
             onAnalyzerException: (_, _, diagnostic) => failures.TryAdd(diagnostic.ToString(), diagnostic),
-            concurrentAnalysis: true,
+            concurrentAnalysis: concurrent,
             logAnalyzerExecutionTime: false));
+        var withAnalyzers = With(analyzers, concurrent: true);
         var (wholeFile, perMember) = await LazyInitializer.EnsureInitialized(ref _kinds, () => Sort(withAnalyzers)).ConfigureAwait(false);
+        // One thread for them: binding the whole file again, alongside the emit that binds it too, slows the
+        // emit less (jellyfin's BaseItem.cs) than spread over many.
+        var wholeFileAnalyzers = wholeFile.IsEmpty ? null : With(wholeFile, concurrent: false);
         var files = await Task.WhenAll(trees.Select(async tree =>
         {
             var edit = _byFile.TryGetValue(tree.FilePath, out var last) ? BodyEdit.Between(last.Tree, tree, cancellationToken) : null;
             var model = withAnalyzers.Compilation.GetSemanticModel(tree);
             // All at once: each forks the compilation. Syntax runs on the whole tree, as its tree actions do
             // even for a span (StyleCop's, on a 3,000-line file, as long as the semantic pass on one member).
+            // The whole-file analyzers bind the whole file: Roslyn's single-file analysis computes the compiler's
+            // diagnostics for its span first, as Visual Studio does for these analyzers too.
             var syntax = withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(tree, cancellationToken);
-            var whole = wholeFile.IsEmpty ? Task.FromResult(ImmutableArray<Diagnostic>.Empty)
-                : withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(model, filterSpan: null, wholeFile, cancellationToken);
+            var whole = wholeFileAnalyzers is null ? Task.FromResult(ImmutableArray<Diagnostic>.Empty)
+                : Task.Run(() => wholeFileAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(wholeFileAnalyzers.Compilation.GetSemanticModel(tree), filterSpan: null, cancellationToken), cancellationToken);
             var member = perMember.IsEmpty ? Task.FromResult(ImmutableArray<Diagnostic>.Empty)
                 : withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(model, edit?.NewMember, perMember, cancellationToken);
             var found = Detached(await member.ConfigureAwait(false), location => location);
