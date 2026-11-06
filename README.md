@@ -59,7 +59,8 @@ blaze-cs stop                   stop this solution's daemon
 From a build in a clone instead of the tool, run `/path/to/blaze-cs/blaze-cs build` (on Windows, `\path\to\blaze-cs\blaze-cs.cmd build`).
 
 The first command starts a daemon for that solution and runs a real `dotnet build`, so it takes as long
-as one. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
+as one. It returns once the daemon has loaded what that build did; the daemon then compiles the solution
+once in memory, to check it matches the build byte for byte, and the next command waits for that. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
 affect, and `blaze-cs test` runs the affected test projects in test hosts that are already started.
 
 The daemon exits on its own after two hours without a command, and the next command starts a new one.

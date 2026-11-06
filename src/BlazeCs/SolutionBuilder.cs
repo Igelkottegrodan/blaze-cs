@@ -55,7 +55,10 @@ sealed class SolutionBuilder
     /// only the others are built from the arguments, and every unit takes the images the build wrote.
     /// </summary>
     /// <param name="fresh">Ignore the cached arguments and compile everything.</param>
-    public bool Load(Action<string> log, bool fresh = false)
+    /// <param name="warmUpLater">
+    /// Return once loaded and leave the warm-up running: the next build waits for it (see <see cref="Settle"/>).
+    /// </param>
+    public bool Load(Action<string> log, bool fresh = false, bool warmUpLater = false)
     {
         var cached = fresh ? [] : UnitsCache.Read();
         var binlog = Path.Combine(_stateDirectory, "build.binlog");
@@ -133,22 +136,85 @@ sealed class SolutionBuilder
 
         log($"blaze-cs: loaded {_units.Count} projects in {stopwatch.ElapsedMilliseconds} ms (build log {read} ms"
             + (kept.Count > 0 ? $"; {kept.Count} kept warm)" : ")"));
-        var mismatched = WarmUp(log, verify);
-
-        // A unit this build didn't compile keeps the arguments csc last ran with under the daemon. If a
-        // build outside it (an IDE's, `dotnet build`) compiled the project since, with other sources, they
-        // are stale and the daemon can't reproduce the assembly: compile everything once to log them all.
         var logged = info.Units.Select(u => u.AssemblyPath).ToHashSet(PathComparer.Instance);
-        if (!fresh && mismatched.FirstOrDefault(u => !logged.Contains(u.Unit.AssemblyPath)) is { } stale)
+        if (warmUpLater)
         {
-            log($"blaze-cs: {stale.Unit.Name}: its cached compiler arguments are stale; running dotnet build --no-incremental");
-            return Load(log, fresh: true);
+            // Its lines go to the next command, which reports them as this one would have.
+            log("blaze-cs: warming up in the background; the next command waits for it");
+            _warmUp = Task.Run(() =>
+            {
+                var lines = new List<string>();
+                var stale = StaleAfterWarmUp(lines.Add, verify, logged, fresh);
+                foreach (var line in lines)
+                    Console.WriteLine($"{DateTime.Now:O} {line}");
+                return new WarmedUp(lines, stale);
+            });
+            return true;
         }
+        return !StaleAfterWarmUp(log, verify, logged, fresh) || Load(log, fresh: true);
+    }
 
+    /// <summary>The first load's warm-up, which runs on after the command that started the daemon returns.</summary>
+    Task<WarmedUp>? _warmUp;
+
+    /// <summary>A warm-up's report, and whether it found cached arguments stale.</summary>
+    sealed record WarmedUp(List<string> Lines, bool Stale);
+
+    /// <summary>The load that warm-up called for, run by each command until it succeeds, as the first load is.</summary>
+    Func<Action<string>, bool>? _reload;
+
+    /// <summary>
+    /// Waits for the warm-up the first load left running and reports it as part of this command, then runs
+    /// the load it calls for: with fresh arguments if it found them stale, or again if it failed. Nothing
+    /// else touches the units until it is done.
+    /// </summary>
+    bool Settle(Action<string> log)
+    {
+        if (_warmUp is { } warmUp)
+        {
+            _warmUp = null;
+            try
+            {
+                var warmedUp = warmUp.GetAwaiter().GetResult();
+                foreach (var line in warmedUp.Lines)
+                    log(line);
+                if (warmedUp.Stale)
+                    _reload = log => Load(log, fresh: true);
+            }
+            catch (Exception e)
+            {
+                // Units it didn't get to verify have nothing on record, so the load compiles them again.
+                Console.WriteLine($"{DateTime.Now:O} {e}");
+                log($"blaze-cs: internal error in the warm-up: {e.Message} (details in .blaze-cs/daemon.log); running dotnet build");
+                _reload = log => Load(log);
+            }
+        }
+        if (_reload is not { } reload)
+            return true;
+        if (!reload(log))
+            return false;
+        _reload = null;
+        return true;
+    }
+
+    /// <summary>
+    /// Warms up these units, then checks their arguments. A unit this build didn't compile keeps the
+    /// arguments csc last ran with under the daemon. If a build outside it (an IDE's, `dotnet build`)
+    /// compiled the project since, with other sources, they are stale and the daemon can't reproduce the
+    /// assembly: the solution must load again with everything compiled once, to log them all.
+    /// </summary>
+    /// <returns>Whether the solution must load again with fresh arguments.</returns>
+    bool StaleAfterWarmUp(Action<string> log, IReadOnlyCollection<ProjectCompiler> units, HashSet<string> logged, bool fresh)
+    {
+        var mismatched = WarmUp(log, units);
         // The build log's tree and the images just read are garbage now, hundreds of MB per load. The
         // server GC on many cores lets that pile up over several loads (jellyfin: 1.7 GB to 3.1 GB RSS)
-        // before it collects; collected here, during a step MSBuild already made slow, it costs ~0.1 s.
+        // before it collects; collected here, after a step MSBuild or the warm-up already made slow, it
+        // costs ~0.1 s.
         GC.Collect();
+        if (fresh || mismatched.FirstOrDefault(u => !logged.Contains(u.Unit.AssemblyPath)) is not { } stale)
+            return false;
+        log($"blaze-cs: {stale.Unit.Name}: its cached compiler arguments are stale; running dotnet build --no-incremental");
         return true;
     }
 
@@ -185,6 +251,8 @@ sealed class SolutionBuilder
 
     public BuildResult Build(Action<string> log)
     {
+        if (!Settle(log))
+            return new BuildResult(false, []);
         var stopwatch = Stopwatch.StartNew();
         if (ChangedMSBuildInput() is { } input)
         {
