@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
 
@@ -24,7 +23,7 @@ sealed record TestHostRequest(string Framework, string Assembly, string? RunSett
 /// exits. Idle hosts wait already started for each runtime the test projects target, as many as run at
 /// once, so a run doesn't wait for a runtime to start.
 /// </summary>
-sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
+sealed class TestRunner(SolutionBuilder builder) : IDisposable
 {
     public const string ResultPrefix = "\u0001result:";
 
@@ -107,7 +106,7 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
     /// </summary>
     string Inputs(ProjectCompiler unit) => string.Join("\n", builder.RuntimeClosure(unit)
         .Append(Path.ChangeExtension(builder.InstalledPath(unit), ".deps.json"))
-        .Concat(RunSettingsFiles(unit.Unit).OfType<string>())
+        .Concat(builder.RunSettingsFile(unit.Unit) is { } runSettings ? new[] { runSettings } : [])
         .Order(PathComparer.Instance)
         .Select(path => $"{path} {Hash(path)}"));
 
@@ -131,46 +130,19 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
 
     /// <summary>
     /// Whether a project runs in a host, and the .runsettings the host applies for it. The host applies one
-    /// that sets only RunConfiguration's EnvironmentVariables and TestRunParameters; a project with any other
-    /// .runsettings, or one that can't be resolved, stays on `dotnet test`. Only the project file and its
-    /// directory are checked: any .runsettings there, and a RunSettingsFilePath in the project file.
+    /// that sets only RunConfiguration's EnvironmentVariables and TestRunParameters; a project whose
+    /// .runsettings (the build's evaluated RunSettingsFilePath, which is what `dotnet test` applies) has
+    /// anything else, or can't be read, stays on `dotnet test`.
     /// </summary>
-    static bool InHost(CompileUnit unit, Action<string> log, out string? runSettings)
+    bool InHost(CompileUnit unit, Action<string> log, out string? runSettings)
     {
-        var files = RunSettingsFiles(unit);
-        runSettings = files is [var file] && file is not null && HostApplies(file) ? file : null;
-        if (files.Count == 0 || runSettings is not null)
+        var file = builder.RunSettingsFile(unit);
+        runSettings = file is not null && HostApplies(file) ? file : null;
+        if (file is null || runSettings is not null)
             return true;
         log($"blaze-cs: {unit.Name} has a .runsettings, which the test host doesn't apply; running dotnet test");
         return false;
     }
-
-    /// <summary>
-    /// The .runsettings files that may apply to a project, null for a RunSettingsFilePath this can't resolve
-    /// (a property other than the project's directory in it).
-    /// </summary>
-    static List<string?> RunSettingsFiles(CompileUnit unit)
-    {
-        var directory = unit.ProjectDirectory;
-        var files = Directory.EnumerateFiles(directory, "*.runsettings").ToHashSet(PathComparer.Instance);
-        var project = File.ReadAllText(unit.ProjectFile);
-        var settings = RunSettingsFilePath().Matches(project);
-        var unresolved = settings.Count == 0 && project.Contains("RunSettingsFilePath", StringComparison.Ordinal);
-        foreach (Match setting in settings)
-        {
-            var value = setting.Groups[1].Value.Trim()
-                .Replace("$(MSBuildProjectDirectory)", directory)
-                .Replace("$(MSBuildThisFileDirectory)", directory + Path.DirectorySeparatorChar);
-            if (value.Contains("$(", StringComparison.Ordinal))
-                unresolved = true;
-            else
-                files.Add(Path.GetFullPath(value, directory));
-        }
-        return [.. files, .. unresolved ? new string?[] { null } : []];
-    }
-
-    [GeneratedRegex(@"<RunSettingsFilePath\b[^>]*>(.*?)</RunSettingsFilePath>", RegexOptions.Singleline)]
-    private static partial Regex RunSettingsFilePath();
 
     /// <summary>
     /// Whether a .runsettings holds only what the host applies: RunConfiguration with EnvironmentVariables,

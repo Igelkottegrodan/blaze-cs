@@ -114,7 +114,7 @@ its own:
   (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
 - **Started tests.** xUnit (v2 and v3), NUnit and MSTest assemblies run in-process in test hosts that the
   daemon starts ahead of time; each host runs one assembly and exits, and a new one takes its place. A
-  `.runsettings` that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is
+  `.runsettings` (the project's evaluated `RunSettingsFilePath`, wherever it is set, as for `dotnet test`) that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is
   applied in the host; projects with any other `.runsettings`, and anything a host can't run, go through
   `dotnet test --no-build`.
 - **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
@@ -149,8 +149,7 @@ its own:
   renders one. MVC views (`.cshtml`) are covered by bitwarden/server's Admin app: a view edit, and a
   constant in a referenced project that only a view reads. Razor Pages, Blazor WebAssembly, other
   static web assets (`wwwroot/`, `.razor.js`), NUnit and MSTest on a real solution, and graphs much
-  larger than 89 projects are untested. The host finds a `.runsettings` only in the test project's
-  directory or a `RunSettingsFilePath` in its project file, not one set in a `Directory.Build.props` ([#51](https://github.com/Igelkottegrodan/blaze-cs/issues/51)).
+  larger than 89 projects are untested.
 - **Known bugs:** one edit that adds a member to a project and starts using it in a dependent can fail
   with no error shown, and leave a project that references both stale until `dotnet build`
   ([#57](https://github.com/Igelkottegrodan/blaze-cs/issues/57)). A project whose Compile items list a
@@ -171,7 +170,7 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 |---|---|
 | `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
 | `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
-| `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile |
+| `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile, each project's `RunSettingsFilePath` |
 | `src/BlazeCs.TestHost` | the single-use test host (xUnit v2 and v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, and what counts as a dependent naming an identifier |

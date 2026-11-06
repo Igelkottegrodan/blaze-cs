@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Build.Framework;
@@ -14,8 +15,12 @@ public sealed partial class CompileLogger : ILogger
 {
     readonly Dictionary<(int Node, int Context), Project> _projects = [];
     readonly Dictionary<(int Node, int Context, int Task), RunningTask> _tasks = [];
+    // The RunSettingsFilePath of each evaluation that sets one, by evaluation id. A project may be evaluated on
+    // another node than the one that builds it, so this is read only once every event has arrived.
+    readonly Dictionary<int, string> _runSettings = [];
     readonly List<CompileRecord> _compiles = [];
-    readonly HashSet<ProjectRecord> _compiled = [];
+    // Each with the id of the evaluation its build ran from, which names its RunSettingsFilePath.
+    readonly HashSet<(string ProjectFile, string? TargetFramework, int Evaluation)> _compiled = [];
     readonly List<CopyRecord> _copies = [];
 
     public LoggerVerbosity Verbosity { get; set; }
@@ -32,6 +37,11 @@ public sealed partial class CompileLogger : ILogger
         if (Environment.GetEnvironmentVariable("MSBUILDLOGTASKINPUTS") != "1")
             throw new LoggerException("blaze-cs-logger needs MSBUILDLOGTASKINPUTS=1");
 
+        // A property's evaluated value reaches a logger only in the evaluation's own event, and only if some
+        // logger asks for evaluation properties; the console logger of `dotnet build` happens to, this makes
+        // sure. MSBuild offers no way to name one property.
+        (eventSource as IEventSource4)?.IncludeEvaluationPropertiesAndItems();
+        eventSource.StatusEventRaised += (_, e) => EvaluationFinished(e);
         eventSource.ProjectStarted += (_, e) => _projects[ProjectKey(e.BuildEventContext)] = new Project(e);
         eventSource.ProjectFinished += (_, e) => ProjectFinished(e.BuildEventContext);
         eventSource.TargetStarted += (_, e) => TargetStarted(e);
@@ -42,8 +52,35 @@ public sealed partial class CompileLogger : ILogger
         eventSource.ErrorRaised += (_, e) => TaskEvent(e.BuildEventContext, e);
     }
 
-    public void Shutdown() =>
-        File.WriteAllText(Parameters!, JsonSerializer.Serialize(new BuildRecord(_compiles, [.. _compiled], _copies)));
+    public void Shutdown()
+    {
+        var compiled = _compiled.Select(p => new ProjectRecord(p.ProjectFile, p.TargetFramework, _runSettings.GetValueOrDefault(p.Evaluation)));
+        File.WriteAllText(Parameters!, JsonSerializer.Serialize(new BuildRecord(_compiles, [.. compiled], _copies)));
+    }
+
+    void EvaluationFinished(BuildStatusEventArgs e)
+    {
+        if (e is not ProjectEvaluationFinishedEventArgs { Properties: { } properties } finished)
+            return;
+        // What an entry is depends on where the project was evaluated: forwarded from another node it is a
+        // KeyValuePair, in this one a ProjectPropertyInstance, which MSBuild.Execution doesn't expose to
+        // a logger but whose ToString is "name=value".
+        foreach (var property in properties)
+        {
+            var (name, value) = property switch
+            {
+                DictionaryEntry entry => (entry.Key as string, entry.Value as string),
+                KeyValuePair<string, string?> pair => (pair.Key, pair.Value),
+                _ when property.ToString() is { } text && text.IndexOf('=') is var equals and > 0 => (text[..equals], text[(equals + 1)..]),
+                _ => (null, null),
+            };
+            if (name == "RunSettingsFilePath" && !string.IsNullOrWhiteSpace(value) && finished.BuildEventContext is { } context)
+            {
+                _runSettings[context.EvaluationId] = Path.GetFullPath(value.Trim(), Path.GetDirectoryName(finished.ProjectFile) ?? "");
+                return;
+            }
+        }
+    }
 
     static (int, int) ProjectKey(BuildEventContext? c) => (c?.NodeId ?? 0, c?.ProjectContextId ?? 0);
 
@@ -67,7 +104,7 @@ public sealed partial class CompileLogger : ILogger
             project.CoreCompile = target;
             // Skipped as up to date, CoreCompile still starts: that is how a project csc didn't run for shows.
             if (e.TargetFile?.EndsWith("Microsoft.CSharp.Core.targets", PathComparer.Comparison) == true)
-                _compiled.Add(new ProjectRecord(project.File, project.TargetFramework));
+                _compiled.Add((project.File, project.TargetFramework, project.Evaluation));
         }
     }
 
@@ -158,6 +195,7 @@ public sealed partial class CompileLogger : ILogger
     /// <summary>One project build request: a project, or one target framework of it.</summary>
     sealed class Project(ProjectStartedEventArgs e)
     {
+        public int Evaluation { get; } = e.BuildEventContext?.EvaluationId ?? BuildEventContext.InvalidEvaluationId;
         public string File { get; } = e.ProjectFile ?? "";
         public string? TargetFramework { get; } = e.GlobalProperties?.TryGetValue("TargetFramework", out var framework) == true ? framework : null;
         public int? CoreCompile { get; set; }

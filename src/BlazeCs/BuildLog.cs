@@ -31,7 +31,10 @@ sealed record CompileUnit(string Name, string ProjectFile, string ProjectDirecto
 /// <param name="Compiled">Every C# project (or target framework of one) the build ran CoreCompile for, whether csc ran
 /// or the target was up to date, as <see cref="CompileUnit.Key"/>: the units the solution builds.</param>
 /// <param name="Copies">Every file copy MSBuild made or confirmed up to date, source to destination.</param>
-sealed record BuildLogInfo(IReadOnlyList<CompileUnit> Units, IReadOnlySet<string> Compiled, IReadOnlyList<(string From, string To)> Copies);
+/// <param name="RunSettings">The evaluated RunSettingsFilePath, as a full path, of each unit (by <see cref="CompileUnit.Key"/>)
+/// whose project sets one, whether or not csc ran for it.</param>
+sealed record BuildLogInfo(IReadOnlyList<CompileUnit> Units, IReadOnlySet<string> Compiled, IReadOnlyList<(string From, string To)> Copies,
+    IReadOnlyDictionary<string, string> RunSettings);
 
 static class BuildLog
 {
@@ -99,8 +102,12 @@ static class BuildLog
             new CompileUnit(UnitName(compile.ProjectFile, compile.TargetFramework), compile.ProjectFile,
                 Path.GetDirectoryName(compile.ProjectFile)!, CompilerArguments(compile.CommandLine),
                 SlowPathReason(compile.AfterCompile, dotnetRoot, realPaths)));
-        var compiled = record.Compiled.Select(p => CompileUnit.KeyOf(p.ProjectFile, UnitName(p.ProjectFile, p.TargetFramework)));
-        return new BuildLogInfo([.. units], compiled.ToHashSet(PathComparer.Instance), [.. record.Copies.Select(c => (c.From, c.To))]);
+        static string KeyOf(ProjectRecord p) => CompileUnit.KeyOf(p.ProjectFile, UnitName(p.ProjectFile, p.TargetFramework));
+        var runSettings = record.Compiled.Where(p => p.RunSettingsFilePath is not null)
+            .DistinctBy(KeyOf, PathComparer.Instance)
+            .ToDictionary(KeyOf, p => p.RunSettingsFilePath!, PathComparer.Instance);
+        return new BuildLogInfo([.. units], record.Compiled.Select(KeyOf).ToHashSet(PathComparer.Instance),
+            [.. record.Copies.Select(c => (c.From, c.To))], runSettings);
     }
 
     /// <summary>A unit's name: the project's, and the target framework it was built for, if it was given one.</summary>

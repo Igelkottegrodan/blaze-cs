@@ -84,6 +84,9 @@ Case[] cases =
     new("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
     new("xUnit v2 test edit", () => Replace("XunitV2Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["XunitV2Tests"], "test"),
     // NUnitTests and MSTestTests have a .runsettings the host applies: a test checks its variable and parameter.
+    // NUnitTests' is in its directory and its project file names it; MSTestTests' is set by a Directory.Build.props
+    // and is in no project directory. XunitV2Tests has a stray .runsettings that nothing names, which dotnet test
+    // ignores: the host must run it, not send it to dotnet test (RanTests).
     new("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
     new("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
     .. (hasNet11 ? new Case[] { new Case("net11.0 test edit", () => Replace("Tests11/RuntimeTests.cs", "Edit = 0", "Edit = 1"), ["Tests11"], "test") } : []),
@@ -485,16 +488,35 @@ void FailedRunsAgain()
 }
 
 // A .runsettings with anything beyond environment variables and test parameters sends its project to dotnet
-// test, which applies it; the tests still see the variable and parameter there.
+// test, which applies it; the tests still see the variable and parameter there. That holds for the one a
+// project file names (NUnitTests) and for the one a Directory.Build.props sets (MSTestTests). A stray
+// .runsettings in the project directory that nothing names, which dotnet test ignores, changes nothing:
+// XunitV2Tests keeps running in the host, and an edit to it doesn't run the project again.
 void RunSettingsTheHostDoesNotApply()
 {
     Replace("NUnitTests/test.runsettings", "  <RunConfiguration>\n", "  <RunConfiguration>\n    <TreatNoTestsAsError>true</TreatNoTestsAsError>\n");
     Replace("NUnitTests/WelcomeTests.cs", "\"tester\"", "\"settings\"");
+    Replace("settings/shared.runsettings", "  <RunConfiguration>\n", "  <RunConfiguration>\n    <TreatNoTestsAsError>true</TreatNoTestsAsError>\n");
+    Replace("MSTestTests/WelcomeTests.cs", "\"tester\"", "\"settings\"");
     var output = Run(blaze, "test");
-    if (!output.Contains("blaze-cs: NUnitTests has a .runsettings, which the test host doesn't apply; running dotnet test")
-        || !Regex.IsMatch(output, $@"^\s*Passed!\s+- Failed:\s+0, Passed:\s+{TestCount("NUnitTests")}, .* - NUnitTests\.dll", RegexOptions.Multiline))
-        Fail($"runsettings the host doesn't apply: expected NUnitTests to pass under dotnet test:\n{output}");
-    Console.WriteLine("ok  runsettings the host doesn't apply: dotnet test ran the project");
+    foreach (var project in new[] { "NUnitTests", "MSTestTests" })
+    {
+        if (!output.Contains($"blaze-cs: {project} has a .runsettings, which the test host doesn't apply; running dotnet test")
+            || !Regex.IsMatch(output, $@"^\s*Passed!\s+- Failed:\s+0, Passed:\s+{TestCount(project)}, .* - {project}\.dll", RegexOptions.Multiline))
+            Fail($"runsettings the host doesn't apply: expected {project} to pass under dotnet test:\n{output}");
+    }
+    Console.WriteLine("ok  runsettings the host doesn't apply: dotnet test ran the projects");
+
+    Replace("XunitV2Tests/stray.runsettings", "<RunConfiguration>\n", "<RunConfiguration>\n    <!-- edited -->\n");
+    output = Run(blaze, "test");
+    if (output.Contains("running dotnet test") || Summaries(output).Count != 0)
+        Fail($"stray runsettings: expected an edit to a .runsettings nothing names to run no tests:\n{output}");
+    Console.WriteLine("ok  stray runsettings: not applied, not a reason to leave the host or run the project again");
+
+    // Back to what the host applies: MSTestTests returns to the host (later steps count the hosts that start).
+    Replace("settings/shared.runsettings", "    <TreatNoTestsAsError>true</TreatNoTestsAsError>\n", "");
+    RanTests("runsettings the host applies again", Run(blaze, "test"), ["MSTestTests"]);
+    Console.WriteLine("ok  runsettings from a Directory.Build.props: MSTestTests is back in the host once its .runsettings is host-applicable");
 }
 
 // An API change in Lib whose compile, or whose writes, fail: the build fails naming the cause, and Consumer,

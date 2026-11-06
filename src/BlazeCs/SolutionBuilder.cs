@@ -25,6 +25,7 @@ sealed class SolutionBuilder
     Dictionary<ProjectCompiler, List<ProjectCompiler>> _dependencies = [];
     Dictionary<ProjectCompiler, List<ProjectCompiler>> _dependents = [];
     Dictionary<string, HashSet<string>> _copies = new(PathComparer.Instance);
+    IReadOnlyDictionary<string, string> _runSettings = new Dictionary<string, string>();
     Dictionary<string, string> _imagePaths = new(PathComparer.Instance);
     Dictionary<string, ProjectCompiler> _producers = new(PathComparer.Instance);
     Dictionary<string, Image> _images = new(PathComparer.Instance);
@@ -47,6 +48,12 @@ sealed class SolutionBuilder
     }
 
     public IReadOnlyList<ProjectCompiler> Units => _units;
+
+    /// <summary>
+    /// The .runsettings `dotnet test` applies to a unit's project: its evaluated RunSettingsFilePath at the
+    /// last build, wherever the build got it (the project, a Directory.Build.props); null if it sets none.
+    /// </summary>
+    public string? RunSettingsFile(CompileUnit unit) => _runSettings.GetValueOrDefault(unit.Key);
 
     UnitsFile UnitsCache => new(Path.Combine(_stateDirectory, "units.json"));
 
@@ -89,6 +96,7 @@ sealed class SolutionBuilder
         }
         UnitsCache.Write(units.Values);
 
+        _runSettings = info.RunSettings;
         _copies = new(PathComparer.Instance);
         foreach (var (from, to) in info.Copies)
         {
