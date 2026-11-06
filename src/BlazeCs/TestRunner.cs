@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace BlazeCs;
 
@@ -10,13 +13,16 @@ namespace BlazeCs;
 /// </summary>
 sealed record TestHostResult(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
 
+/// <summary>What a test host runs: a framework, an assembly, and the .runsettings it applies, if any.</summary>
+sealed record TestHostRequest(string Framework, string Assembly, string? RunSettings);
+
 /// <summary>
-/// Runs the test projects a build affected. xUnit v3, NUnit and MSTest projects run in test host
+/// Runs the test projects a build affected. xUnit (v2 and v3), NUnit and MSTest projects run in test host
 /// processes, longest first, like `dotnet test` runs projects side by side; the rest go through
 /// `dotnet test --no-build`. A host runs one assembly and exits, and a few wait already started, so a
 /// run doesn't wait for a runtime to start.
 /// </summary>
-sealed class TestRunner(SolutionBuilder builder) : IDisposable
+sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
 {
     public const string ResultPrefix = "\u0001result:";
 
@@ -40,21 +46,22 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return 0;
         }
 
-        var hosted = affected.Where(u => InHost(u, log)).ToList();
+        var hosted = affected.Select(u => (Unit: u, Applies: InHost(u.Unit, log, out var runSettings), RunSettings: runSettings))
+            .Where(test => test.Applies).ToList();
         var failed = 0;
-        var inHost = new ConcurrentQueue<(ProjectCompiler Unit, string Assembly)>(hosted
-            .Select(u => (u, builder.InstalledPath(u)))
-            .OrderByDescending(test => _lastDuration.GetValueOrDefault(test.Item2)));
+        var inHost = new ConcurrentQueue<(ProjectCompiler Unit, TestHostRequest Request)>(hosted
+            .Select(test => (test.Unit, new TestHostRequest(Framework(test.Unit)!, builder.InstalledPath(test.Unit), test.RunSettings)))
+            .OrderByDescending(test => _lastDuration.GetValueOrDefault(test.Item2.Assembly)));
         var workers = Enumerable.Range(0, Math.Min(MaxHosts, inHost.Count)).Select(_ => Task.Run(() =>
         {
             while (inHost.TryDequeue(out var test))
             {
-                if (!(RunInHost(Framework(test.Unit)!, test.Assembly, log) ?? DotnetTest(test.Unit, log)))
+                if (!(RunInHost(test.Request, log) ?? DotnetTest(test.Unit, log)))
                     Interlocked.Increment(ref failed);
             }
         })).ToArray();
 
-        foreach (var unit in affected.Except(hosted))
+        foreach (var unit in affected.Except(hosted.Select(test => test.Unit)))
         {
             if (!DotnetTest(unit, log))
                 Interlocked.Increment(ref failed);
@@ -64,20 +71,68 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     }
 
     /// <summary>
-    /// Whether a project runs in a host. A .runsettings would go unapplied there, so those projects (and
-    /// xUnit v2's) stay on `dotnet test`. Only the project file and its directory are checked.
+    /// Whether a project runs in a host, and the .runsettings the host applies for it. The host applies one
+    /// that sets only RunConfiguration's EnvironmentVariables and TestRunParameters; a project with any other
+    /// .runsettings, or one that can't be resolved, stays on `dotnet test`. Only the project file and its
+    /// directory are checked: any .runsettings there, and a RunSettingsFilePath in the project file.
     /// </summary>
-    static bool InHost(ProjectCompiler unit, Action<string> log)
+    static bool InHost(CompileUnit unit, Action<string> log, out string? runSettings)
     {
-        if (Framework(unit) == "vstest")
-            return false;
-        if (Directory.EnumerateFiles(unit.Unit.ProjectDirectory, "*.runsettings").Any()
-            || File.ReadAllText(unit.Unit.ProjectFile).Contains("RunSettingsFilePath", StringComparison.Ordinal))
+        var files = RunSettingsFiles(unit);
+        runSettings = files is [var file] && file is not null && HostApplies(file) ? file : null;
+        if (files.Count == 0 || runSettings is not null)
+            return true;
+        log($"blaze-cs: {unit.Name} has a .runsettings, which the test host doesn't apply; running dotnet test");
+        return false;
+    }
+
+    /// <summary>
+    /// The .runsettings files that may apply to a project, null for a RunSettingsFilePath this can't resolve
+    /// (a property other than the project's directory in it).
+    /// </summary>
+    static List<string?> RunSettingsFiles(CompileUnit unit)
+    {
+        var directory = unit.ProjectDirectory;
+        var files = Directory.EnumerateFiles(directory, "*.runsettings").ToHashSet(PathComparer.Instance);
+        var project = File.ReadAllText(unit.ProjectFile);
+        var settings = RunSettingsFilePath().Matches(project);
+        var unresolved = settings.Count == 0 && project.Contains("RunSettingsFilePath", StringComparison.Ordinal);
+        foreach (Match setting in settings)
         {
-            log($"blaze-cs: {unit.Unit.Name} has a .runsettings, which the test host doesn't apply; running dotnet test");
+            var value = setting.Groups[1].Value.Trim()
+                .Replace("$(MSBuildProjectDirectory)", directory)
+                .Replace("$(MSBuildThisFileDirectory)", directory + Path.DirectorySeparatorChar);
+            if (value.Contains("$(", StringComparison.Ordinal))
+                unresolved = true;
+            else
+                files.Add(Path.GetFullPath(value, directory));
+        }
+        return [.. files, .. unresolved ? new string?[] { null } : []];
+    }
+
+    [GeneratedRegex(@"<RunSettingsFilePath\b[^>]*>(.*?)</RunSettingsFilePath>", RegexOptions.Singleline)]
+    private static partial Regex RunSettingsFilePath();
+
+    /// <summary>
+    /// Whether a .runsettings holds only what the host applies: RunConfiguration with EnvironmentVariables,
+    /// and TestRunParameters with Parameter elements.
+    /// </summary>
+    static bool HostApplies(string path)
+    {
+        try
+        {
+            var root = XElement.Load(path);
+            return root.Name == "RunSettings" && !root.HasAttributes && root.Elements().All(section => section.Name.LocalName switch
+            {
+                "RunConfiguration" => !section.HasAttributes && section.Elements().All(e => e.Name == "EnvironmentVariables" && !e.HasAttributes),
+                "TestRunParameters" => !section.HasAttributes && section.Elements().All(e => e.Name == "Parameter"),
+                _ => false,
+            });
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or XmlException)
+        {
             return false;
         }
-        return true;
     }
 
     bool DotnetTest(ProjectCompiler unit, Action<string> log) =>
@@ -87,12 +142,13 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// Runs one assembly in a host and logs its output in one piece: true if it passed, null if the host
     /// ran no tests, which `dotnet test` then settles.
     /// </summary>
-    bool? RunInHost(string framework, string assembly, Action<string> log)
+    bool? RunInHost(TestHostRequest request, Action<string> log)
     {
         var stopwatch = Stopwatch.StartNew();
         var output = new List<string>();
+        var assembly = request.Assembly;
         var host = TakeHost(RuntimeVersion(assembly));
-        try { host.StandardInput.WriteLine($"{framework} {assembly}"); }
+        try { host.StandardInput.WriteLine(JsonSerializer.Serialize(request)); }
         catch (IOException) { } // it died while idle: no result, so the run fails below
 
         TestHostResult? result = null;
@@ -245,8 +301,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     }
 
     /// <summary>
-    /// The test framework a project references: xunit3, nunit or mstest run in a host; vstest (xUnit v2)
-    /// goes through `dotnet test`.
+    /// The test framework a project references: xunit3, xunit2, nunit or mstest.
     /// </summary>
     static string? Framework(ProjectCompiler unit)
     {
@@ -259,7 +314,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         if (references.Contains("MSTest.TestFramework.dll") || references.Contains("Microsoft.VisualStudio.TestPlatform.TestFramework.dll"))
             return "mstest";
         if (references.Contains("xunit.core.dll"))
-            return "vstest";
+            return "xunit2";
         return null;
     }
 }

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only what the warm test host applies; any other setting sends the project to dotnet test. -->
+<RunSettings>
+  <RunConfiguration>
+    <EnvironmentVariables>
+      <BLAZE_CS_FIXTURE_VARIABLE>from runsettings</BLAZE_CS_FIXTURE_VARIABLE>
+    </EnvironmentVariables>
+  </RunConfiguration>
+  <TestRunParameters>
+    <Parameter name="fixtureParameter" value="from runsettings" />
+  </TestRunParameters>
+</RunSettings>

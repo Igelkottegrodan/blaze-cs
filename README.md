@@ -105,9 +105,11 @@ its own:
   changes, it diffs the API member by member and recompiles only the dependents that use a changed
   member (or whose source generators' output changes). Changes that code can reach without naming them
   (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
-- **Started tests.** xUnit v3, NUnit and MSTest assemblies run in-process in test hosts that the daemon
-  starts ahead of time; each host runs one assembly and exits, and a new one takes its place. xUnit v2,
-  projects with a `.runsettings`, and anything a host can't run go through `dotnet test --no-build`.
+- **Started tests.** xUnit (v2 and v3), NUnit and MSTest assemblies run in-process in test hosts that the
+  daemon starts ahead of time; each host runs one assembly and exits, and a new one takes its place. A
+  `.runsettings` that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is
+  applied in the host; projects with any other `.runsettings`, and anything a host can't run, go through
+  `dotnet test --no-build`.
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
   or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
   project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
@@ -126,13 +128,14 @@ its own:
   app with `.cshtml` views, 37 xUnit v2 and 4 xUnit v3 test projects; method body, signature, new file,
   test and view edits all match `dotnet build --no-incremental` ([results](https://github.com/Igelkottegrodan/blaze-cs/issues/33#issuecomment-6680682555)).
   Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not by a real solution.
-  .NET 11 (RC3) is covered by the fixture check (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
+  .NET 11 (RC3) is covered by the fixture check (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. xUnit v2 in the test host, NUnit, MSTest and `.runsettings` are covered only by the fixture check (a few tests each).
   Blazor components (`.razor`) are covered only by the fixture check: a Razor class library (markup,
   `@code` API changes, `_Imports.razor`, new and deleted `.razor`, scoped CSS) and an xUnit project that
   renders one. MVC views (`.cshtml`) are covered by bitwarden/server's Admin app: a view edit, and a
   constant in a referenced project that only a view reads. Razor Pages, Blazor WebAssembly, other
   static web assets (`wwwroot/`, `.razor.js`), NUnit and MSTest on a real solution, and graphs much
-  larger than 89 projects are untested. The host doesn't apply NUnit or MSTest settings beyond the defaults.
+  larger than 89 projects are untested. The host finds a `.runsettings` only in the test project's
+  directory or a `RunSettingsFilePath` in its project file, not one set in a `Directory.Build.props` ([#51](https://github.com/Igelkottegrodan/blaze-cs/issues/51)).
 - **Known bugs:** one edit that adds a member to a project and starts using it in a dependent can fail
   with no error shown, and leave a project that references both stale until `dotnet build`
   ([#57](https://github.com/Igelkottegrodan/blaze-cs/issues/57)). A project whose Compile items list a
@@ -150,7 +153,7 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | Path | What |
 |---|---|
 | `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
-| `src/BlazeCs.TestHost` | the single-use test host (xUnit v3, NUnit, MSTest) |
+| `src/BlazeCs.TestHost` | the single-use test host (xUnit v2 and v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, and what counts as a dependent naming an identifier |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |

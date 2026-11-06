@@ -8,7 +8,7 @@ namespace BlazeCs.TestHost;
 
 /// <summary>
 /// A single-use test host. The daemon starts it ahead of time, so the runtime is already up when a run
-/// needs it; it reads one "framework assembly" line from stdin, runs that test assembly in-process, writes
+/// needs it; it reads one request line from stdin, runs that test assembly in-process, writes
 /// the result as the last line and exits. Test output goes to stdout. Exiting keeps every run's statics,
 /// threads and console redirections apart, and lets the tests load into an ordinary (non-collectible)
 /// context, where precompiled code is used: measured on the fixture, about twice as fast as a collectible one.
@@ -23,18 +23,19 @@ static class Program
         // End of input means the daemon stopped (or died) without needing this host.
         if (Console.ReadLine() is not { } request)
             return;
-        var separator = request.IndexOf(' ');
-        var result = Run(request[..separator], request[(separator + 1)..]);
+        var result = Run(JsonSerializer.Deserialize<Request>(request)!);
         Console.Out.Flush();
         protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result));
     }
 
-    static Result Run(string framework, string assemblyPath)
+    static Result Run(Request request)
     {
         var (output, error) = (Console.Out, Console.Error);
+        var assemblyPath = request.Assembly;
         Func<Result> run;
         try
         {
+            var settings = Settings.Read(request.RunSettings);
             // Tests find files relative to their output directory, as under `dotnet test`: through the
             // current directory, or AppContext.BaseDirectory (WebApplicationFactory looks for deps.json there).
             var directory = Path.GetDirectoryName(assemblyPath)!;
@@ -53,12 +54,15 @@ static class Program
                     return new Result(0, 0, 0, 0, $"the test host (.NET {Environment.Version}) can't load {reference.FullName}: {e.Message}", null);
                 }
             }
-            run = framework switch
+            run = request.Framework switch
             {
                 "xunit3" => XunitV3(context, assembly, output),
-                "nunit" => NUnit(context, assembly, output),
-                "mstest" => MSTest(context, assembly, output),
-                _ => throw new NotSupportedException($"no runner for {framework}"),
+                "xunit2" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyPath(XunitV2Adapter(directory))
+                    .GetType("Xunit.Runner.VisualStudio.VsTestRunner", throwOnError: true)!),
+                "nunit" => NUnit(context, assembly, output, settings),
+                "mstest" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyName(new AssemblyName("MSTest.TestAdapter"))
+                    .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!),
+                _ => throw new NotSupportedException($"no runner for {request.Framework}"),
             };
         }
         catch (Exception e)
@@ -121,12 +125,17 @@ static class Program
     /// NUnit's FrameworkController, which its engine and VSTest adapter drive too: RunTests returns the
     /// results as XML (a test-suite with totals, and a test-case per test with any failure and output).
     /// </summary>
-    static Func<Result> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    static Func<Result> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings settings)
     {
         var type = context.LoadFromAssemblyName(new AssemblyName("nunit.framework"))
             .GetType("NUnit.Framework.Api.FrameworkController", throwOnError: true)!;
-        var settings = new Hashtable { ["WorkDirectory"] = Path.GetDirectoryName(assembly.Location)! };
-        var controller = Activator.CreateInstance(type, [assembly, "0-", settings])!;
+        // TestParametersDictionary is how NUnit's VSTest adapter hands over TestRunParameters (TestContext.Parameters).
+        var controllerSettings = new Hashtable
+        {
+            ["WorkDirectory"] = Path.GetDirectoryName(assembly.Location)!,
+            ["TestParametersDictionary"] = settings.Parameters,
+        };
+        var controller = Activator.CreateInstance(type, [assembly, "0-", controllerSettings])!;
         var load = type.GetMethod("LoadTests", Type.EmptyTypes) ?? throw new MissingMethodException(type.FullName, "LoadTests");
         var runTests = type.GetMethod("RunTests", [typeof(string)]) ?? throw new MissingMethodException(type.FullName, "RunTests");
         return () =>
@@ -147,26 +156,26 @@ static class Program
     }
 
     /// <summary>
-    /// MSTest's VSTest executor, as vstest's testhost runs it. Its run context and framework handle are
-    /// proxies for the test's own copy of the VSTest object model, so the host doesn't reference it.
+    /// A VSTest adapter's executor (MSTest's, xUnit v2's), as vstest's testhost runs it, with the run's
+    /// .runsettings. Its run context and framework handle are proxies for the test's own copy of the VSTest
+    /// object model, so the host doesn't reference it.
     /// </summary>
-    static Func<Result> MSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    static Func<Result> VSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings runSettings, Type executorType)
     {
-        var executor = Activator.CreateInstance(context.LoadFromAssemblyName(new AssemblyName("MSTest.TestAdapter"))
-            .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!)!;
+        var executor = Activator.CreateInstance(executorType)!;
         var objectModel = context.LoadFromAssemblyName(new AssemblyName("Microsoft.VisualStudio.TestPlatform.ObjectModel"));
         Type Adapter(string name) => objectModel.GetType($"Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter.{name}", throwOnError: true)!;
         var runTests = Adapter("ITestExecutor").GetMethod("RunTests", [typeof(IEnumerable<string>), Adapter("IRunContext"), Adapter("IFrameworkHandle")])
             ?? throw new MissingMethodException("ITestExecutor", "RunTests");
         var settings = Proxy.Create(Adapter("IRunSettings"), (method, _) =>
-            method.Name == "get_SettingsXml" ? "<RunSettings><RunConfiguration /></RunSettings>" : null);
+            method.Name == "get_SettingsXml" ? runSettings.Xml : null);
         var runContext = Proxy.Create(Adapter("IRunContext"), (method, _) => method.Name switch
         {
             "get_RunSettings" => settings,
             "get_TestRunDirectory" => Path.GetDirectoryName(assembly.Location),
             _ => null,
         });
-        var recorder = new MSTestRecorder(output);
+        var recorder = new VSTestRecorder(output);
         var handle = Proxy.Create(Adapter("IFrameworkHandle"), recorder.Invoke);
         return () =>
         {
@@ -175,8 +184,16 @@ static class Program
         };
     }
 
-    /// <summary>Counts what MSTest records; tests run in parallel, so from many threads.</summary>
-    sealed class MSTestRecorder(TextWriter output)
+    /// <summary>
+    /// xUnit v2's VSTest adapter, which isn't in the test's deps.json: vstest finds adapters by file name.
+    /// It is xunit.runner.visualstudio.testadapter.dll from xunit.runner.visualstudio 3 on, with "dotnetcore" in the name before.
+    /// </summary>
+    static string XunitV2Adapter(string directory) =>
+        Directory.EnumerateFiles(directory, "xunit.runner.visualstudio*.testadapter.dll").FirstOrDefault()
+            ?? throw new FileNotFoundException("no xunit.runner.visualstudio adapter next to the tests");
+
+    /// <summary>Counts what a VSTest adapter records; tests may run in parallel, so from many threads.</summary>
+    sealed class VSTestRecorder(TextWriter output)
     {
         int _total, _passed, _failed, _skipped;
 
@@ -237,7 +254,31 @@ static class Program
 
     static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;
 
+    /// <summary>What to run: a framework (xunit3, xunit2, nunit, mstest), an assembly, and the .runsettings that applies, if any.</summary>
+    sealed record Request(string Framework, string Assembly, string? RunSettings);
+
     sealed record Result(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
+
+    /// <summary>
+    /// A .runsettings, of which the daemon only sends ones the host applies in full: RunConfiguration's
+    /// EnvironmentVariables, set here for the whole (single-use) process as vstest sets them on its testhost,
+    /// and TestRunParameters, which VSTest adapters read from the XML and NUnit gets as a dictionary.
+    /// </summary>
+    sealed record Settings(string Xml, Dictionary<string, string> Parameters)
+    {
+        public static Settings Read(string? path)
+        {
+            if (path is null)
+                return new("<RunSettings><RunConfiguration /></RunSettings>", []);
+            var xml = File.ReadAllText(path);
+            var root = XElement.Parse(xml);
+            foreach (var variable in root.Element("RunConfiguration")?.Element("EnvironmentVariables")?.Elements() ?? [])
+                Environment.SetEnvironmentVariable(variable.Name.LocalName, variable.Value);
+            var parameters = (root.Element("TestRunParameters")?.Elements("Parameter") ?? [])
+                .ToDictionary(p => p.Attribute("name")?.Value ?? "", p => p.Attribute("value")?.Value ?? "");
+            return new(xml, parameters);
+        }
+    }
 
     /// <summary>Implements an interface from the test's load context by handing each call to a function.</summary>
     class Proxy : DispatchProxy

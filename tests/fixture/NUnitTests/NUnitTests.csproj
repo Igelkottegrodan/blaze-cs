@@ -1,4 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RunSettingsFilePath>$(MSBuildProjectDirectory)/test.runsettings</RunSettingsFilePath>
+  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="NUnit" Version="4.6.1" />
     <PackageReference Include="NUnit.Analyzers" Version="4.15.0" />
