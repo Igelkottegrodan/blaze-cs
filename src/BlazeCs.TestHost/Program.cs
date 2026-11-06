@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Runtime.Loader;
@@ -32,21 +33,64 @@ static partial class Program
         // Started for a test project: <framework> <assembly> [--run-settings=<file>] [--warm-up=<assembly>].
         string? Option(string name) => args.FirstOrDefault(a => a.StartsWith(name, StringComparison.Ordinal))?[name.Length..];
         var prepared = args is [var framework, var assembly, ..] ? Prepare(framework, assembly, Option("--run-settings="), Option("--warm-up=")) : null;
-        // End of input means the daemon stopped (or died) without needing this host.
-        if (daemon.Next() is not TestHostRequest request)
+        var first = daemon.Next();
+        if (first is not TestHostRequest request)
+        {
+            Refuse(protocol, "a run", first);
             return;
+        }
         var loaded = Load(request, prepared, out var result);
         while (true)
         {
-            result ??= daemon.Running(() => RunTests(request.Framework, loaded!));
+            result ??= RunTests(request.Framework, loaded!);
             result = result with { CannotHotReload = result.CannotHotReload ?? CannotHotReload(loaded, result) };
-            Console.Out.Flush();
-            protocol.WriteLine(TestHostProtocol.ResultPrefix + JsonSerializer.Serialize(result, ProtocolJson.Default.TestHostResult));
-            if (result.CannotHotReload is not null || daemon.Next() is not TestHostUpdate update)
-                return; // exit, or end of input
-            // Applied, it runs the tests again; otherwise it reports that it ran nothing, and exits.
-            result = Apply(update) is { } failure ? new TestHostResult(0, 0, 0, 0, null, failure, failure) : null;
+            Report(protocol, result);
+            if (result.CannotHotReload is not null)
+                Exit();
+            var next = daemon.Next();
+            switch (next)
+            {
+                case TestHostUpdate update:
+                    // Applied, it runs the tests again; otherwise it reports that it ran nothing, and exits.
+                    result = Apply(update) is { } failure ? new TestHostResult(0, 0, 0, 0, null, failure, failure) : null;
+                    break;
+                case TestHostExit:
+                    Exit();
+                    break;
+                default:
+                    Refuse(protocol, "an update or exit", next);
+                    break;
+            }
         }
+    }
+
+    static void Report(StreamWriter protocol, TestHostResult result)
+    {
+        Console.Out.Flush();
+        protocol.WriteLine(TestHostProtocol.ResultPrefix + JsonSerializer.Serialize(result, ProtocolJson.Default.TestHostResult));
+    }
+
+    /// <summary>Reports a message out of turn, or one it couldn't read, as an error, and exits.</summary>
+    [DoesNotReturn]
+    static void Refuse(StreamWriter protocol, string expected, TestHostMessage message)
+    {
+        var error = $"the test host expected {expected} from the daemon, and got " + (message is Unreadable unreadable
+            ? $"a line it couldn't read ({unreadable.Reason})" : $"a {message.GetType().Name} message");
+        Report(protocol, new TestHostResult(0, 0, 0, 0, error, null, error));
+        Exit();
+    }
+
+    /// <summary>
+    /// Ends this process at once. Returning from Main would leave it running as long as a foreground thread
+    /// that a test started does; a host's work ends with the daemon's message or its last result.
+    /// </summary>
+    [DoesNotReturn]
+    static void Exit()
+    {
+        Console.Out.Flush();
+        Process.GetCurrentProcess().Kill();
+        Thread.Sleep(Timeout.Infinite); // until the kill lands
+        throw new UnreachableException();
     }
 
     /// <summary>Why this host can't take an update after a run, or null if it can.</summary>
@@ -55,16 +99,21 @@ static partial class Program
         : !MetadataUpdater.IsSupported ? $"the runtime applies no updates here (it needs {TestHostProtocol.ModifiableAssemblies}=debug)"
         : null;
 
+    /// <summary>A line from the daemon that isn't a message, which the host reports and exits on.</summary>
+    sealed record Unreadable(string Reason) : TestHostMessage;
+
     /// <summary>
-    /// The daemon's messages, read from stdin on a thread of their own, so that stdin closing is seen while
-    /// tests run, on Linux and Windows alike: the daemon's end of the pipe closes with the daemon, however it
-    /// died, and this process then exits at once if it is running tests. The raw stream: Console.In is
-    /// emptied, so tests that read it don't take the daemon's lines.
+    /// The daemon's messages, read from stdin on a thread of their own, so that stdin closing is seen at once,
+    /// on Linux and Windows alike: the daemon's end of the pipe closes with the daemon, however it died. The
+    /// host then exits at once, unless it is preparing, which it finishes first. Once it has taken a message
+    /// it is busy with it, and the result would go nowhere. The raw stream: Console.In is emptied, so tests
+    /// that read it don't take the daemon's lines.
     /// </summary>
     sealed class Daemon
     {
         readonly BlockingCollection<TestHostMessage> _messages = [];
-        volatile bool _running;
+        readonly object _gate = new();
+        bool _busy, _ended;
 
         public Daemon()
         {
@@ -77,22 +126,46 @@ static partial class Program
                 _ = JsonSerializer.Serialize(new TestHostResult(0, 0, 0, 0, null, null), ProtocolJson.Default.TestHostResult);
                 using var stdin = new StreamReader(Console.OpenStandardInput());
                 while (stdin.ReadLine() is { } line)
-                    _messages.Add(JsonSerializer.Deserialize(line, ProtocolJson.Default.TestHostMessage)!);
-                if (_running)
-                    Process.GetCurrentProcess().Kill();
+                    _messages.Add(Read(line));
+                lock (_gate)
+                {
+                    _ended = true;
+                    if (_busy)
+                        Exit();
+                }
                 _messages.CompleteAdding();
             }) { IsBackground = true }.Start();
         }
 
-        /// <summary>The next message, or null once stdin has ended.</summary>
-        public TestHostMessage? Next() => _messages.TryTake(out var message, Timeout.Infinite) ? message : null;
-
-        /// <summary>Runs tests, during which stdin closing kills this process.</summary>
-        public T Running<T>(Func<T> run)
+        static TestHostMessage Read(string line)
         {
-            _running = true;
-            try { return run(); }
-            finally { _running = false; }
+            try
+            {
+                return JsonSerializer.Deserialize(line, ProtocolJson.Default.TestHostMessage) ?? new Unreadable("null");
+            }
+            catch (Exception e) when (e is JsonException or NotSupportedException)
+            {
+                return new Unreadable(e.Message);
+            }
+        }
+
+        /// <summary>
+        /// The next message, after which the host is busy until it asks for another. Exits if stdin has
+        /// ended, even with a message left: the daemon that sent it is gone.
+        /// </summary>
+        public TestHostMessage Next()
+        {
+            lock (_gate)
+                _busy = false;
+            _ = _messages.TryTake(out var message, Timeout.Infinite);
+            lock (_gate)
+            {
+                // Taking nothing means stdin has ended.
+                if (_ended)
+                    Exit();
+                _busy = true;
+            }
+            return message!;
         }
     }
 
@@ -278,17 +351,14 @@ static partial class Program
 
     /// <summary>
     /// Calls ClearCache, then UpdateApplication, on each [MetadataUpdateHandler] type of every loaded assembly,
-    /// in load order (CoreLib's first): null types means any may have changed. A handler that fails leaves
-    /// its own cache stale, which the run that follows shows.
+    /// as dotnet-watch's agent does (MetadataUpdateHandlerInvoker in dotnet/sdk): each assembly's references
+    /// before it (CoreLib's reflection cache first, a test framework's before the tests'), the attribute
+    /// matched by name. Null types means any may have changed. A handler that fails leaves its own cache
+    /// stale, which the run that follows shows.
     /// </summary>
     static void CallUpdateHandlers(Type[]? types)
     {
-        var handlers = new List<Type>();
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            try { handlers.AddRange(assembly.GetCustomAttributes<MetadataUpdateHandlerAttribute>().Select(a => a.HandlerType)); }
-            catch (Exception) { } // an attribute whose type doesn't load
-        }
+        var handlers = DependenciesFirst(AppDomain.CurrentDomain.GetAssemblies()).SelectMany(UpdateHandlers).ToList();
         foreach (var name in new[] { "ClearCache", "UpdateApplication" })
         {
             foreach (var handler in handlers)
@@ -297,6 +367,59 @@ static partial class Program
                 catch (Exception) { }
             }
         }
+    }
+
+    static List<Type> UpdateHandlers(Assembly assembly)
+    {
+        try
+        {
+            return [.. assembly.GetCustomAttributesData()
+                .Where(a => a.AttributeType.FullName == "System.Reflection.Metadata.MetadataUpdateHandlerAttribute")
+                .Select(a => a.ConstructorArguments is [{ Value: Type handler }] ? handler : null)
+                .OfType<Type>()];
+        }
+        catch (Exception) // an attribute whose type doesn't load
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Assemblies ordered so that each comes after those it references, by simple name, the first loaded of a
+    /// name standing for all (the agent's TopologicalSort).
+    /// </summary>
+    static List<Assembly> DependenciesFirst(Assembly[] assemblies)
+    {
+        static string? Name(Assembly assembly)
+        {
+            try { return assembly.GetName().Name; }
+            catch (Exception) { return null; }
+        }
+        var byName = new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
+        foreach (var assembly in assemblies)
+        {
+            if (Name(assembly) is { } name)
+                byName.TryAdd(name, assembly);
+        }
+        var sorted = new List<Assembly>(assemblies.Length);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Visit(Assembly assembly)
+        {
+            if (Name(assembly) is not { } name || !visited.Add(name))
+                return;
+            AssemblyName[] references;
+            try { references = assembly.GetReferencedAssemblies(); }
+            catch (Exception) { references = []; }
+            foreach (var reference in references)
+            {
+                if (reference.Name is { } referenceName && byName.TryGetValue(referenceName, out var dependency))
+                    Visit(dependency);
+            }
+            sorted.Add(assembly);
+        }
+        foreach (var assembly in assemblies)
+            Visit(assembly);
+        return sorted;
     }
 
     /// <summary>

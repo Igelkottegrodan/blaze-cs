@@ -16,7 +16,10 @@ namespace BlazeCs;
 //      apply ends it: that result has Unsupported and CannotHotReload set, and ran nothing.
 //    - Exit (TestHostExit): the host exits.
 //    Otherwise CannotHotReload says why, and the host exits after that one run, as hosts always did.
-// Stdin closing ends a host at any point: at once during a run, after preparing while it waits for a Run.
+// A line the host can't read, or a message out of turn, gets a result with Error and CannotHotReload set
+// that names it, and ends the host. Stdin closing ends a host at once, whatever it is doing, and even with
+// a message it hasn't acted on yet (its result would go nowhere); only a host still preparing finishes that
+// first. A host ends by killing itself, so threads its tests started don't keep it running.
 //
 // A host can hot reload when the runtime allows updates (MetadataUpdater.IsSupported), which takes
 // DOTNET_MODIFIABLE_ASSEMBLIES=debug in its environment, and only assemblies compiled without

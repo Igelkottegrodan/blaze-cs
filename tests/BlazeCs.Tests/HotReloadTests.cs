@@ -69,6 +69,75 @@ public class HotReloadTests
         Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the host should exit after a failed update");
     }
 
+    /// <summary>
+    /// A host's work ends with the exit message, with stdin closing while it waits for an update, or with its
+    /// one run when it can't hot reload, and then the process ends too: a foreground thread a test started
+    /// doesn't keep it running.
+    /// </summary>
+    [Theory]
+    [InlineData("exit")]
+    [InlineData("end of input")]
+    [InlineData("no hot reload")]
+    public void AHostEndsDespiteATestsForegroundThread(string ending)
+    {
+        using var subject = new Subject("xunit3", "[Fact] public void StartsAThread() => new Thread(() => Thread.Sleep(Timeout.Infinite)).Start();");
+        using var host = new Host(hotReload: ending != "no hot reload");
+
+        var result = host.Send(subject.Run);
+        Assert.Equal((3, 2, 1), (result.Total, result.Passed, result.Failed));
+        if (ending == "exit")
+            Assert.True(TestRunner.Send(host.Process, new TestHostExit()));
+        else if (ending == "end of input")
+            host.Process.StandardInput.Close();
+        Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), $"the host should exit ({ending})");
+    }
+
+    /// <summary>
+    /// Stdin closing right after a message, as when the daemon dies having sent it, ends the host before it
+    /// acts on it, even while it loads the test assembly or applies the delta: nobody would read the result.
+    /// The tests sleep 20 s once they run; the host must be gone well before.
+    /// </summary>
+    [Fact]
+    public void StdinClosingRightAfterARunEndsTheHostWithoutRunning()
+    {
+        using var subject = new Subject("xunit3", "[Fact] public void Sleeps() => Thread.Sleep(20_000);");
+        using var host = new Host(hotReload: true);
+
+        Assert.True(TestRunner.Send(host.Process, subject.Run));
+        host.Process.StandardInput.Close();
+        Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(10)), "the host should exit without running the tests");
+        Assert.Null(TestRunner.ReadResult(host.Process, []));
+    }
+
+    /// <inheritdoc cref="StdinClosingRightAfterARunEndsTheHostWithoutRunning"/>
+    [Fact]
+    public void StdinClosingRightAfterAnUpdateEndsTheHostWithoutRunning()
+    {
+        using var subject = new Subject("xunit3", "[Fact] public void SleepsOnceFixed() { if (Answer.Value() == 42) Thread.Sleep(20_000); }");
+        using var host = new Host(hotReload: true);
+        Assert.Equal((3, 2, 1), host.Send(subject.Run) is var first ? (first.Total, first.Passed, first.Failed) : default);
+
+        Assert.True(TestRunner.Send(host.Process, new TestHostUpdate([subject.Fix()])));
+        host.Process.StandardInput.Close();
+        Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(10)), "the host should exit without running the tests again");
+        Assert.Null(TestRunner.ReadResult(host.Process, []));
+    }
+
+    /// <summary>A line the host can't read gets an error result, and ends it.</summary>
+    [Fact]
+    public void AnUnreadableLineIsReportedAndEndsTheHost()
+    {
+        using var subject = new Subject("xunit3");
+        using var host = new Host(hotReload: true);
+        Assert.Null(host.Send(subject.Run).CannotHotReload);
+
+        host.Process.StandardInput.WriteLine("{\"kind\":\"upd");
+        var result = TestRunner.ReadResult(host.Process, []);
+        Assert.Contains("a line it couldn't read", result?.Error);
+        Assert.NotNull(result?.CannotHotReload);
+        Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the host should exit after an unreadable line");
+    }
+
     /// <summary>A test host process, as the daemon starts one, with or without the runtime's switch for updates.</summary>
     sealed class Host : IDisposable
     {
@@ -117,15 +186,16 @@ public class HotReloadTests
     /// </summary>
     sealed class Subject : IDisposable
     {
-        readonly string _framework;
+        readonly string _framework, _extraTest;
         readonly DirectoryInfo _directory;
         readonly CSharpCompilation _compilation;
         readonly EmitBaseline _baseline;
         readonly Guid _module;
 
-        public Subject(string framework)
+        /// <param name="extraTest">A third test in the test class, in the framework's attributes.</param>
+        public Subject(string framework, string extraTest = "")
         {
-            _framework = framework;
+            (_framework, _extraTest) = (framework, extraTest);
             var kit = framework switch { "xunit3" => "XunitV3Kit", "nunit" => "NUnitKit", "mstest" => "MSTestKit", _ => throw new ArgumentOutOfRangeException(nameof(framework)) };
             var kitDirectory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "kits", kit));
             _directory = Directory.CreateTempSubdirectory("blaze-cs-hot-reload-");
@@ -183,6 +253,7 @@ public class HotReloadTests
 
         string Source(int answer) => $$"""
             using System;
+            using System.Threading;
             {{_framework switch
             {
                 "xunit3" => "using Xunit;",
@@ -204,6 +275,7 @@ public class HotReloadTests
                     "nunit" => "[Test] public void IsPositive() => Assert.That(Answer.Value(), Is.Positive);\n    [Test] public void IsFortyTwo() => Assert.That(Answer.Value(), Is.EqualTo(42));",
                     _ => "[TestMethod] public void IsPositive() => Assert.IsTrue(Answer.Value() > 0);\n    [TestMethod] public void IsFortyTwo() => Assert.AreEqual(42, Answer.Value());",
                 }}}
+                {{_extraTest}}
             }
             """;
 
