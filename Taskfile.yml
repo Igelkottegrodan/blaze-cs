@@ -6,6 +6,11 @@ tasks:
     cmds:
       - dotnet build BlazeCs.slnx -nologo -v:q
 
+  test:
+    desc: Run the unit tests (tests/BlazeCs.Tests)
+    cmds:
+      - dotnet run --project tests/BlazeCs.Tests
+
   check:
     desc: Edit the fixture solution every way blaze-cs handles and compare its output with dotnet build
     deps: [build]

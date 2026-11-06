@@ -297,27 +297,27 @@ sealed class ProjectCompiler
         return (new EmitOutput(assembly.ToArray(), pdb?.ToArray(), documentation?.ToArray(), referenceAssembly?.ToArray()), diagnostics);
     }
 
-    readonly System.Runtime.CompilerServices.ConditionalWeakTable<SyntaxTree, HashSet<string>> _identifiers = new();
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<SyntaxTree, HashSet<string>> IdentifierCache = new();
     List<SourceText> _generated = [];
 
     /// <summary>
     /// Whether any source file, generated ones and doc comments included, contains one of these
     /// identifiers. A dependent that names none of the members an API change touched binds the same.
     /// </summary>
-    public bool Mentions(Prepared prepared, IReadOnlySet<string> names) =>
-        prepared.Compilation.SyntaxTrees.Any(tree => Identifiers(tree).Overlaps(names));
+    public static bool Mentions(Compilation compilation, IReadOnlySet<string> names) =>
+        compilation.SyntaxTrees.Any(tree => Identifiers(tree).Overlaps(names));
 
-    HashSet<string> Identifiers(SyntaxTree tree) =>
-        _identifiers.GetValue(tree, t => t.GetRoot()
+    static HashSet<string> Identifiers(SyntaxTree tree) =>
+        IdentifierCache.GetValue(tree, t => t.GetRoot()
             .DescendantTokens(descendIntoTrivia: true)
             .Where(token => token.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.IdentifierToken))
             .Select(token => token.ValueText)
             .ToHashSet(StringComparer.Ordinal));
 
     /// <summary>Indexes every tree's identifiers ahead of the first edit.</summary>
-    public void IndexIdentifiers(Prepared prepared)
+    public static void IndexIdentifiers(Compilation compilation)
     {
-        foreach (var tree in prepared.Compilation.SyntaxTrees)
+        foreach (var tree in compilation.SyntaxTrees)
             Identifiers(tree);
     }
 

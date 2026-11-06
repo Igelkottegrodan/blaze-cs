@@ -135,7 +135,7 @@ sealed class SolutionBuilder
             if (_dependents[unit].Count > 0)
                 _surfaces[unit] = new ApiSurface(prepared.Compilation);
             unit.GeneratedChanged(prepared);
-            unit.IndexIdentifiers(prepared);
+            ProjectCompiler.IndexIdentifiers(prepared.Compilation);
             var (output, diagnostics) = unit.Emit(prepared);
             if (output is null)
                 mismatches[unit] = $"{unit.Unit.Name}: {diagnostics.First(d => d.Severity == DiagnosticSeverity.Error)}";
@@ -319,7 +319,7 @@ sealed class SolutionBuilder
             unit.RefreshReferences();
             var prepared = unit.Prepare();
             var generatedChanged = unit.GeneratedChanged(prepared);
-            if (change is { Everything: false } && !generatedChanged && !unit.Mentions(prepared, change.Names))
+            if (change is { Everything: false } && !generatedChanged && !ProjectCompiler.Mentions(prepared.Compilation, change.Names))
             {
                 Unaffected[unit] = true;
                 return;
@@ -354,17 +354,13 @@ sealed class SolutionBuilder
 
     readonly ConcurrentDictionary<ProjectCompiler, ApiSurface> _surfaces = new();
 
-    /// <summary>
-    /// What changed in a unit's API since its last image. The image bytes are the ground truth: if they
-    /// changed but the surface shows nothing, something it doesn't model changed and every dependent
-    /// recompiles.
-    /// </summary>
+    /// <summary>What changed in a unit's API since its last image, which has just changed.</summary>
     ApiChange SurfaceChange(ProjectCompiler unit, ProjectCompiler.Prepared prepared)
     {
         var surface = new ApiSurface(prepared.Compilation);
         var change = _surfaces.TryGetValue(unit, out var before) ? surface.ChangeFrom(before) : ApiChange.All;
         _surfaces[unit] = surface;
-        return change is { Everything: false, Names.IsEmpty: true } ? ApiChange.All : change;
+        return change;
     }
 
     /// <summary>Writes a unit's outputs where csc and MSBuild's copies would; true if its public API changed.</summary>
