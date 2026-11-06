@@ -153,7 +153,8 @@ its own:
   the edit changes without touching its files. After a body edit, the rest of the file reports what it
   reported at its last analysis, even if an edit elsewhere has changed that since. A file's first edit
   after the daemon starts analyzes the whole file, which on a large file with many analyzers takes longer
-  than the compile (jellyfin's 3,100-line `BaseItem.cs`: 0.6 to 1.4 s). Analyzers that report at
+  than the compile (jellyfin's 3,100-line `BaseItem.cs`: 0.55 to 0.7 s, so that build takes about 0.3 s
+  longer; later body edits in it add about 25 ms). Analyzers that report at
   compilation end (unused members, unused parameters and the like) don't run, and diagnostic suppressors
   don't silence compiler warnings.
   Warnings-as-errors, and rules set to `error`, are reported as warnings and don't fail the build. Run
