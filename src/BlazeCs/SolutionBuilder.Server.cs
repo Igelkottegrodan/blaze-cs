@@ -227,13 +227,20 @@ sealed partial class SolutionBuilder
         }
     }
 
-    /// <summary>csc writes each of its outputs on every compile, changed or not: MSBuild's up-to-date checks read their times.</summary>
+    /// <summary>
+    /// csc writes each of its outputs on every compile, changed or not: MSBuild's up-to-date checks read their times.
+    /// The copies MSBuild makes in other projects' bin/ are brought up to date too, as a blaze-cs build would: a
+    /// build of one project doesn't copy into the projects that reference it, and the daemon's next build, which
+    /// finds this unit current, wouldn't write it again (#133).
+    /// </summary>
     void WriteAsCsc(ProjectCompiler unit, EmitOutput output)
     {
         void Write(string path, byte[] bytes)
         {
+            var content = OutputContent.Of(bytes);
+            WriteCopies(path, bytes, content);
             Replace(path, bytes);
-            _published.Wrote(path, OutputContent.Of(bytes));
+            _published.Wrote(path, content);
         }
         Write(unit.AssemblyPath, output.Assembly);
         if (unit.PdbPath is { } pdb && output.Pdb is { } pdbBytes)

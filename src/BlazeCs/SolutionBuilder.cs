@@ -806,18 +806,32 @@ sealed partial class SolutionBuilder
             Write(reference, ImageBytes(unit, output));
     }
 
-    /// <summary>Writes an output and its copies, unless it already holds these bytes.</summary>
+    /// <summary>Writes an output and each of its copies that doesn't already hold these bytes.</summary>
     void Write(string path, byte[] bytes)
     {
         var content = OutputContent.Of(bytes);
+        WriteCopies(path, bytes, content);
+        // The path itself last: after a write that failed partway, the path doesn't hold what the daemon
+        // emitted, so the next load compiles the unit again (HoldsLast) and the next write checks every copy.
         if (_published.Holds(path, content))
             return;
-        // The path itself last: while it holds the bytes, so does every copy, and a write that failed
-        // partway is done again in full.
-        Parallel.ForEach(Closure(path).Skip(1), copy => Replace(copy, bytes));
         Replace(path, bytes);
         _published.Wrote(path, content);
     }
+
+    /// <summary>
+    /// Writes each copy of an output that doesn't already hold these bytes, whether or not the output itself
+    /// does: a `dotnet build` of one project writes its own obj/ and bin/, but not the copies in the projects
+    /// that reference it (#133). A copy the daemon wrote or verified since it last changed costs a stat.
+    /// </summary>
+    void WriteCopies(string path, byte[] bytes, OutputContent content) =>
+        Parallel.ForEach(Closure(path).Skip(1), copy =>
+        {
+            if (_published.Holds(copy, content))
+                return;
+            Replace(copy, bytes);
+            _published.Wrote(copy, content);
+        });
 
     /// <summary>Writes a file by replacing it rather than overwriting it: a running test host may have the old file mapped.</summary>
     static void Replace(string path, byte[] bytes)
