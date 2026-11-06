@@ -33,7 +33,7 @@ sealed class IdleCollector(TimeSpan delay, Action collect)
 
     /// <summary>
     /// A command ended: collect once the daemon has been idle for the delay, after the work it left running
-    /// (the first load's warm-up) has finished, unless another command starts first.
+    /// (the first load's warm-up, the background analysis) has finished, unless another command starts first.
     /// </summary>
     public void Idle(Task? running = null)
     {

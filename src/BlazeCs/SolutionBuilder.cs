@@ -37,6 +37,21 @@ sealed class SolutionBuilder
     /// outputs are stale until they run again.
     /// </summary>
     Dictionary<ProjectCompiler, ApiChange?> _retry = [];
+    /// <summary>
+    /// Units compiled since the whole-compilation analysis last reported on them: their compilation-end rules'
+    /// warnings haven't been shown for what is on disk. A real build ran them, but printed errors only, so the
+    /// units it compiled join, and the ones already here stay.
+    /// </summary>
+    HashSet<ProjectCompiler> _wholeAnalysisPending = [];
+    /// <summary>
+    /// That analysis, run while the daemon is idle (see <see cref="AnalyzeWhenIdle"/>): each unit's warnings, with
+    /// the unit's version it analyzed.
+    /// </summary>
+    readonly IdleWork<ProjectCompiler, (object Version, ImmutableArray<Diagnostic> Diagnostics)> _background =
+        new("background analysis", BackgroundDelay, u => u.Unit.Name);
+
+    /// <summary>How long the daemon waits after a command before the background analysis starts.</summary>
+    static readonly TimeSpan BackgroundDelay = TimeSpan.FromSeconds(1);
 
     public SolutionBuilder(string solutionPath, string sdkDirectory)
     {
@@ -137,6 +152,12 @@ sealed class SolutionBuilder
             .ToList());
         _dependents = compilers.ToDictionary(c => c, c => compilers.Where(d => _dependencies[d].Contains(c)).ToList());
         _units = TopologicalOrder(compilers);
+        // The units csc ran for in this build (but not in the daemon's first, which started it), and the ones
+        // still pending, by their assembly.
+        var pending = _wholeAnalysisPending.Select(u => u.AssemblyPath).ToHashSet(PathComparer.Instance);
+        if (held.Count > 0)
+            pending.UnionWith(info.Units.Select(u => u.AssemblyPath));
+        _wholeAnalysisPending = [.. compilers.Where(c => pending.Contains(c.AssemblyPath))];
         _analyzerUnits = compilers.SelectMany(c => c.AnalyzerPaths)
             .Select(path => _producers.GetValueOrDefault(path))
             .OfType<ProjectCompiler>()
@@ -186,9 +207,6 @@ sealed class SolutionBuilder
 
     /// <summary>The first load's warm-up, which runs on after the command that started the daemon returns.</summary>
     Task<WarmedUp>? _warmUp;
-
-    /// <summary>The warm-up still running after the command that started it returned, if any.</summary>
-    public Task? WarmingUp => _warmUp;
 
     /// <summary>A warm-up's report, and whether it found cached arguments stale.</summary>
     sealed record WarmedUp(List<string> Lines, bool Stale);
@@ -282,7 +300,21 @@ sealed class SolutionBuilder
         return [.. mismatches.Keys];
     }
 
-    public bool Build(Action<string> log)
+    /// <param name="all">
+    /// Then run every analyzer on every project's whole compilation, compilation-end rules included, and
+    /// report all their warnings, as `dotnet build --no-incremental` would.
+    /// </param>
+    public bool Build(Action<string> log, bool all = false)
+    {
+        if (!BuildChanges(log, reportAnalyzers: !all))
+            return false;
+        if (all)
+            AnalyzeAll(log);
+        return true;
+    }
+
+    /// <param name="reportAnalyzers">Report what the analyzers found on the edited files (--all reports it with everything else).</param>
+    bool BuildChanges(Action<string> log, bool reportAnalyzers)
     {
         if (!Settle(log))
             return false;
@@ -314,11 +346,11 @@ sealed class SolutionBuilder
         foreach (var (unit, change) in work.OrderByDescending(w => LastDuration(w.Key)))
             run.Schedule(unit, change);
         run.Wait();
+        // What this build wrote, compilation-end rules haven't reported on.
+        foreach (var unit in run.Diagnostics.Keys.Where(u => !run.Failed.ContainsKey(u)))
+            _wholeAnalysisPending.Add(unit);
 
-        // As csc prints them: an analyzer's rules with their help link.
-        var output = run.Diagnostics.Concat(run.AnalyzerDiagnostics).SelectMany(r => r.Value
-            .Where(d => d.Severity >= DiagnosticSeverity.Warning)
-            .Select(d => $"{CSharpDiagnosticFormatter.Instance.Format(d, System.Globalization.CultureInfo.CurrentUICulture)} [{r.Key.Unit.ProjectFile}]"));
+        var output = run.Diagnostics.Concat(reportAnalyzers ? run.AnalyzerDiagnostics : []).SelectMany(r => Warnings(r.Key, r.Value));
         foreach (var line in output.Order())
             log(line);
         var rebuilt = run.Diagnostics.Keys.ToList();
@@ -345,6 +377,85 @@ sealed class SolutionBuilder
             log("blaze-cs: slowest: " + string.Join(", ", times.OrderByDescending(t => t.Value.Compile).Take(5)
                 .Select(t => $"{t.Key.Unit.Name} {t.Value.Compile.TotalMilliseconds:F0} ms (generators {t.Value.Generators.TotalMilliseconds:F0})")));
         return true;
+    }
+
+    /// <summary>A unit's warnings as csc prints them: an analyzer's rules with their help link.</summary>
+    static IEnumerable<string> Warnings(ProjectCompiler unit, IEnumerable<Diagnostic> diagnostics) => diagnostics
+        .Where(d => d.Severity >= DiagnosticSeverity.Warning)
+        .Select(d => $"{CSharpDiagnosticFormatter.Instance.Format(d, System.Globalization.CultureInfo.CurrentUICulture)} [{unit.Unit.ProjectFile}]");
+
+    /// <summary>
+    /// The daemon is idle: once it has been for a moment, run the compilation-end rules on each project compiled
+    /// since they last reported on it, one project at a time. The next command cancels the run without waiting
+    /// for it (see <see cref="CancelBackgroundAnalysis"/>), and the projects it didn't finish run at the next
+    /// idle. Nothing runs while the first load's warm-up does.
+    /// </summary>
+    public void AnalyzeWhenIdle()
+    {
+        if (_warmUp is { IsCompleted: false })
+            return;
+        _background.Start([.. _units.Where(_wholeAnalysisPending.Contains).Select(unit =>
+        {
+            var analysis = unit.WholeAnalysis(compilationEndOnly: true);
+            return (unit, (Func<CancellationToken, Task<(object, ImmutableArray<Diagnostic>)>>)(async token => (analysis.Version, await analysis.Run(token).ConfigureAwait(false))));
+        })]);
+    }
+
+    /// <summary>The background analysis the last idle started, until it ends or a command cancels it.</summary>
+    public Task BackgroundAnalysis => _background.Running;
+
+    /// <summary>
+    /// The work the daemon does while idle, in its order: the first load's warm-up, then the background analysis
+    /// (which doesn't start while the warm-up runs). Done when both are; the idle collection waits for it.
+    /// </summary>
+    public Task Idling => _warmUp is { } warmUp ? Task.WhenAll(warmUp, BackgroundAnalysis) : BackgroundAnalysis;
+
+    /// <summary>A command starts: the background analysis stops; what it finished waits for <see cref="ReportBackgroundAnalysis"/>.</summary>
+    public void CancelBackgroundAnalysis() => _background.Cancel();
+
+    /// <summary>
+    /// After a command's build: reports what the background analysis finished for units the build left as they
+    /// were analyzed, one line saying which projects and when, then their warnings. A unit that changed since
+    /// stays pending, its result dropped: it describes files that are no longer there.
+    /// </summary>
+    public void ReportBackgroundAnalysis(Action<string> log)
+    {
+        var current = _background.Take()
+            .GroupBy(d => d.Key)
+            .Select(g => g.Last())
+            .Where(d => _wholeAnalysisPending.Contains(d.Key) && d.Key.IsAt(d.Result.Version))
+            .ToList();
+        if (current.Count == 0)
+            return;
+        foreach (var analyzed in current)
+            _wholeAnalysisPending.Remove(analyzed.Key);
+        var warnings = current.SelectMany(d => Warnings(d.Key, d.Result.Diagnostics)).Order().ToList();
+        log($"blaze-cs: background analysis (compilation-end rules) of {string.Join(", ", current.Select(d => d.Key.Unit.Name).Order())}, "
+            + $"finished at {current.Max(d => d.Finished):HH:mm:ss} in {current.Sum(d => d.Took.TotalMilliseconds):F0} ms: "
+            + (warnings.Count == 0 ? "no warnings" : $"{warnings.Count} warning(s)"));
+        foreach (var line in warnings)
+            log(line);
+    }
+
+    /// <summary>
+    /// Runs every analyzer on every unit's whole compilation and reports what they find: every file, and the
+    /// compilation-end rules. After it, no background analysis is pending.
+    /// </summary>
+    void AnalyzeAll(Action<string> log)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var found = new ConcurrentDictionary<ProjectCompiler, ImmutableArray<Diagnostic>>();
+        var analyses = _units.Select(u => (Unit: u, Analysis: u.WholeAnalysis(compilationEndOnly: false))).ToList();
+        Parallel.ForEachAsync(analyses, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount / 4) },
+            async (a, token) => found[a.Unit] = await a.Analysis.Run(token).ConfigureAwait(false)).GetAwaiter().GetResult();
+        // This reports everything the background analysis found, and more.
+        _wholeAnalysisPending.Clear();
+        _background.Take();
+        var warnings = found.SelectMany(f => Warnings(f.Key, f.Value)).Order().ToList();
+        log($"blaze-cs: full analysis (every analyzer, compilation-end rules included) of {_units.Count} projects in {stopwatch.ElapsedMilliseconds} ms: "
+            + (warnings.Count == 0 ? "no warnings" : $"{warnings.Count} warning(s)"));
+        foreach (var line in warnings)
+            log(line);
     }
 
     readonly ConcurrentDictionary<ProjectCompiler, TimeSpan> _lastDuration = new();

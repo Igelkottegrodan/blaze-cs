@@ -44,6 +44,8 @@ sealed class ProjectCompiler
     /// by path. An edit reports the analyzer warnings of these files, as `dotnet build` would.
     /// </summary>
     readonly HashSet<string> _unanalyzed = new(PathComparer.Instance);
+    /// <summary>Replaced whenever anything the unit compiles from changes; see <see cref="IsAt"/>.</summary>
+    object _version = new();
 
     public CompileUnit Unit { get; }
     /// <summary>How long the last Emit spent in source generators (the rest is binding and emit).</summary>
@@ -257,6 +259,8 @@ sealed class ProjectCompiler
         }
 
         _compilation = compilation;
+        if (changed)
+            _version = new object();
         return changed;
     }
 
@@ -325,6 +329,8 @@ sealed class ProjectCompiler
         changed = Refresh() | changed;
         // The real build analyzed every file as it is now.
         _unanalyzed.Clear();
+        if (changed)
+            _version = new object();
         return changed;
     }
 
@@ -335,6 +341,7 @@ sealed class ProjectCompiler
         if (references.SequenceEqual(_compilation.References))
             return false;
         _compilation = _compilation.WithReferences(references);
+        _version = new object();
         return true;
     }
 
@@ -452,12 +459,55 @@ sealed class ProjectCompiler
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
-                Console.WriteLine($"{DateTime.Now:O} {Unit.Name}: analyzers failed: {e}");
-                ImmutableArray<Diagnostic> failed = [Diagnostic.Create("BLAZE002", "blaze-cs", $"analyzers failed, so this build reports none of their warnings: {e.Message} (details in .blaze-cs/daemon.log)",
-                    DiagnosticSeverity.Warning, DiagnosticSeverity.Warning, isEnabledByDefault: true, warningLevel: 1)];
-                return new AnalysisResult(failed, System.Diagnostics.Stopwatch.GetElapsedTime(started), Files: null);
+                return new AnalysisResult(AnalyzersFailed(e), System.Diagnostics.Stopwatch.GetElapsedTime(started), Files: null);
             }
         }, cancellationToken);
+    }
+
+    /// <summary>
+    /// An analysis of the whole compilation as the unit is now (see <see cref="ProjectAnalyzers.AnalyzeCompilationAsync"/>),
+    /// to run later, beside other builds: it holds the compilation, generator driver and additional files of this
+    /// moment and changes nothing in the unit. Generators run again from the driver's caches, and their new state
+    /// is dropped. Take it while no build runs. Never fails: a failure is a warning. Its version tells whether
+    /// the unit still is as analyzed (see <see cref="IsAt"/>).
+    /// </summary>
+    public WholeAnalysisRun WholeAnalysis(bool compilationEndOnly)
+    {
+        Compilation compilation = _compilation;
+        var driver = _driver;
+        ImmutableArray<AdditionalText> additionalFiles = [.. _additionalTexts.Values];
+        return new WholeAnalysisRun(_version, async cancellationToken =>
+        {
+            try
+            {
+                var analyzers = Analyzers;
+                if (!(compilationEndOnly ? analyzers.CanReportAtCompilationEnd : analyzers.CanReport))
+                    return [];
+                var prepared = compilation;
+                driver?.RunGeneratorsAndUpdateCompilation(compilation, out prepared, out _, cancellationToken);
+                return await analyzers.AnalyzeCompilationAsync(prepared, additionalFiles, compilationEndOnly, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                return AnalyzersFailed(e);
+            }
+        });
+    }
+
+    /// <summary>An analysis of the unit as it was, and that state, which nothing outside the unit reads.</summary>
+    public sealed record WholeAnalysisRun(object Version, Func<CancellationToken, Task<ImmutableArray<Diagnostic>>> Run);
+
+    /// <summary>
+    /// Whether the unit still compiles exactly what it did at <paramref name="version"/>: no source, additional
+    /// file, resource or reference changed since.
+    /// </summary>
+    public bool IsAt(object version) => ReferenceEquals(_version, version);
+
+    ImmutableArray<Diagnostic> AnalyzersFailed(Exception e)
+    {
+        Console.WriteLine($"{DateTime.Now:O} {Unit.Name}: analyzers failed: {e}");
+        return [Diagnostic.Create("BLAZE002", "blaze-cs", $"analyzers failed, so this build reports none of their warnings: {e.Message} (details in .blaze-cs/daemon.log)",
+            DiagnosticSeverity.Warning, DiagnosticSeverity.Warning, isEnabledByDefault: true, warningLevel: 1)];
     }
 
     /// <summary>

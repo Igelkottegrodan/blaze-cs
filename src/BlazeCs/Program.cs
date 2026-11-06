@@ -11,13 +11,13 @@ namespace BlazeCs;
 /// </summary>
 static class Program
 {
-    const string Usage = "usage: blaze-cs build | test [--all] | run [-- app arguments] | stop";
+    const string Usage = "usage: blaze-cs build [--all] | test [--all] | run [-- app arguments] | stop";
 
     static int Main(string[] args)
     {
         if (args is ["daemon", var solution])
             return RunDaemon(solution);
-        if (args.Length == 0 || args[0] is not ("build" or "test" or "run" or "stop") || args[0] == "test" && args is not (["test"] or ["test", "--all"]))
+        if (args.Length == 0 || args[0] is not ("build" or "test" or "run" or "stop") || args[0] is "build" or "test" && args is not ([_] or [_, "--all"]))
         {
             Console.Error.WriteLine(Usage);
             return 2;
@@ -28,7 +28,7 @@ static class Program
             return 2;
 
         var command = args[0];
-        var exitCode = Send(solutionPath, new Request(command == "run" ? "build" : command, Daemon.Build, All: args is ["test", "--all"]));
+        var exitCode = Send(solutionPath, new Request(command == "run" ? "build" : command, Daemon.Build, All: args is ["build" or "test", "--all"]));
         if (command != "run" || exitCode != 0)
             return exitCode;
 
@@ -211,5 +211,8 @@ static class Program
     }
 }
 
-/// <param name="All">For `test`: run every test project, not only those whose inputs changed.</param>
+/// <param name="All">
+/// For `test`: run every test project, not only those whose inputs changed. For `build`: run every analyzer on
+/// every project, compilation-end rules included, and report all their warnings.
+/// </param>
 sealed record Request(string Command, Guid Build, bool All = false);

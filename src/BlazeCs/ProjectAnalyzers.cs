@@ -50,6 +50,15 @@ sealed class ProjectAnalyzers(ImmutableArray<DiagnosticAnalyzer> analyzers, Anal
     public sealed record Result(ImmutableArray<Diagnostic> Diagnostics, ImmutableArray<FileAnalysis> Files);
 
     /// <summary>
+    /// The analyzers with a rule reported at compilation end (unused members and the like), which only an
+    /// analysis of the whole compilation runs, with the suppressors.
+    /// </summary>
+    readonly ImmutableArray<DiagnosticAnalyzer> _compilationEnd = [.. analyzers.Where(a => a is DiagnosticSuppressor || ReportsAtCompilationEnd(a))];
+
+    /// <summary>Whether any of them has a rule reported at compilation end.</summary>
+    public bool CanReportAtCompilationEnd => _compilationEnd.Any(a => a is not DiagnosticSuppressor);
+
+    /// <summary>
     /// What the analyzers report on these trees of the compilation, syntax and semantic, with the severities
     /// the project's options give each tree and its suppressors applied, as csc would report them for these
     /// files. Roslyn skips every analyzer whose rules are all off for these trees. Diagnostics reported only
@@ -156,6 +165,48 @@ sealed class ProjectAnalyzers(ImmutableArray<DiagnosticAnalyzer> analyzers, Anal
             return Diagnostic.Create(formatted, diagnostic.Location.IsInSource ? move(diagnostic.Location) : Location.None, diagnostic.Severity,
                 diagnostic.AdditionalLocations.Where(l => l.IsInSource).Select(move), diagnostic.Properties);
         })];
+
+    /// <summary>
+    /// What the analyzers report on the whole compilation, as csc reports them for the project: every file, and
+    /// compilation-end rules too. With <paramref name="compilationEndOnly"/>, only the analyzers that have a rule
+    /// reported at compilation end run, and only those rules are reported: what <see cref="AnalyzeAsync"/> can't
+    /// give.
+    /// </summary>
+    public async Task<ImmutableArray<Diagnostic>> AnalyzeCompilationAsync(
+        Compilation compilation, ImmutableArray<AdditionalText> additionalFiles, bool compilationEndOnly, CancellationToken cancellationToken = default)
+    {
+        if (!(compilationEndOnly ? CanReportAtCompilationEnd : CanReport))
+            return [];
+        var failures = new ConcurrentDictionary<string, Diagnostic>();
+        var withAnalyzers = compilation.WithAnalyzers(compilationEndOnly ? _compilationEnd : analyzers, new CompilationWithAnalyzersOptions(
+            new AnalyzerOptions(additionalFiles, options),
+            onAnalyzerException: (_, _, diagnostic) => failures.TryAdd(diagnostic.ToString(), diagnostic),
+            concurrentAnalysis: true,
+            logAnalyzerExecutionTime: false));
+        var diagnostics = await withAnalyzers.GetAnalyzerDiagnosticsAsync(cancellationToken).ConfigureAwait(false);
+        // With a handler for analyzer exceptions, Roslyn leaves AD0001 out of the results, so nothing is here twice
+        // unless an analyzer reported it twice, and csc prints that twice too.
+        return [.. diagnostics.Where(d => !compilationEndOnly || IsCompilationEnd(d.Descriptor)), .. failures.Values];
+    }
+
+    /// <summary>
+    /// A rule reported at compilation end carries the CompilationEnd tag, as Roslyn's IDE reads it to tell
+    /// these rules apart (and as its analyzer rules require of analyzer authors).
+    /// </summary>
+    static bool IsCompilationEnd(DiagnosticDescriptor descriptor) => descriptor.CustomTags.Contains(WellKnownDiagnosticTags.CompilationEnd);
+
+    static bool ReportsAtCompilationEnd(DiagnosticAnalyzer analyzer)
+    {
+        try
+        {
+            return analyzer.SupportedDiagnostics.Any(IsCompilationEnd);
+        }
+        catch (Exception)
+        {
+            // Roslyn reports the analyzer's failure (AD0001) when it runs; run it where every analyzer runs.
+            return false;
+        }
+    }
 }
 
 /// <summary>
