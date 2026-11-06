@@ -314,12 +314,9 @@ finally
     }
     if (!passed)
     {
+        // daemon-start.log has what the daemon's launcher printed, such as a daemon that can't start.
         foreach (var name in new[] { "daemon.log", "daemon-start.log" })
-        {
-            var text = ReadLog(name);
-            if (text.Length > 0)
-                Console.Error.WriteLine($"{name} ({Path.Combine(work, ".blaze-cs", name)}):\n{text[^Math.Min(4000, text.Length)..]}");
-        }
+            Console.Error.WriteLine($"{name} ({Path.Combine(work, ".blaze-cs", name)}):\n{PrintedLog(name)}");
     }
 }
 return 0;
@@ -333,6 +330,20 @@ string ReadLog(string name)
         return "";
     using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
     return reader.ReadToEnd();
+}
+
+// A log as the end of a failed check prints it: also when it is missing, empty or can't be read.
+string PrintedLog(string name)
+{
+    try
+    {
+        var text = ReadLog(name);
+        return text.Length > 0 ? text[^Math.Min(4000, text.Length)..] : File.Exists(Path.Combine(work, ".blaze-cs", name)) ? "(empty)" : "(missing)";
+    }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        return $"(can't be read: {e.Message})";
+    }
 }
 
 // The daemons that have started, oldest first, from the log line each writes.
@@ -371,8 +382,9 @@ void IdleCollected()
 }
 
 // A `dotnet build` of one project writes its own obj/ and bin/ but not the copies in the projects that
-// reference it (#133). Without the pipe (csc, UseSharedCompilation=false), the next `test` compiles Lib to the bytes its obj/ already holds;
-// through it, the daemon compiled Lib for the build, and the next `test` has nothing to compile. Either way
+// reference it (#133). Without the pipe (csc, UseSharedCompilation=false), the next `test` compiles Lib to the
+// bytes its obj/ already holds; through it, the daemon compiled Lib for the build, and the next `test` has nothing
+// to compile. Either way
 // every copy must be brought up to date, and the test projects whose copies changed must run rather than be
 // reported unchanged. Every copy in a bin/ is then what `dotnet build --no-incremental` makes. The edit is
 // undone after.

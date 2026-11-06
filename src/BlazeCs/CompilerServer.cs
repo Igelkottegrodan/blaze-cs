@@ -465,19 +465,28 @@ sealed class CompilerServer : IDisposable
 
     /// <summary>
     /// VBCSCompiler on the private pipe, as the Csc task starts it (BuildServerConnection.TryCreateServer): in the
-    /// compiler's directory, with nothing to read or write. It exits after its own idle timeout.
+    /// compiler's directory, with nothing to read or write, and none of the daemon's handles. It outlives the
+    /// daemon, so on Windows it must not inherit them: a plain start there passes it every inheritable handle,
+    /// among them the daemon's output, which cmd redirects into daemon-start.log, and the next daemon start then
+    /// can't write that file. ShellExecute passes none, as the Csc task's CreateProcess does
+    /// (bInheritHandles: false). On Unix the redirects replace the daemon's output, and .NET opens every other
+    /// file close-on-exec.
     /// </summary>
     void StartPrivateServer()
     {
-        var start = new ProcessStartInfo(_dotnet)
+        var start = new ProcessStartInfo(_dotnet) { WorkingDirectory = _clientDirectory };
+        if (OperatingSystem.IsWindows())
         {
-            WorkingDirectory = _clientDirectory,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
+            start.UseShellExecute = true;
+            start.WindowStyle = ProcessWindowStyle.Hidden;
+        }
+        else
+        {
+            start.UseShellExecute = false;
+            start.RedirectStandardInput = true;
+            start.RedirectStandardOutput = true;
+            start.RedirectStandardError = true;
+        }
         foreach (var argument in new[] { "exec", Path.Combine(_clientDirectory, "VBCSCompiler.dll"), $"-pipename:{_privatePipeName}" })
             start.ArgumentList.Add(argument);
         using var process = Process.Start(start);

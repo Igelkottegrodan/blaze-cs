@@ -79,4 +79,6 @@ jobs:
         with:
           name: daemon-log-${{ matrix.os }}-${{ matrix.sdk }}
           path: ${{ runner.temp }}/blaze-cs-fixture/.blaze-cs/daemon*.log
+          # .blaze-cs is hidden, and upload-artifact skips hidden files unless told.
+          include-hidden-files: true
           if-no-files-found: ignore
