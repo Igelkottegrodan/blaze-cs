@@ -4,21 +4,24 @@ using System.Text.Json;
 
 namespace BlazeCs;
 
-/// <summary>What the test host reports for one test assembly.</summary>
-sealed record TestHostResult(int Total, int Passed, int Failed, int Skipped, bool Unloaded, string? Error);
+/// <summary>
+/// What the test host reports for one test assembly. Unsupported means it ran nothing (it doesn't know
+/// this framework version), so `dotnet test` runs the project instead.
+/// </summary>
+sealed record TestHostResult(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
 
 /// <summary>
-/// Runs the test projects a build affected. xUnit v3 projects run in a small pool of warm test host
-/// processes, longest first, like `dotnet test` runs projects side by side; other frameworks go
-/// through `dotnet test --no-build`.
+/// Runs the test projects a build affected. xUnit v3, NUnit and MSTest projects run in test host
+/// processes, longest first, like `dotnet test` runs projects side by side; the rest go through
+/// `dotnet test --no-build`. A host runs one assembly and exits, and a few wait already started, so a
+/// run doesn't wait for a runtime to start.
 /// </summary>
 sealed class TestRunner(SolutionBuilder builder) : IDisposable
 {
     public const string ResultPrefix = "\u0001result:";
 
     /// <summary>
-    /// One assembly per host at a time: the current directory, AppContext.BaseDirectory and the console
-    /// are per process. Tests parallelize inside an assembly too, so a few hosts are enough.
+    /// Hosts running at once: tests parallelize inside an assembly too, so a few are enough.
     /// </summary>
     const int MaxHosts = 4;
 
@@ -36,36 +39,60 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return 0;
         }
 
+        var hosted = affected.Where(u => InHost(u, log)).ToList();
         var failed = 0;
-        var inHost = new ConcurrentQueue<string>(affected
-            .Where(u => Framework(u) == "xunit3")
-            .Select(builder.InstalledPath)
-            .OrderByDescending(path => _lastDuration.GetValueOrDefault(path)));
+        var inHost = new ConcurrentQueue<(ProjectCompiler Unit, string Assembly)>(hosted
+            .Select(u => (u, builder.InstalledPath(u)))
+            .OrderByDescending(test => _lastDuration.GetValueOrDefault(test.Item2)));
         var workers = Enumerable.Range(0, Math.Min(MaxHosts, inHost.Count)).Select(_ => Task.Run(() =>
         {
-            while (inHost.TryDequeue(out var assembly))
+            while (inHost.TryDequeue(out var test))
             {
-                if (!RunInHost(assembly, log))
+                if (!(RunInHost(Framework(test.Unit)!, test.Assembly, log) ?? DotnetTest(test.Unit, log)))
                     Interlocked.Increment(ref failed);
             }
         })).ToArray();
 
-        foreach (var unit in affected.Where(u => Framework(u) != "xunit3"))
+        foreach (var unit in affected.Except(hosted))
         {
-            if (builder.RunDotnet($"test --no-build \"{unit.Unit.ProjectFile}\"", log) != 0)
+            if (!DotnetTest(unit, log))
                 Interlocked.Increment(ref failed);
         }
         Task.WaitAll(workers);
         return failed > 0 ? 1 : 0;
     }
 
-    /// <summary>Runs one assembly in an idle host and logs its output in one piece; true if it passed.</summary>
-    bool RunInHost(string assembly, Action<string> log)
+    /// <summary>
+    /// Whether a project runs in a host. A .runsettings would go unapplied there, so those projects (and
+    /// xUnit v2's) stay on `dotnet test`. Only the project file and its directory are checked.
+    /// </summary>
+    static bool InHost(ProjectCompiler unit, Action<string> log)
+    {
+        if (Framework(unit) == "vstest")
+            return false;
+        if (Directory.EnumerateFiles(unit.Unit.ProjectDirectory, "*.runsettings").Any()
+            || File.ReadAllText(unit.Unit.ProjectFile).Contains("RunSettingsFilePath", StringComparison.Ordinal))
+        {
+            log($"blaze-cs: {unit.Unit.Name} has a .runsettings, which the test host doesn't apply; running dotnet test");
+            return false;
+        }
+        return true;
+    }
+
+    bool DotnetTest(ProjectCompiler unit, Action<string> log) =>
+        builder.RunDotnet($"test --no-build \"{unit.Unit.ProjectFile}\"", log) == 0;
+
+    /// <summary>
+    /// Runs one assembly in a host and logs its output in one piece: true if it passed, null if the host
+    /// ran no tests, which `dotnet test` then settles.
+    /// </summary>
+    bool? RunInHost(string framework, string assembly, Action<string> log)
     {
         var stopwatch = Stopwatch.StartNew();
         var output = new List<string>();
-        var host = _idleHosts.TryTake(out var idle) && !idle.HasExited ? idle : StartHost();
-        host.StandardInput.WriteLine(assembly);
+        var host = TakeHost();
+        try { host.StandardInput.WriteLine($"{framework} {assembly}"); }
+        catch (IOException) { } // it died while idle: no result, so the run fails below
 
         TestHostResult? result = null;
         while (host.StandardOutput.ReadLine() is { } line)
@@ -78,24 +105,47 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             result = JsonSerializer.Deserialize<TestHostResult>(line[ResultPrefix.Length..])!;
             break;
         }
-
-        // A test that keeps its load context alive (a leaked thread, a static event) would let the next
-        // assembly see stale state, so that host is replaced rather than reused.
-        if (result is { Unloaded: true })
-            _idleHosts.Add(host);
-        else
-            Stop(host);
-        result ??= new TestHostResult(0, 0, 0, 0, Unloaded: false, Error: "the test host exited mid-run");
+        Stop(host);
+        result ??= new TestHostResult(0, 0, 0, 0, Error: "the test host exited mid-run", Unsupported: null);
         _lastDuration[assembly] = stopwatch.Elapsed;
+
+        var name = Path.GetFileName(assembly);
+        // An empty run proves nothing: the host may have missed tests that dotnet test would find.
+        var fallback = result.Unsupported ?? (result is { Total: 0, Error: null } ? "the test host found no tests" : null);
+        if (fallback is not null)
+        {
+            lock (_idleHosts)
+            {
+                output.ForEach(log);
+                log($"blaze-cs: {name}: {fallback}; running dotnet test");
+            }
+            return null;
+        }
 
         var passed = result.Error is null && result.Failed == 0;
         if (result.Error is not null)
-            output.Add($"blaze-cs: {Path.GetFileName(assembly)}: {result.Error}");
-        output.Add($"{(passed ? "Passed!" : "Failed!")} - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
-            + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {Path.GetFileName(assembly)}");
+            output.Add($"blaze-cs: {name}: {result.Error}");
+        output.Add($"{(passed ? "Passed!" : "Failed!")}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
+            + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}");
         lock (_idleHosts)
             output.ForEach(log);
         return passed;
+    }
+
+    /// <summary>An idle host, and a new one started in its place for the next run.</summary>
+    Process TakeHost()
+    {
+        Process? host = null;
+        while (host is null && _idleHosts.TryTake(out var idle))
+        {
+            if (idle.HasExited)
+                idle.Dispose();
+            else
+                host = idle;
+        }
+        host ??= StartHost();
+        _idleHosts.Add(StartHost());
+        return host;
     }
 
     static Process StartHost()
@@ -110,6 +160,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         // Tests run with the runtime's defaults, as under `dotnet test`, not the daemon's tuning.
         foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
             start.Environment.Remove(variable);
+        // An idle host exits when its stdin closes, so the daemon exiting any way takes them with it.
         return Process.Start(start)!;
     }
 
@@ -126,14 +177,21 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             Stop(host);
     }
 
+    /// <summary>
+    /// The test framework a project references: xunit3, nunit or mstest run in a host; vstest (xUnit v2)
+    /// goes through `dotnet test`.
+    /// </summary>
     static string? Framework(ProjectCompiler unit)
     {
         var references = unit.References.Select(r => Path.GetFileName(r.Reference)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (references.Contains("xunit.v3.core.dll"))
             return "xunit3";
+        if (references.Contains("nunit.framework.dll"))
+            return "nunit";
         // MSTest's framework assembly is MSTest.TestFramework.dll from v4 on, and the longer name before.
-        if (references.Contains("xunit.core.dll") || references.Contains("nunit.framework.dll")
-            || references.Contains("MSTest.TestFramework.dll") || references.Contains("Microsoft.VisualStudio.TestPlatform.TestFramework.dll"))
+        if (references.Contains("MSTest.TestFramework.dll") || references.Contains("Microsoft.VisualStudio.TestPlatform.TestFramework.dll"))
+            return "mstest";
+        if (references.Contains("xunit.core.dll"))
             return "vstest";
         return null;
     }

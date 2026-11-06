@@ -6,7 +6,7 @@
 
 Faster rebuilds for C# solutions. Type `blaze-cs build` where you would type `dotnet build`: a daemon
 keeps your solution compiled in memory, and after an edit it rebuilds only what the edit can affect.
-`blaze-cs test` then runs the affected test projects in warm test hosts.
+`blaze-cs test` then runs the affected test projects in test hosts that are already started.
 
 It is influenced by **[blaze](https://github.com/indexable-inc/blaze)**, which does this for Rust ("type
 `blaze` wherever you'd type `cargo`"). blaze-cs borrows the idea, a warm daemon that holds the project
@@ -34,8 +34,9 @@ daemon:
   changes, it diffs the API member by member and recompiles only the dependents that use a changed
   member (or whose source generators' output changes). Changes that code can reach without naming them
   (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
-- **Warm tests.** xUnit v3 test assemblies run in a small pool of long-lived test host processes, each
-  run in a fresh collectible load context. Other test frameworks go through `dotnet test --no-build`.
+- **Started tests.** xUnit v3, NUnit and MSTest assemblies run in-process in test hosts that the daemon
+  starts ahead of time; each host runs one assembly and exits, and a new one takes its place. xUnit v2,
+  projects with a `.runsettings`, and anything a host can't run go through `dotnet test --no-build`.
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
   or NuGet file, or a project that an IL weaver (such as Fody) rewrites after compile, goes through a
   real `dotnet build`.
@@ -67,7 +68,7 @@ blaze-cs doesn't run analyzers, so the fair comparison is the middle column: 6 t
 
 | Test loop | `dotnet test` | `blaze-cs test` |
 |---|---:|---:|
-| Edit a test file, rerun its project (219 tests) | 4.54 s | **1.04 s** |
+| Edit a test file, rerun its project (219 tests) | 4.54 s | **0.68 s** |
 
 To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timings) and
 `task verify -- body|signature|file` (compares output with `dotnet build --no-incremental`).
@@ -81,8 +82,9 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
   until the next `dotnet build` recompiles it.
 - **Platforms:** Linux only so far. The client uses a Unix socket and `setsid`.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
-  by a real solution. NUnit and MSTest are covered by the fixture check through `dotnet test`; Razor,
-  NUnit and MSTest in the warm host, and large graphs are untested.
+  by a real solution. NUnit and MSTest run in the test host only in the fixture check (two tests each);
+  Razor, NUnit and MSTest on a real solution, and large graphs are untested. The host doesn't apply
+  NUnit or MSTest settings beyond the defaults.
 - **Memory:** the daemon holds a few GB (about 2.3 GB for jellyfin).
 
 ## Layout
@@ -90,6 +92,6 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
 | Path | What |
 |---|---|
 | `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
-| `src/BlazeCs.TestHost` | the warm xUnit v3 test host |
+| `src/BlazeCs.TestHost` | the single-use test host (xUnit v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
