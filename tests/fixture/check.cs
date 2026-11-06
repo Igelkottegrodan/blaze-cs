@@ -97,6 +97,7 @@ try
             RanTests(name, output, expected);
         Verify(name, rebuilt, fallback);
     }
+    HostCannotLoad();
     passed = true;
 }
 catch (CheckFailed failure)
@@ -116,6 +117,33 @@ finally
     }
 }
 return 0;
+
+// A test assembly the warm host can't load (here, a missing reference) fails the run within seconds, naming
+// the assembly and the cause, and the daemon still serves the next run.
+void HostCannotLoad()
+{
+    var reference = Directory.EnumerateFiles(Path.Combine(work, "Tests", "bin"), "Consumer.dll", SearchOption.AllDirectories).Single();
+    var kept = File.ReadAllBytes(reference);
+    File.Delete(reference);
+    Replace("Tests/WelcomeTests.cs", "\"tester\"", "\"loader\"");
+    var stopwatch = Stopwatch.StartNew();
+    string output;
+    int exitCode;
+    try
+    {
+        (output, exitCode) = RunWithExit(blaze, "test", check: false);
+    }
+    finally
+    {
+        File.WriteAllBytes(reference, kept);
+        Replace("Tests/WelcomeTests.cs", "\"loader\"", "\"tester\"");
+    }
+    var failedIn = stopwatch.Elapsed;
+    if (exitCode == 0 || failedIn > TimeSpan.FromSeconds(30) || !Regex.IsMatch(output, @"^blaze-cs: Tests\.dll: .*Consumer", RegexOptions.Multiline))
+        Fail($"host that can't load Tests.dll: expected a failure naming Tests.dll and Consumer within 30 s, got exit {exitCode} after {failedIn.TotalSeconds:F0} s:\n{output}");
+    RanTests("test after a host that can't load", Run(blaze, "test"), ["Tests"]);
+    Console.WriteLine($"ok  host that can't load an assembly: failed in {failedIn.TotalSeconds:F1} s; the next run passed");
+}
 
 void Replace(string path, string old, string replacement)
 {
@@ -200,7 +228,9 @@ Dictionary<string, byte[]> Outputs() =>
             && (path.EndsWith(".dll", StringComparison.Ordinal) || parts.Contains("scopedcss") && path.EndsWith(".css", StringComparison.Ordinal)))
         .ToDictionary(path => path, path => File.ReadAllBytes(Path.Combine(work, path)));
 
-string Run(string file, string arguments, bool check = true)
+string Run(string file, string arguments, bool check = true) => RunWithExit(file, arguments, check).Output;
+
+(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true)
 {
     var start = new ProcessStartInfo(file, arguments) { WorkingDirectory = work, RedirectStandardOutput = true, RedirectStandardError = true };
     using var process = Process.Start(start)!;
@@ -209,7 +239,7 @@ string Run(string file, string arguments, bool check = true)
     process.WaitForExit();
     if (check && process.ExitCode != 0)
         Fail($"{file} {arguments} exited {process.ExitCode}:\n{output}");
-    return output;
+    return (output, process.ExitCode);
 }
 
 static void CopyFixture(string from, string to)
