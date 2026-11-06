@@ -122,6 +122,7 @@ try
     }
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
+    AllTestsSkipped();
     DaemonLifecycle();
     passed = true;
 }
@@ -263,6 +264,28 @@ void RunSettingsTheHostDoesNotApply()
     Console.WriteLine("ok  runsettings the host doesn't apply: dotnet test ran the project");
 }
 
+// With every test skipped, the warm host's summary reads like dotnet test's for each framework: "Skipped!"
+// and the same counts. The xUnit v3 project keeps its explicit test, which neither counts.
+void AllTestsSkipped()
+{
+    string[] projects = ["Tests", "XunitV2Tests", "NUnitTests", "MSTestTests"];
+    SkipTests("Tests/WelcomeTests.cs", "[Fact]", "[Fact(Skip = \"skipped\")]");
+    SkipTests("XunitV2Tests/WelcomeTests.cs", "[Fact]", "[Fact(Skip = \"skipped\")]");
+    SkipTests("NUnitTests/WelcomeTests.cs", "[Test]", "[Test, Ignore(\"skipped\")]");
+    SkipTests("MSTestTests/WelcomeTests.cs", "[TestMethod]", "[TestMethod, Ignore]");
+    var ours = Summaries(Run(blaze, "test"));
+    foreach (var project in projects)
+    {
+        var theirs = Summaries(Run("dotnet", $"test --no-build {project} -nologo"));
+        var expected = new Summary("Skipped!", 0, 0, TestCount(project), TestCount(project));
+        if (ours.GetValueOrDefault(project) != expected || theirs.GetValueOrDefault(project) != expected)
+            Fail($"all tests skipped: {project}: expected {expected} from the host and from dotnet test, got {ours.GetValueOrDefault(project)} and {theirs.GetValueOrDefault(project)}");
+    }
+    Console.WriteLine("ok  all tests skipped: the host's summary lines match dotnet test's");
+}
+
+void SkipTests(string path, string attribute, string skipped) => File.WriteAllText(Path.Combine(work, path), File.ReadAllText(Path.Combine(work, path)).Replace(attribute, skipped));
+
 void Replace(string path, string old, string replacement)
 {
     var file = Path.Combine(work, path);
@@ -308,20 +331,26 @@ HashSet<string> FellBack(string name, string output, string fallback, bool allKe
     return [];
 }
 
-// The test projects a run reports, from their summary lines ("Passed!  - Failed: 0, Passed: 2, ... - Tests.dll",
-// printed alike by the warm host and dotnet test): exactly the expected ones, once each, with all their tests
-// passed, and none through dotnet test, since the warm host must run them on the runtime each one targets.
+// The test projects' summary lines ("Passed!  - Failed: 0, Passed: 2, Skipped: 0, Total: 2, ... - Tests.dll",
+// printed alike by the warm host and dotnet test), by project.
+static Dictionary<string, Summary> Summaries(string output) =>
+    Regex.Matches(output, @"^\s*(\w+!)\s+- Failed:\s+(\d+), Passed:\s+(\d+), Skipped:\s+(\d+), Total:\s+(\d+), .* - (\S+)\.dll\b", RegexOptions.Multiline)
+        .ToDictionary(m => m.Groups[6].Value, m => new Summary(m.Groups[1].Value, int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value),
+            int.Parse(m.Groups[4].Value), int.Parse(m.Groups[5].Value)));
+
+// The test projects a run reports: exactly the expected ones, once each, with all their tests passed and
+// counted as dotnet test counts them (explicit tests that weren't asked for aren't), and none through
+// dotnet test, since the warm host must run them on the runtime each one targets.
 void RanTests(string name, string output, string[] expected)
 {
-    var summaries = Regex.Matches(output, @"^\s*(?:Passed|Failed)!\s+- Failed:\s+(\d+), Passed:\s+(\d+), .* - (\S+)\.dll\b", RegexOptions.Multiline)
-        .Select(m => (Project: m.Groups[3].Value, Failed: int.Parse(m.Groups[1].Value), Passed: int.Parse(m.Groups[2].Value)))
-        .ToList();
-    if (!summaries.Select(s => s.Project).Order().SequenceEqual(expected.Order()))
-        Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Select(s => s.Project).Order())}:\n{output}");
+    var summaries = Summaries(output);
+    if (!summaries.Keys.Order().SequenceEqual(expected.Order()))
+        Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Keys.Order())}:\n{output}");
     if (output.Contains("running dotnet test"))
         Fail($"{name}: expected the test host to run these, not dotnet test:\n{output}");
-    if (summaries.FirstOrDefault(s => s.Failed != 0 || s.Passed != TestCount(s.Project)) is { Project: not null } wrong)
-        Fail($"{name}: {wrong.Project}: expected {TestCount(wrong.Project)} tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
+    foreach (var (project, summary) in summaries)
+        if (summary != new Summary("Passed!", 0, TestCount(project), 0, TestCount(project)))
+            Fail($"{name}: {project}: expected {TestCount(project)} tests passed and no others, got {summary}:\n{output}");
 }
 
 // Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings.
@@ -393,5 +422,7 @@ static void CopyFixture(string from, string to)
 static void Fail(string message) => throw new CheckFailed(message);
 
 sealed class CheckFailed(string message) : Exception(message);
+
+sealed record Summary(string Label, int Failed, int Passed, int Skipped, int Total);
 
 sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null, bool AllKept = false);
