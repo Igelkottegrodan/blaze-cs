@@ -12,6 +12,11 @@ tasks:
     cmds:
       - dotnet run tests/fixture/check.cs
 
+  check:windows:
+    desc: From WSL, run the fixture check on native Windows for SDK 10 and 11 (installs them under %LOCALAPPDATA%\blaze-cs)
+    cmds:
+      - scripts/check-windows.sh
+
   bench:
     desc: Time each edit kind on bench/jellyfin (task bench -- [runs])
     deps: [build]
