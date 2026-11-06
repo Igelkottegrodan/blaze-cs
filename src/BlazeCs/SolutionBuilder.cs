@@ -267,9 +267,36 @@ sealed partial class SolutionBuilder
             Run();
     }
 
-    /// <summary>Whether a unit's assembly on disk is the one its sources compile to, as the daemon last wrote or verified it.</summary>
-    public bool Reproduces(ProjectCompiler unit) =>
-        _published.HoldsLast(unit.AssemblyPath);
+    /// <summary>
+    /// Whether a unit's assembly on disk is its sources' code: the bytes the daemon last wrote or verified, or,
+    /// if a build outside it wrote the file since (a `dotnet build` fallback's, the user's), the code the daemon
+    /// compiles from the unit now, apart from debug identity: a dependent the daemon skipped records an older
+    /// MVID of its reference than a full build's. That compile is remembered with the file's stamp. Only while
+    /// no command builds: it compiles the unit.
+    /// </summary>
+    public bool Reproduces(ProjectCompiler unit)
+    {
+        var path = unit.AssemblyPath;
+        if (_published.HoldsLast(path))
+            return true;
+        var info = new FileInfo(path);
+        if (!info.Exists)
+            return false;
+        if (_sameCode.TryGetValue(path, out var verified) && verified == (info.Length, info.LastWriteTimeUtc))
+            return true;
+        var (output, _) = unit.Emit(unit.Prepare());
+        if (output is null)
+            return false;
+        if (_published.Holds(path, output.Assembly))
+            return true;
+        if (!PeIdentity.SameCode(File.ReadAllBytes(path), output.Assembly))
+            return false;
+        _sameCode[path] = (info.Length, info.LastWriteTimeUtc);
+        return true;
+    }
+
+    /// <summary>Assemblies a build outside the daemon wrote with what their unit compiles to apart from debug identity, by stamp.</summary>
+    readonly ConcurrentDictionary<string, (long Length, DateTime Modified)> _sameCode = new(PathComparer.Instance);
 
     /// <summary>The load that warm-up called for, run by each command until it succeeds, as the first load is.</summary>
     Func<Action<string>, bool>? _reload;

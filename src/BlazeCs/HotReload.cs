@@ -239,8 +239,15 @@ sealed class HotReloadEngine
             _status.GetValue(updates)!.ToString()!,
             deltas,
             diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error).Select(d => d.ToString()).ToList(),
-            Items(_projectsToRestart.GetValue(updates)).Cast<object>().Count() + Items(_projectsToRebuild.GetValue(updates)).Cast<object>().Count());
+            Items(_projectsToRestart.GetValue(updates)).Cast<object>().Count() + Items(_projectsToRebuild.GetValue(updates)).Cast<object>().Count(),
+            // A rude edit that only needs a restart comes as a warning (ENC....), not an error.
+            [.. diagnostics.Where(d => d.Id.StartsWith("ENC", StringComparison.Ordinal) && d.Severity >= DiagnosticSeverity.Warning).Select(Describe)]);
     }
+
+    /// <summary>A diagnostic as `Greeter.cs(7): ENC0009: Updating the return type of method requires restarting the application.`</summary>
+    static string Describe(Diagnostic diagnostic) => diagnostic.Location.GetLineSpan() is { IsValid: true } span
+        ? $"{Path.GetFileName(span.Path)}({span.StartLinePosition.Line + 1}): {diagnostic.Id}: {diagnostic.GetMessage()}"
+        : $"{diagnostic.Id}: {diagnostic.GetMessage()}";
 
     internal void Commit(object service) => _commit.Invoke(service, null);
     internal void Discard(object service) => _discard.Invoke(service, null);
@@ -263,7 +270,7 @@ sealed class HotReloadEngine
 }
 
 /// <summary>What the engine made of an edit: its status (NoChangesToApply, ReadyToApply, Blocked) and deltas, and why it can't apply some.</summary>
-sealed record EngineUpdates(string Status, List<EngineDelta> Deltas, List<string> Errors, int ProjectsToRestartOrRebuild);
+sealed record EngineUpdates(string Status, List<EngineDelta> Deltas, List<string> Errors, int ProjectsToRestartOrRebuild, List<string> RudeEdits);
 
 sealed record EngineDelta(Guid Module, ProjectId Project, byte[] Metadata, byte[] IL, byte[] Pdb, int[] UpdatedTypes);
 

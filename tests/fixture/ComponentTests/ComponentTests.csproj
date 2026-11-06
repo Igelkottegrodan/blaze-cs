@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <!-- Compiled as a Release build is, though the solution builds Debug: the runtime can't edit an optimized
+         module, so this project's hosts never take updates, and every check runs a Release test project too. -->
+    <Optimize>true</Optimize>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="xunit.v3" Version="3.2.2" />
