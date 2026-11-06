@@ -76,15 +76,15 @@ sealed class ProjectCompiler
         _config = new ProjectConfig(_args.AnalyzerConfigPaths);
         _embedded = _args.EmbeddedFiles.Select(f => f.Path).ToHashSet(PathComparer.Instance);
 
-        var trees = new SyntaxTree[_args.SourceFiles.Length];
+        _order = CompiledSources(_args.SourceFiles);
+        var trees = new SyntaxTree[_order.Count];
         Parallel.For(0, trees.Length, i =>
         {
-            var file = SourceFile.Read(_args.SourceFiles[i].Path, this);
+            var file = SourceFile.Read(_order[i], this);
             lock (_sources)
                 _sources[file.Path] = file;
             trees[i] = file.Tree;
         });
-        _order = _args.SourceFiles.Select(f => f.Path).ToList();
         _ignoredOnDisk = DiscoverFiles([".cs"]).Where(path => !_sources.ContainsKey(path)).ToHashSet(PathComparer.Instance);
 
         foreach (var file in _args.AdditionalFiles)
@@ -118,6 +118,17 @@ sealed class ProjectCompiler
                 _config.GeneratorOptions(),
                 DriverOptions(baseDirectory));
         }
+    }
+
+    /// <summary>
+    /// The source paths csc compiles, in order: a file listed more than once compiles only at its first
+    /// occurrence (warning CS2002). csc compares the full paths of the opened files ignoring case on
+    /// every OS (CSharpCompiler.CreateCompilation), so this does too.
+    /// </summary>
+    static List<string> CompiledSources(IEnumerable<CommandLineSourceFile> files)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return files.Select(f => f.Path).Where(path => seen.Add(Path.GetFullPath(path))).ToList();
     }
 
     /// <summary>
@@ -271,16 +282,16 @@ sealed class ProjectCompiler
     {
         var order = new List<string>();
         var changed = false;
-        foreach (var file in _args.SourceFiles)
+        foreach (var path in CompiledSources(_args.SourceFiles))
         {
-            if (!_sources.ContainsKey(file.Path))
+            if (!_sources.ContainsKey(path))
             {
-                if (!File.Exists(file.Path))
+                if (!File.Exists(path))
                     continue;
-                _sources[file.Path] = SourceFile.Read(file.Path, this);
+                _sources[path] = SourceFile.Read(path, this);
                 changed = true;
             }
-            order.Add(file.Path);
+            order.Add(path);
         }
         foreach (var extra in _sources.Keys.Except(order, PathComparer.Instance).ToList())
         {

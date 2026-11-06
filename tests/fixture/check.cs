@@ -142,6 +142,8 @@ var loadedProjects = 0; // from the last "loaded N projects" line a command prin
 try
 {
     Run(blaze, "build"); // starts the daemon: a real dotnet build; the warm-up compile runs after it returns
+    // The next command reports the warm-up, which must reproduce every assembly.
+    WarmedUpIdentical("start", Run(blaze, "build"));
     var prestarted = PrestartedHosts();
     foreach (var (name, edit, expected, command, fallback, allKept, ran) in cases)
     {
@@ -613,10 +615,7 @@ HashSet<string> FellBack(string name, string output, string fallback, bool allKe
     // Its message names paths with this OS's separator.
     if (!output.Contains($"blaze-cs: {fallback.Replace('/', Path.DirectorySeparatorChar)}"))
         Fail($"{name}: expected blaze-cs to log \"{fallback}\":\n{output}");
-    // The last warm-up: one that finds stale cached arguments reloads with fresh ones.
-    var warmUp = Regex.Matches(output, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical.*", RegexOptions.Multiline).LastOrDefault();
-    if (warmUp is null || warmUp.Groups[1].Value != warmUp.Groups[2].Value)
-        Fail($"{name}: expected blaze-cs to reload with every assembly identical to dotnet build's:\n{output}");
+    var warmUp = WarmedUpIdentical(name, output);
     if (allKept)
     {
         var loaded = Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects .*", RegexOptions.Multiline).LastOrDefault();
@@ -626,6 +625,16 @@ HashSet<string> FellBack(string name, string output, string fallback, bool allKe
             Fail($"{name}: expected blaze-cs to keep every project warm and compile none of them again:\n{output}");
     }
     return [];
+}
+
+// The last warm-up must find every assembly identical to dotnet build's: one that finds stale cached
+// arguments reloads with fresh ones.
+Match WarmedUpIdentical(string name, string output)
+{
+    var warmUp = Regex.Matches(output, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical.*", RegexOptions.Multiline).LastOrDefault();
+    if (warmUp is null || warmUp.Groups[1].Value != warmUp.Groups[2].Value)
+        Fail($"{name}: expected blaze-cs to reload with every assembly identical to dotnet build's:\n{output}");
+    return warmUp;
 }
 
 // The test projects' summary lines ("Passed!  - Failed: 0, Passed: 2, Skipped: 0, Total: 2, ... - Tests.dll",
