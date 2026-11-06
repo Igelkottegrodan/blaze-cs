@@ -83,11 +83,18 @@ sealed class ProjectConfig
     }
 }
 
-/// <summary>An /additionalfile: read from disk, as csc does.</summary>
+/// <summary>
+/// An /additionalfile: read from disk, as csc does, with csc's encoding and checksum algorithm. Generators
+/// see the checksum: Razor writes it into a #pragma checksum, and so into the PDB and the assembly's PDB ID.
+/// </summary>
 sealed class FileText(string path, SourceText text) : AdditionalText
 {
     public override string Path => path;
     public override SourceText GetText(CancellationToken cancellationToken = default) => text;
 
-    public static FileText Read(string path) => new(path, SourceText.From(File.ReadAllText(path)));
+    public static FileText Read(string path, System.Text.Encoding? encoding, SourceHashAlgorithm checksumAlgorithm)
+    {
+        using var stream = File.OpenRead(path);
+        return new(path, SourceText.From(stream, encoding, checksumAlgorithm));
+    }
 }

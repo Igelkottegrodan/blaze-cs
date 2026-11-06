@@ -1,9 +1,10 @@
 #!/usr/bin/env dotnet
 #:include ../../scripts/PeIdentity.cs
 // Regression check: makes each kind of edit to a copy of this fixture, rebuilds it with blaze-cs, and fails
-// unless (1) blaze-cs rebuilt exactly the expected projects and (2) every assembly is what
-// `dotnet build --no-incremental` produces. An assembly may differ only in debug identity (PeIdentity),
-// and only in a project blaze-cs skipped: its PDB still records the old MVID of the reference that changed.
+// unless (1) blaze-cs rebuilt exactly the expected projects, or took the expected fallback to dotnet build,
+// and (2) every assembly and scoped CSS bundle is what `dotnet build --no-incremental` produces. An assembly
+// may differ only in debug identity (PeIdentity), and only in a project blaze-cs skipped: its PDB still
+// records the old MVID of the reference that changed. After a fallback, nothing may differ.
 //
 // usage: task check   (or: dotnet run tests/fixture/check.cs, after `dotnet build BlazeCs.slnx`)
 using System.Diagnostics;
@@ -14,32 +15,55 @@ var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
 var blaze = Path.Combine(root, "blaze-cs");
 
-// (name, edit, units blaze-cs must rebuild, command); the edits build on each other. Lib and Consumer
-// target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
+// (name, edit, units blaze-cs must rebuild, command, fallback); the edits build on each other. Lib and
+// Consumer target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
+// A case with a fallback must instead log it ("blaze-cs: <fallback>") and run dotnet build.
 string[] lib = ["Lib (net10.0)", "Lib (net8.0)"], consumer = ["Consumer (net10.0)", "Consumer (net8.0)"];
-(string Name, Action Edit, string[] Expected, string Command)[] cases =
+Case[] cases =
 [
-    ("body", () => Replace("Lib/Greeter.cs", "\"Hello, \"", "\"Hello there, \""), lib, "build"),
-    ("signature used by Consumer",
+    new("body", () => Replace("Lib/Greeter.cs", "\"Hello, \"", "\"Hello there, \""), lib, "build"),
+    new("signature used by Consumer",
         () => Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + name", "Greet(string person) => \"Hello there, \" + person"),
         [.. consumer, .. lib], "build"),
-    ("signature unused by Consumer",
+    new("signature unused by Consumer",
         () => Replace("Lib/Greeter.cs", "Twice(int value) => value * 2", "Twice(int amount) => amount * 2"), lib, "build"),
     // Lib (net8.0) recompiles because its source changed, but its API doesn't, so Consumer (net8.0) doesn't.
-    ("net10.0-only signature",
+    new("net10.0-only signature",
         () => Replace("Lib/Greeter.cs", "Shout(string name) => name.ToUpperInvariant()", "Shout(string who) => who.ToUpperInvariant()"),
         ["Consumer (net10.0)", .. lib], "build"),
-    ("new file",
+    new("new file",
         () => File.WriteAllText(Path.Combine(work, "Lib/Probe.cs"), "namespace Lib;\n\ninternal static class Probe\n{\n    internal const int Edit = 1;\n}\n"),
         lib, "build"),
-    ("generator output",
+    new("generator output",
         () => Replace("Lib/Greeter.cs", "    public static int Twice",
             "    public static string Farewell(string name) => \"Bye, \" + name;\n\n    public static int Twice"),
         [.. consumer, .. lib], "build"),
     // A test run must also show each rebuilt test project's tests passing (RanTests).
-    ("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
-    ("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
-    ("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
+    new("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
+    new("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
+    new("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
+    // Razor (Components): the Razor generator compiles .razor files, which csc gets as /additionalfile.
+    new("razor markup", () => Replace("Components/Greeting.razor", "<Badge>@Text(Name)</Badge>", "<Badge><em>@Text(Name)</em></Badge>"),
+        ["Components"], "build"),
+    new("razor @code API used by ComponentTests",
+        () => Replace("Components/Greeting.razor", "    [Parameter]\n    public string Name", "    [Parameter, EditorRequired]\n    public string Name"),
+        ["ComponentTests", "Components"], "build"),
+    new("razor @code API unused",
+        () => Replace("Components/Badge.razor", "    public RenderFragment? ChildContent { get; set; }\n",
+            "    public RenderFragment? ChildContent { get; set; }\n\n    [Parameter]\n    public string? Tone { get; set; }\n"),
+        ["Components"], "build"),
+    new("_Imports.razor", () => File.AppendAllText(Path.Combine(work, "Components/_Imports.razor"), "@using Consumer\n"), ["Components"], "build"),
+    new("component test edit", () => Replace("ComponentTests/GreetingTests.cs", "\"reader\"", "\"tester\""), ["ComponentTests"], "test"),
+    // Only MSBuild lists a new .razor for the generator, with its metadata in the generated .editorconfig.
+    new("new razor file",
+        () => File.WriteAllText(Path.Combine(work, "Components/Farewell.razor"), "<p>Bye, @Who</p>\n\n@code {\n    [Parameter]\n    public string Who { get; set; } = \"\";\n}\n"),
+        [], "build", "Components: Farewell.razor is new; running dotnet build"),
+    new("razor file added by the last fallback", () => Replace("Components/Farewell.razor", "<p>Bye, @Who</p>", "<p>Goodbye, @Who</p>"), ["Components"], "build"),
+    // MSBuild rewrites and bundles scoped CSS; the compiled component only carries its scope.
+    new("scoped css", () => Replace("Components/Badge.razor.css", "font-weight: bold;", "font-weight: bold;\n    color: green;"),
+        [], "build", "Components/Badge.razor.css changed, running dotnet build"),
+    new("deleted razor file", () => File.Delete(Path.Combine(work, "Components/Farewell.razor")),
+        [], "build", "Components: Farewell.razor was deleted; running dotnet build"),
 ];
 
 if (Directory.Exists(work))
@@ -55,16 +79,16 @@ var passed = false;
 try
 {
     Run(blaze, "build"); // starts the daemon: a real dotnet build, then a warm-up compile
-    foreach (var (name, edit, expected, command) in cases)
+    foreach (var (name, edit, expected, command, fallback) in cases)
     {
         edit();
         var output = Run(blaze, command);
-        var rebuilt = Rebuilt(output);
+        var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback);
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
         if (command == "test")
             RanTests(name, output, expected);
-        Verify(name, rebuilt);
+        Verify(name, rebuilt, fallback);
     }
     passed = true;
 }
@@ -104,6 +128,19 @@ HashSet<string> Rebuilt(string output)
     return [.. match.Groups[1].Value.Split(", ")];
 }
 
+// A case that must go through dotnet build: blaze-cs logs why, and then reloads with every assembly
+// identical to that build's. The projects MSBuild compiled aren't reported, so the set is empty.
+HashSet<string> FellBack(string name, string output, string fallback)
+{
+    if (!output.Contains($"blaze-cs: {fallback}"))
+        Fail($"{name}: expected blaze-cs to log \"{fallback}\":\n{output}");
+    // The last warm-up: one that finds stale cached arguments reloads with fresh ones.
+    var warmUp = Regex.Matches(output, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical", RegexOptions.Multiline).LastOrDefault();
+    if (warmUp is null || warmUp.Groups[1].Value != warmUp.Groups[2].Value)
+        Fail($"{name}: expected blaze-cs to reload with every assembly identical to dotnet build's:\n{output}");
+    return [];
+}
+
 // The test projects a run reports, from their summary lines ("Passed!  - Failed: 0, Passed: 2, ... - Tests.dll",
 // printed alike by the warm host and dotnet test): exactly the expected ones, once each, with both tests passed.
 void RanTests(string name, string output, string[] expected)
@@ -117,23 +154,24 @@ void RanTests(string name, string output, string[] expected)
         Fail($"{name}: {wrong.Project}: expected 2 tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
 }
 
-// Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources.
-void Verify(string name, HashSet<string> rebuilt)
+// Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources. After a fallback, MSBuild
+// built everything, so every output must be identical.
+void Verify(string name, HashSet<string> rebuilt, string? fallback)
 {
-    var ours = Assemblies();
+    var ours = Outputs();
     Run("dotnet", "build Fixture.slnx -nologo -v:q -clp:ErrorsOnly --no-incremental");
-    var theirs = Assemblies();
+    var theirs = Outputs();
     if (!ours.Keys.ToHashSet().SetEquals(theirs.Keys))
-        Fail($"{name}: assembly sets differ: {string.Join(", ", ours.Keys.ToHashSet().Except(theirs.Keys).Union(theirs.Keys.Except(ours.Keys)))}");
+        Fail($"{name}: output sets differ: {string.Join(", ", ours.Keys.ToHashSet().Except(theirs.Keys).Union(theirs.Keys.Except(ours.Keys)))}");
     var differing = ours.Keys.Where(path => !ours[path].AsSpan().SequenceEqual(theirs[path])).ToList();
-    var inRebuilt = differing.Where(path => CompiledBy(rebuilt, path)).ToList();
+    var inRebuilt = differing.Where(path => fallback is not null || CompiledBy(rebuilt, path) || !path.EndsWith(".dll", StringComparison.Ordinal)).ToList();
     if (inRebuilt.Count > 0)
-        Fail($"{name}: blaze-cs compiled these but they differ from dotnet build: {string.Join(", ", inRebuilt)}");
+        Fail($"{name}: blaze-cs or its fallback wrote these, but they differ from dotnet build: {string.Join(", ", inRebuilt)}");
     var beyondIdentity = differing.Where(path => !PeIdentity.SameCode(ours[path], theirs[path])).ToList();
     if (beyondIdentity.Count > 0)
         Fail($"{name}: skipped dependents differ beyond debug identity: {string.Join(", ", beyondIdentity)}");
-    Console.WriteLine($"ok  {name}: rebuilt {(rebuilt.Count == 0 ? "nothing" : string.Join(", ", rebuilt.Order()))}; "
-        + $"{ours.Count - differing.Count} of {ours.Count} assemblies identical, {differing.Count} same code");
+    Console.WriteLine($"ok  {name}: {(fallback is not null ? "dotnet build" : "rebuilt " + (rebuilt.Count == 0 ? "nothing" : string.Join(", ", rebuilt.Order())))}; "
+        + $"{ours.Count - differing.Count} of {ours.Count} outputs identical, {differing.Count} same code");
 }
 
 // Whether blaze-cs compiled an obj/ assembly (Project/obj/<configuration>/<tfm>/...): its unit is named
@@ -141,10 +179,12 @@ void Verify(string name, HashSet<string> rebuilt)
 static bool CompiledBy(HashSet<string> rebuilt, string path) => path.Split('/') is [var project, "obj", _, var framework, ..]
     && (rebuilt.Contains(project) || rebuilt.Contains($"{project} ({framework})"));
 
-Dictionary<string, byte[]> Assemblies() =>
-    Directory.EnumerateFiles(work, "*.dll", SearchOption.AllDirectories)
+// Every obj/ assembly, and the scoped CSS that MSBuild rewrites and bundles (obj/.../scopedcss/).
+Dictionary<string, byte[]> Outputs() =>
+    Directory.EnumerateFiles(work, "*", SearchOption.AllDirectories)
         .Select(path => Path.GetRelativePath(work, path))
-        .Where(path => path.Split('/') is [_, "obj", ..] parts && !parts.Contains("refint"))
+        .Where(path => path.Split('/') is [_, "obj", ..] parts && !parts.Contains("refint")
+            && (path.EndsWith(".dll", StringComparison.Ordinal) || parts.Contains("scopedcss") && path.EndsWith(".css", StringComparison.Ordinal)))
         .ToDictionary(path => path, path => File.ReadAllBytes(Path.Combine(work, path)));
 
 string Run(string file, string arguments, bool check = true)
@@ -174,3 +214,5 @@ static void CopyFixture(string from, string to)
 static void Fail(string message) => throw new CheckFailed(message);
 
 sealed class CheckFailed(string message) : Exception(message);
+
+sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null);

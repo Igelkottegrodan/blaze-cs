@@ -6,4 +6,6 @@
   <Project Path="Tests/Tests.csproj" />
   <Project Path="NUnitTests/NUnitTests.csproj" />
   <Project Path="MSTestTests/MSTestTests.csproj" />
+  <Project Path="Components/Components.csproj" />
+  <Project Path="ComponentTests/ComponentTests.csproj" />
 </Solution>
