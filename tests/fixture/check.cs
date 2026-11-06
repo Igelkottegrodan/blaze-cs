@@ -121,6 +121,7 @@ if (hasNet11)
 else
     Directory.Delete(Path.Combine(work, "Tests11"), recursive: true);
 var passed = false;
+var loadedProjects = 0; // from the last "loaded N projects" line a command printed
 try
 {
     Run(blaze, "build"); // starts the daemon: a real dotnet build, then a warm-up compile
@@ -128,6 +129,8 @@ try
     {
         edit();
         var output = Run(blaze, command);
+        if (Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects", RegexOptions.Multiline).LastOrDefault() is { } load)
+            loadedProjects = int.Parse(load.Groups[1].Value);
         var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback, allKept);
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
@@ -135,6 +138,7 @@ try
             RanTests(name, output, ran ?? expected);
         Verify(name, rebuilt, fallback);
     }
+    ProjectRemovedAndRestored();
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
     FailedRunsAgain();
@@ -261,6 +265,48 @@ static void CopyDirectory(string from, string to)
         File.Copy(file, Path.Combine(to, Path.GetFileName(file)));
     foreach (var directory in Directory.EnumerateDirectories(from))
         CopyDirectory(directory, Path.Combine(to, Path.GetFileName(directory)));
+}
+
+// A project removed from the solution is no unit any more, though an incremental build logs nothing about
+// it: the reload drops it (here with its obj/ deleted too, which must not break the load), later builds
+// don't compile or write it, and `test` doesn't run it. Put back, it is a unit again and builds as usual.
+void ProjectRemovedAndRestored()
+{
+    const string removed = "XunitV2Tests";
+    var solution = Path.Combine(work, "Fixture.slnx");
+    var original = File.ReadAllText(solution);
+    var before = loadedProjects;
+    string[] tests = ["Tests", "NUnitTests", "MSTestTests", "ComponentTests", .. (hasNet11 ? new[] { "Tests11" } : [])];
+
+    Replace("Fixture.slnx", $"  <Project Path=\"{removed}/{removed}.csproj\" />\n", "");
+    Directory.Delete(Path.Combine(work, removed, "obj"), recursive: true);
+    var output = Run(blaze, "build");
+    var none = FellBack("project removed", output, "Fixture.slnx changed, running dotnet build", allKept: false);
+    var loaded = Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects.*", RegexOptions.Multiline).Last();
+    if (int.Parse(loaded.Groups[1].Value) != before - 1 || Regex.Match(loaded.Value, @"(\d+) kept warm").Groups[1].Value != (before - 1).ToString())
+        Fail($"project removed: expected {before - 1} projects, all kept warm (one fewer than the {before} before):\n{output}");
+    Verify("project removed", none, "fallback");
+
+    // The removed project's sources are no input: nothing compiles, and nothing is written for it.
+    Replace($"{removed}/WelcomeTests.cs", "\"tester\"", "\"removed\"");
+    output = Run(blaze, "build");
+    if (!Rebuilt(output).SetEquals([]) || Directory.Exists(Path.Combine(work, removed, "obj")))
+        Fail($"edit in the removed project: expected blaze-cs to ignore it and write no {removed}/obj:\n{output}");
+    // The others' inputs didn't change, so none runs again (#35), and the removed one isn't listed at all.
+    RanTests("test after a project was removed", Run(blaze, "test"), [], among: tests);
+
+    File.WriteAllText(solution, original);
+    output = Run(blaze, "build");
+    FellBack("project restored", output, "Fixture.slnx changed", allKept: false);
+    Verify("project restored", [], "fallback");
+    Replace($"{removed}/WelcomeTests.cs", "\"removed\"", "\"tester\"");
+    output = Run(blaze, "test");
+    if (!Rebuilt(output).SetEquals([removed]))
+        Fail($"project restored: expected blaze-cs to compile {removed} again:\n{output}");
+    // Back as a test project: its bytes are what it last ran with (the edit is undone), so it is listed
+    // as unchanged since that run (#35) rather than run again.
+    RanTests("test after the project was restored", output, []);
+    Console.WriteLine($"ok  project removed and restored: {removed} was dropped with the rest kept warm, never compiled or tested, and came back as a unit");
 }
 
 // A test assembly the warm host can't load (here, a missing reference) fails the run within seconds, naming
@@ -456,14 +502,15 @@ static Dictionary<string, Summary> Summaries(string output) =>
 // The test projects a run reports: exactly the expected ones, once each, with all their tests passed and
 // counted as dotnet test counts them (explicit tests that weren't asked for aren't), and none through
 // dotnet test, since the warm host must run them on the runtime each one targets. Every other test
-// project is listed as unchanged since its last run.
-void RanTests(string name, string output, string[] expected)
+// project in the solution (`among`, by default all) is listed as unchanged since its last run.
+void RanTests(string name, string output, string[] expected, string[]? among = null)
 {
+    among ??= allTests;
     var unchanged = Regex.Match(output, @"^blaze-cs: unchanged since last run: (.+)$", RegexOptions.Multiline) is { Success: true } line
         ? line.Groups[1].Value.TrimEnd('\r').Split(", ").Select(project => project.Split(" (")[0]).ToList()
         : [];
-    if (!unchanged.Order().SequenceEqual(allTests.Except(expected).Order()))
-        Fail($"{name}: expected {string.Join(", ", allTests.Except(expected).Order())} listed as unchanged since last run, got {string.Join(", ", unchanged.Order())}:\n{output}");
+    if (!unchanged.Order().SequenceEqual(among.Except(expected).Order()))
+        Fail($"{name}: expected {string.Join(", ", among.Except(expected).Order())} listed as unchanged since last run, got {string.Join(", ", unchanged.Order())}:\n{output}");
     var summaries = Summaries(output);
     if (!summaries.Keys.Order().SequenceEqual(expected.Order()))
         Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Keys.Order())}:\n{output}");
