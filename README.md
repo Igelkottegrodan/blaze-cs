@@ -45,6 +45,10 @@ task build
 
 On Windows, build it with the .NET SDK: `dotnet build BlazeCs.slnx`.
 
+The build also compiles the small `blaze-cs` client Native AOT, so a command that reaches a running daemon
+starts in about 5 ms instead of 60. That needs a C toolchain: clang and zlib headers on Linux, the Visual
+Studio C++ build tools on Windows.
+
 ## Try it
 
 In a directory with one `.sln` or `.slnx` (or below one):
@@ -152,6 +156,7 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 
 | Path | What |
 |---|---|
+| `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
 | `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
 | `src/BlazeCs.TestHost` | the single-use test host (xUnit v2 and v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |

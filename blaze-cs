@@ -1,3 +1,7 @@
 #!/bin/sh
-# Runs the built CLI with whatever `dotnet` is on PATH (devbox shell: the pinned SDK).
-exec dotnet "$(dirname "$(readlink -f "$0")")/artifacts/bin/blaze-cs.dll" "$@"
+# Runs the built CLI: the native client (no .NET start-up) when it was built, else the managed one with
+# whatever `dotnet` is on PATH (devbox shell: the pinned SDK).
+self="$(readlink -f "$0")"
+bin="${self%/*}/artifacts/bin"
+if [ -x "$bin/blaze-cs-client" ]; then exec "$bin/blaze-cs-client" "$@"; fi
+exec dotnet "$bin/blaze-cs.dll" "$@"
