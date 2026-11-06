@@ -38,8 +38,9 @@ daemon:
   starts ahead of time; each host runs one assembly and exits, and a new one takes its place. xUnit v2,
   projects with a `.runsettings`, and anything a host can't run go through `dotnet test --no-build`.
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
-  or NuGet file, or a project that an IL weaver (such as Fody) rewrites after compile, goes through a
-  real `dotnet build`.
+  or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
+  project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
+  Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon.
 
 ## Trying it
 
@@ -82,9 +83,12 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
   until the next `dotnet build` recompiles it.
 - **Platforms:** Linux only so far. The client uses a Unix socket and `setsid`.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
-  by a real solution. NUnit and MSTest run in the test host only in the fixture check (two tests each);
-  Razor, NUnit and MSTest on a real solution, and large graphs are untested. The host doesn't apply
-  NUnit or MSTest settings beyond the defaults.
+  by a real solution. NUnit and MSTest run in the test host only in the fixture check (two tests each).
+  Razor is covered only by the fixture check: a Razor class library of Blazor components (markup,
+  `@code` API changes, `_Imports.razor`, new and deleted `.razor`, scoped CSS) and an xUnit project that
+  renders one. MVC views and Razor Pages (`.cshtml`), Blazor WebAssembly, other static web assets
+  (`wwwroot/`, `.razor.js`), and Razor, NUnit and MSTest on a real solution, and large graphs are
+  untested. The host doesn't apply NUnit or MSTest settings beyond the defaults.
 - **Memory:** the daemon holds a few GB (about 2.3 GB for jellyfin).
 
 ## Layout

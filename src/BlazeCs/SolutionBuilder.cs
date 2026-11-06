@@ -51,9 +51,10 @@ sealed class SolutionBuilder
     /// Runs `dotnet build` and loads what it did. csc only logs its arguments when it runs, so with no
     /// cached arguments the first build compiles everything; later ones are incremental.
     /// </summary>
-    public bool Load(Action<string> log)
+    /// <param name="fresh">Ignore the cached arguments and compile everything.</param>
+    public bool Load(Action<string> log, bool fresh = false)
     {
-        var cached = UnitsCache.Read();
+        var cached = fresh ? [] : UnitsCache.Read();
         var binlog = Path.Combine(_stateDirectory, "build.binlog");
         var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly -bl:\"{binlog}\"" + (cached.Count == 0 ? " --no-incremental" : "");
         if (RunDotnet(arguments, log) != 0)
@@ -103,7 +104,17 @@ sealed class SolutionBuilder
         _msbuildInputs = MSBuildInputs();
 
         log($"blaze-cs: loaded {_units.Count} projects in {stopwatch.ElapsedMilliseconds} ms");
-        WarmUp(log);
+        var mismatched = WarmUp(log);
+
+        // A unit this build didn't compile keeps the arguments csc last ran with under the daemon. If a
+        // build outside it (an IDE's, `dotnet build`) compiled the project since, with other sources, they
+        // are stale and the daemon can't reproduce the assembly: compile everything once to log them all.
+        var logged = info.Units.Select(u => u.AssemblyPath).ToHashSet();
+        if (!fresh && mismatched.FirstOrDefault(u => !logged.Contains(u.Unit.AssemblyPath)) is { } stale)
+        {
+            log($"blaze-cs: {stale.Unit.Name}: its cached compiler arguments are stale; running dotnet build --no-incremental");
+            return Load(log, fresh: true);
+        }
         return true;
     }
 
@@ -111,10 +122,11 @@ sealed class SolutionBuilder
     /// Compiles every unit once into memory: JITs the compiler, fills the generator caches, and checks
     /// that the daemon's output is byte-for-byte what `dotnet build` just wrote.
     /// </summary>
-    void WarmUp(Action<string> log)
+    /// <returns>The units whose output differs.</returns>
+    List<ProjectCompiler> WarmUp(Action<string> log)
     {
         var stopwatch = Stopwatch.StartNew();
-        var mismatches = new ConcurrentBag<string>();
+        var mismatches = new ConcurrentDictionary<ProjectCompiler, string>();
         Parallel.ForEach(_units, unit =>
         {
             var prepared = unit.Prepare();
@@ -125,13 +137,14 @@ sealed class SolutionBuilder
             unit.IndexIdentifiers(prepared);
             var (output, diagnostics) = unit.Emit(prepared);
             if (output is null)
-                mismatches.Add($"{unit.Unit.Name}: {diagnostics.First(d => d.Severity == DiagnosticSeverity.Error)}");
+                mismatches[unit] = $"{unit.Unit.Name}: {diagnostics.First(d => d.Severity == DiagnosticSeverity.Error)}";
             else if (!output.Assembly.AsSpan().SequenceEqual(File.ReadAllBytes(unit.AssemblyPath)))
-                mismatches.Add($"{unit.Unit.Name}: emitted assembly differs from {unit.AssemblyPath}");
+                mismatches[unit] = $"{unit.Unit.Name}: emitted assembly differs from {unit.AssemblyPath}";
         });
         log($"blaze-cs: warmed up in {stopwatch.ElapsedMilliseconds} ms; {_units.Count - mismatches.Count}/{_units.Count} assemblies identical to dotnet build");
-        foreach (var mismatch in mismatches.Order())
+        foreach (var mismatch in mismatches.Values.Order())
             log($"blaze-cs: warning: {mismatch}");
+        return [.. mismatches.Keys];
     }
 
     public BuildResult Build(Action<string> log)
@@ -145,9 +158,9 @@ sealed class SolutionBuilder
 
         var changed = _units.AsParallel().Where(u => u.Refresh()).ToHashSet();
         var scanned = stopwatch.ElapsedMilliseconds;
-        if (changed.FirstOrDefault(u => u.Unit.SlowPathReason is not null || _analyzerUnits.Contains(u)) is { } special)
+        if (changed.FirstOrDefault(u => u.Unit.SlowPathReason is not null || u.StaleArguments is not null || _analyzerUnits.Contains(u)) is { } special)
         {
-            log($"blaze-cs: {special.Unit.Name}: {special.Unit.SlowPathReason ?? "it is an analyzer other projects load"}; running dotnet build");
+            log($"blaze-cs: {special.Unit.Name}: {special.Unit.SlowPathReason ?? special.StaleArguments ?? "it is an analyzer other projects load"}; running dotnet build");
             return new BuildResult(Load(log), Downstream(changed));
         }
 
@@ -494,7 +507,8 @@ sealed class SolutionBuilder
 
     /// <summary>
     /// Files that decide csc's arguments: project files, MSBuild imports, config. A change to any of
-    /// them makes the cached arguments stale.
+    /// them makes the cached arguments stale. Scoped CSS too: MSBuild rewrites and bundles it into static
+    /// web assets, and a new or deleted one changes a component's scope in the generated .editorconfig.
     /// </summary>
     Dictionary<string, DateTime> MSBuildInputs()
     {
@@ -510,6 +524,7 @@ sealed class SolutionBuilder
                     || name.EndsWith(".targets", StringComparison.Ordinal) || name.EndsWith(".editorconfig", StringComparison.Ordinal)
                     || name.EndsWith(".globalconfig", StringComparison.Ordinal) || name.EndsWith(".sln", StringComparison.Ordinal)
                     || name.EndsWith(".slnx", StringComparison.Ordinal)
+                    || name.EndsWith(".razor.css", StringComparison.Ordinal) || name.EndsWith(".cshtml.css", StringComparison.Ordinal)
                     || name is "global.json" or "nuget.config" or "NuGet.Config" or "packages.lock.json")
                     inputs[file] = File.GetLastWriteTimeUtc(file);
             }

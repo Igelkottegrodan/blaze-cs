@@ -26,6 +26,9 @@ sealed class ProjectCompiler
     readonly Dictionary<string, AdditionalText> _additionalTexts = new(StringComparer.Ordinal);
     readonly Dictionary<string, FileStamp> _inputs = new(StringComparer.Ordinal);
     readonly HashSet<string> _ignoredOnDisk;
+    /// <summary>Extensions the SDK's globs turn into additional files: .razor and .cshtml under the Razor SDK.</summary>
+    readonly string[] _globbedAdditional;
+    readonly HashSet<string> _ignoredAdditionalOnDisk;
     readonly Func<CommandLineReference, MetadataReference> _resolveReference;
     CSharpCompilation _compilation;
     GeneratorDriver? _driver;
@@ -43,6 +46,12 @@ sealed class ProjectCompiler
     public IEnumerable<string> AnalyzerPaths => _args.AnalyzerReferences.Select(a => a.FilePath);
     /// <summary>Config files whose change means csc's arguments are stale (handled by a real build).</summary>
     public IEnumerable<string> ConfigPaths => _args.AnalyzerConfigPaths;
+    /// <summary>
+    /// Set by Refresh when csc's arguments are out of date: a globbed additional file appeared or went
+    /// away. Only MSBuild can list it, with the per-file metadata (TargetPath, CssScope) that the Razor
+    /// generator reads from the .editorconfig MSBuild generates.
+    /// </summary>
+    public string? StaleArguments { get; private set; }
 
     public ProjectCompiler(CompileUnit unit, Func<CommandLineReference, MetadataReference> resolveReference, GeneratorCache generators)
     {
@@ -71,13 +80,15 @@ sealed class ProjectCompiler
             trees[i] = file.Tree;
         });
         _order = _args.SourceFiles.Select(f => f.Path).ToList();
-        _ignoredOnDisk = DiscoverSources().Where(path => !_sources.ContainsKey(path)).ToHashSet(StringComparer.Ordinal);
+        _ignoredOnDisk = DiscoverFiles([".cs"]).Where(path => !_sources.ContainsKey(path)).ToHashSet(StringComparer.Ordinal);
 
         foreach (var file in _args.AdditionalFiles)
         {
             _additionalFiles[file.Path] = FileStamp.Of(file.Path);
-            _additionalTexts[file.Path] = FileText.Read(file.Path);
+            _additionalTexts[file.Path] = FileText.Read(file.Path, _args.Encoding, _args.ChecksumAlgorithm);
         }
+        _globbedAdditional = AnalyzerPaths.Any(p => Path.GetFileName(p) == "Microsoft.CodeAnalysis.Razor.Compiler.dll") ? [".razor", ".cshtml"] : [];
+        _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(StringComparer.Ordinal);
         foreach (var resource in ResourcePaths())
             _inputs[resource] = FileStamp.Of(resource);
 
@@ -137,6 +148,7 @@ sealed class ProjectCompiler
     {
         var changed = false;
         var filesAddedOrRemoved = false;
+        StaleArguments = null;
         var compilation = _compilation;
 
         foreach (var file in _sources.Values.ToList())
@@ -163,7 +175,7 @@ sealed class ProjectCompiler
             changed = true;
         }
 
-        foreach (var path in DiscoverSources())
+        foreach (var path in DiscoverFiles([".cs"]))
         {
             if (_sources.ContainsKey(path) || _ignoredOnDisk.Contains(path))
                 continue;
@@ -183,11 +195,23 @@ sealed class ProjectCompiler
             var current = FileStamp.Of(path);
             if (current == stamp)
                 continue;
+            if (!File.Exists(path))
+            {
+                StaleArguments = $"{Path.GetRelativePath(Unit.ProjectDirectory, path)} was deleted";
+                changed = true;
+                continue;
+            }
             _additionalFiles[path] = current;
-            var text = FileText.Read(path);
+            var text = FileText.Read(path, _args.Encoding, _args.ChecksumAlgorithm);
             if (_driver is not null)
                 _driver = _driver.ReplaceAdditionalText(_additionalTexts[path], text);
             _additionalTexts[path] = text;
+            changed = true;
+        }
+
+        if (DiscoverFiles(_globbedAdditional).FirstOrDefault(p => !_additionalFiles.ContainsKey(p) && !_ignoredAdditionalOnDisk.Contains(p)) is { } added)
+        {
+            StaleArguments = $"{Path.GetRelativePath(Unit.ProjectDirectory, added)} is new";
             changed = true;
         }
 
@@ -379,16 +403,18 @@ sealed class ProjectCompiler
     }
 
     /// <summary>
-    /// The .cs files the SDK's default glob would pick up: everything under the project directory
-    /// except bin/, obj/, hidden directories and nested projects.
+    /// The files with these extensions that the SDK's default globs would pick up: everything under the
+    /// project directory except bin/, obj/, hidden directories and nested projects.
     /// </summary>
-    IEnumerable<string> DiscoverSources()
+    IEnumerable<string> DiscoverFiles(string[] extensions)
     {
+        if (extensions.Length == 0)
+            yield break;
         var pending = new Stack<string>([Unit.ProjectDirectory]);
         while (pending.Count > 0)
         {
             var directory = pending.Pop();
-            foreach (var file in Directory.EnumerateFiles(directory, "*.cs"))
+            foreach (var file in extensions.SelectMany(extension => Directory.EnumerateFiles(directory, "*" + extension)))
                 yield return file;
             foreach (var child in Directory.EnumerateDirectories(directory))
             {
