@@ -55,6 +55,13 @@ static class SdkRoslyn
     /// <summary>Simple names of the compiler's own assemblies, which analyzers must share with the daemon.</summary>
     public static IReadOnlySet<string> CompilerAssemblies { get; private set; } = new HashSet<string>();
 
+    /// <summary>
+    /// The runtime configuration the SDK's own csc runs under. Roslyn records the runtime it ran on in
+    /// every PDB, so the daemon must run on that runtime too to emit the same bytes.
+    /// </summary>
+    public static string CompilerRuntimeConfig(string solutionDir) =>
+        Path.Combine(FindSdkDirectory(solutionDir), "Roslyn", "bincore", "csc.runtimeconfig.json");
+
     /// <summary>The SDK `dotnet build` would pick in this directory, honouring global.json.</summary>
     static string FindSdkDirectory(string solutionDir)
     {

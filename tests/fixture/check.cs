@@ -69,7 +69,12 @@ Case[] cases =
 if (Directory.Exists(work))
     Directory.Delete(work, recursive: true);
 CopyFixture(fixture, work);
-File.Copy(Path.Combine(root, "global.json"), Path.Combine(work, "global.json"));
+// BLAZE_CS_SDK=<version> checks against another SDK than the repo's pin, such as a .NET 11 one.
+if (Environment.GetEnvironmentVariable("BLAZE_CS_SDK") is { Length: > 0 } sdk)
+    File.WriteAllText(Path.Combine(work, "global.json"),
+        $$"""{ "sdk": { "version": "{{sdk}}", "allowPrerelease": true, "rollForward": "latestFeature" } }""");
+else
+    File.Copy(Path.Combine(root, "global.json"), Path.Combine(work, "global.json"));
 var passed = false;
 try
 {

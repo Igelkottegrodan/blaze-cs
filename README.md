@@ -44,7 +44,7 @@ daemon:
 
 ## Trying it
 
-It needs the .NET 10 SDK. The repo pins one with [devbox](https://www.jetify.com/devbox):
+It needs the .NET 10 or 11 SDK for the solution you build. The repo itself pins SDK 10 and builds on it with [devbox](https://www.jetify.com/devbox):
 
 ```sh
 git clone https://github.com/igelkottegrodan/blaze-cs && cd blaze-cs
@@ -83,7 +83,8 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
   until the next `dotnet build` recompiles it.
 - **Platforms:** Linux only so far. The client uses a Unix socket and `setsid`.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
-  by a real solution. NUnit and MSTest run in the test host only in the fixture check (two tests each).
+  by a real solution. .NET 11 (RC3) is covered by the fixture check
+  (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
   Razor is covered only by the fixture check: a Razor class library of Blazor components (markup,
   `@code` API changes, `_Imports.razor`, new and deleted `.razor`, scoped CSS) and an xUnit project that
   renders one. MVC views and Razor Pages (`.cshtml`), Blazor WebAssembly, other static web assets
