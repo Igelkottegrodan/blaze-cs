@@ -15,6 +15,16 @@ public class WelcomeTests
     [Fact(Explicit = true)]
     public void OnlyWhenAsked() { }
 
+    // Lib's static field and resource, which the hot reload check edits.
+    [Fact]
+    public void Exclaims() => Assert.Equal("Hi!", Lib.Salutation.Exclaim("Hi"));
+
+    [Fact]
+    public void ReadsGreeting() => Assert.Equal("Hello", Lib.Salutation.Greeting());
+
+    [Fact]
+    public void Computes() => Assert.Equal(1, Lib.Salutation.Value);
+
     [Fact]
     public void RunsOnTargetRuntime() => Assert.Equal(
         typeof(WelcomeTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "TargetRuntimeMajor").Value,

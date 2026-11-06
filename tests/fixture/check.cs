@@ -205,6 +205,9 @@ var passed = false;
 var loadedProjects = 0; // from the last "loaded N projects" line a command printed
 // BLAZE_CS_COMPILER_SERVER=0 turns the daemon's compiler-server pipe off; the checks of builds through it are skipped.
 var serverOff = Environment.GetEnvironmentVariable("BLAZE_CS_COMPILER_SERVER") == "0";
+// The projects whose tests passed hot reloaded in the last `blaze-cs test`, and in the one before: a hot reloaded
+// pass doesn't count as one, so they run again on the next `test` (RanTests), whether or not they changed.
+HashSet<string> hotReloaded = [], hotReloadedBefore = [];
 try
 {
     // Starts the daemon: a real dotnet build; the warm-up compile runs after it returns. It names the pipe that
@@ -231,7 +234,7 @@ try
             if (name == "first test run")
                 TookEveryHost(prestarted);
             else
-                IdleHosts(name, ran ?? expected);
+                IdleHosts(name, [.. (ran ?? expected).Union(hotReloadedBefore)]);
         }
         Verify(name, rebuilt, fallback);
     }
@@ -250,11 +253,16 @@ try
         CompilationEndThroughTheDaemon(pipe!);
     }
     PreparedHostsSeeNewBytes();
+    HotReloadBodyEdit();
+    HotReloadFallsBack();
+    HotReloadedPassRunsAgain();
     ProjectRemovedAndRestored();
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
     FailedRunsAgain();
+    SessionNotReady();
     AllTestsSkipped();
+    HotReloadUnavailable();
     WarmUpAfterFirstCommand();
     if (!serverOff)
     {
@@ -981,11 +989,15 @@ List<(int Pid, string Project)> IdleHosts(string when, string[]? ran = null)
 }
 
 // A run of every test project takes the waiting host of each project that has one, and the hosts are back after.
+// A taken host is gone, or stayed up for its project (a Debug project's, for hot reload; the daemon may have
+// ended it since, stopping it in the background).
 void TookEveryHost(List<(int Pid, string Project)> prestarted)
 {
-    var taken = prestarted.Where(host => !Running(host.Pid)).Count();
+    var kept = Regex.Matches(ReadLog("daemon.log"), @"^\S+ hot reload: test host (\d+) \((\w+)\.dll\) stays up for ", RegexOptions.Multiline)
+        .Select(m => (int.Parse(m.Groups[1].Value), m.Groups[2].Value)).ToHashSet();
+    var taken = prestarted.Where(host => !Running(host.Pid) || kept.Contains(host)).Count();
     if (taken != prestarted.Count)
-        Fail($"expected the first test run to take all {prestarted.Count} pre-started hosts, {taken} are gone");
+        Fail($"expected the first test run to take all {prestarted.Count} pre-started hosts, {taken} are gone or stay up for their project");
     IdleHosts("after the first test run");
     Console.WriteLine($"ok  the first test run took the {taken} hosts started for {string.Join(", ", prestarted.Select(h => h.Project).Order())}; "
         + $"each test project's host is one of at most {HostCap}, with a spare per runtime, and they are back after each run");
@@ -995,16 +1007,19 @@ void TookEveryHost(List<(int Pid, string Project)> prestarted)
 // none of the solution's outputs (on Linux, where its mapped files show it), so a project reference rebuilt
 // after the host started is the new bytes when the run loads it: an edit to Consumer fails each test
 // project's greeting test with the new text, whether its host was waiting or started for the run; undone,
-// the tests pass again.
+// the tests pass again. The hosts that ran before now stay up for their projects, so a new daemon starts
+// hosts that have run nothing; its first test run runs every test project.
 void PreparedHostsSeeNewBytes()
 {
+    Run(blaze, "stop");
+    Run(blaze, "build");
     var hosts = IdleHosts("before the Consumer edit");
     if (OperatingSystem.IsLinux())
         hosts.ForEach(NoProjectOutputLoaded);
     Replace("Consumer/Welcome.cs", "=> Lib.Greeter.Greet(who)", "=> Lib.Greeter.Greet(who).Replace(\"Hello\", \"Howdy\")");
     var (output, exitCode) = RunWithExit(blaze, "test", check: false);
     var summaries = Summaries(output);
-    if (exitCode == 0 || !Rebuilt(output).SetEquals(consumer) || !output.Contains("Howdy") || !summaries.Keys.Order().SequenceEqual(libTests.Order())
+    if (exitCode == 0 || !Rebuilt(output).SetEquals(consumer) || !output.Contains("Howdy") || !summaries.Keys.Order().SequenceEqual(allTests.Order())
         || libTests.Any(project => summaries[project] != new Summary("Failed!", 1, TestCount(project) - 1, 0, TestCount(project))))
         Fail($"Consumer edit: expected {string.Join(", ", libTests)} to run with Consumer's new bytes, each failing its greeting test on \"Howdy\", got exit {exitCode}:\n{output}");
     Replace("Consumer/Welcome.cs", ".Replace(\"Hello\", \"Howdy\")", "");
@@ -1015,6 +1030,360 @@ void PreparedHostsSeeNewBytes()
     Verify("Consumer edit undone", [.. consumer], null);
     Console.WriteLine($"ok  Consumer edit: every test project saw its new bytes, among them in the hosts waiting for {string.Join(", ", hosts.Select(h => h.Project).Order())}"
         + (OperatingSystem.IsLinux() ? ", which had loaded no project output" : ""));
+}
+
+// Why the running daemon has no hot reload engine (on Windows, or an SDK without the one blaze-cs knows), or null if it has.
+string? HotReloadUnavailableBecause()
+{
+    var log = ReadLog("daemon.log");
+    var since = log.LastIndexOf($"(pid {Daemons().Last().Pid}, exits after", StringComparison.Ordinal);
+    var deadline = Stopwatch.StartNew();
+    while (deadline.Elapsed < TimeSpan.FromSeconds(30))
+    {
+        var current = ReadLog("daemon.log")[Math.Max(0, since)..];
+        if (current.Contains(" hot reload engine loaded"))
+            return null;
+        if (Regex.Match(current, @"^\S+ hot reload is unavailable: (.+?)\r?$", RegexOptions.Multiline) is { Success: true } unavailable)
+            return unavailable.Groups[1].Value;
+        Thread.Sleep(100);
+    }
+    Fail($"expected the daemon to log whether hot reload is available:\n{log}");
+    return null;
+}
+
+// Hosts that stay up after their run (TestRunner.Keep), by pid, with their project, as the daemon logs them; only
+// those it hasn't ended since (in a run, or when their project dropped out of the ones that get a host,
+// whose process it stops in the background) and still running.
+Dictionary<int, string> LiveHosts()
+{
+    var log = ReadLog("daemon.log");
+    var ended = Regex.Matches(log, @"^\S+ hot reload: test host (\d+) \(\w+\.dll\) ends\b", RegexOptions.Multiline)
+        .Select(m => int.Parse(m.Groups[1].Value)).ToHashSet();
+    return Regex.Matches(log, @"^\S+ hot reload: test host (\d+) \((\w+)\.dll\) stays up for ", RegexOptions.Multiline)
+        .Select(m => (Pid: int.Parse(m.Groups[1].Value), Project: m.Groups[2].Value))
+        .Where(host => !ended.Contains(host.Pid) && Running(host.Pid))
+        .ToDictionary(host => host.Pid, host => host.Project);
+}
+
+// The live hosts of these projects that have their hot reload sessions, once each has one or the daemon says it
+// has none: an edit before that runs the project in a new host (SessionNotReady).
+Dictionary<int, string> ReadyLiveHosts(string when, string[] projects)
+{
+    var deadline = Stopwatch.StartNew();
+    while (true)
+    {
+        var live = LiveHosts().Where(host => projects.Contains(host.Value)).ToDictionary();
+        var log = ReadLog("daemon.log");
+        bool Has(KeyValuePair<int, string> host, string session) => log.Contains($"hot reload: test host {host.Key} ({host.Value}.dll) {session}");
+        var waiting = live.Where(host => !Has(host, "has its session") && !Has(host, "has no session")).ToList();
+        if (waiting.Count == 0)
+            return live.Where(host => Has(host, "has its session")).ToDictionary();
+        if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+            Fail($"{when}: expected the hosts of {string.Join(", ", waiting.Select(h => $"{h.Value} (pid {h.Key})"))} to have their hot reload sessions within 30 s:\n{log}");
+        Thread.Sleep(100);
+    }
+}
+
+// A method body edit in Lib reaches the hosts that stay up for the Debug test projects as a delta: each runs its
+// tests again in the same process (the output and the daemon log name the host and the module), with the same
+// passes and failures as `dotnet test` of the same build, and Lib's files on disk are what dotnet build makes.
+// Undone, the tests pass again, in the hosts that stay up then. (Five test projects run with Lib, and hosts
+// stay up for the four run most recently.)
+void HotReloadBodyEdit()
+{
+    if (HotReloadUnavailableBecause() is { } reason)
+    {
+        Console.WriteLine($"ok  hot reload: unavailable here ({reason}); the test runs above took the path without it");
+        return;
+    }
+    var reloadedInto = new HashSet<string>();
+    foreach (var undo in new[] { false, true })
+    {
+        var name = undo ? "hot reload undone" : "hot reload";
+        IdleHosts($"before {name}"); // and the hosts of projects no longer among the most recent are gone
+        var live = ReadyLiveHosts(name, libTests);
+        // A run right after the one before ends the hosts whose sessions weren't ready: body edits until some are.
+        for (var edits = 0; live.Count == 0 && edits < 4; edits++)
+        {
+            ToggleShout();
+            Run(blaze, "test", check: !undo);
+            IdleHosts($"before {name}");
+            live = ReadyLiveHosts(name, libTests);
+        }
+        if (live.Count == 0)
+            Fail($"{name}: expected hosts staying up for some of {string.Join(", ", libTests)}:\n{ReadLog("daemon.log")}");
+        if (undo)
+            Replace("Lib/Greeter.cs", "\"Howdy there, \"", "\"Hello there, \"");
+        else
+            Replace("Lib/Greeter.cs", "\"Hello there, \"", "\"Howdy there, \"");
+        var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+        if (!Rebuilt(output).SetEquals(lib))
+            Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", lib)}:\n{output}");
+        var reloaded = Regex.Matches(output, @"^blaze-cs: (\w+)\.dll: hot reloaded Lib \(net10\.0\) \(1 type\) into its test host \(pid (\d+)\)", RegexOptions.Multiline)
+            .ToDictionary(m => int.Parse(m.Groups[2].Value), m => m.Groups[1].Value);
+        if (!reloaded.OrderBy(h => h.Key).SequenceEqual(live.OrderBy(h => h.Key)))
+            Fail($"{name}: expected Lib hot reloaded into the hosts of {string.Join(", ", live.Select(h => $"{h.Value} (pid {h.Key})"))}, which stayed up:\n{output}");
+        reloadedInto.UnionWith(live.Values);
+        var log = ReadLog("daemon.log");
+        if (live.FirstOrDefault(host => !Regex.IsMatch(log, $@"hot reload: test host {host.Key} \({host.Value}\.dll\) applied a delta to module Lib \(net10\.0\) \([0-9a-f-]+\): 1 type updated")) is { Key: > 0 } unlogged)
+            Fail($"{name}: expected the daemon log to name host {unlogged.Key}, Lib (net10.0) and 1 type updated:\n{log}");
+        if (undo)
+            RanTests(name, output, libTests);
+        else
+        {
+            if (exitCode == 0)
+                Fail($"{name}: expected each greeting test to fail on \"Howdy\":\n{output}");
+            SameAsDotnetTest(name, output, libTests);
+        }
+        Verify(name, [.. lib], null);
+    }
+    Console.WriteLine($"ok  hot reload: a Lib body edit and its undo reached the hosts that stayed up ({string.Join(", ", reloadedInto.Order())}) as deltas, in the same processes; the failures matched dotnet test's");
+}
+
+// Edits a delta can't carry don't hot reload: each host that stayed up for a Debug test project ends, the
+// project runs in a new host, and the failures match dotnet test's (a host that took the edit as a delta would
+// still pass, on the old value).
+// - A static field's initializer: the engine has a delta (the type initializer's body), but the initializer
+//   already ran in the host, so the engine asks for a restart (RestartWhenChangesHaveNoEffect).
+// - An embedded resource, with a body edit in the same assembly: the engine has a delta for the body, which
+//   doesn't carry the resource.
+void HotReloadFallsBack()
+{
+    if (HotReloadUnavailableBecause() is not null)
+        return;
+    const string staticInit = "Mark = \"!\"", body = "Twice(int amount) => amount + amount";
+    FallsBack("static initializer edit", () => Replace("Lib/Salutation.cs", staticInit, "Mark = \"?\""), fails: true, reason: null);
+    FallsBack("static initializer edit undone", () => Replace("Lib/Salutation.cs", "Mark = \"?\"", staticInit), fails: false, reason: null);
+    const string resourced = "Lib (net10.0)'s resources changed, which a delta doesn't carry";
+    FallsBack("resource and body edit", () =>
+    {
+        File.WriteAllText(Path.Combine(work, "Lib/greeting.txt"), "Howdy\n");
+        Replace("Lib/Greeter.cs", body, "Twice(int amount) => amount << 1");
+    }, fails: true, reason: resourced);
+    FallsBack("resource and body edit undone", () =>
+    {
+        File.WriteAllText(Path.Combine(work, "Lib/greeting.txt"), "Hello\n");
+        Replace("Lib/Greeter.cs", "Twice(int amount) => amount << 1", body);
+    }, fails: false, reason: resourced);
+    Console.WriteLine("ok  hot reload fallback: a static initializer edit, and a resource edit with a body edit, ran in new hosts; the failures matched dotnet test's");
+
+    void FallsBack(string name, Action edit, bool fails, string? reason)
+    {
+        // The step before ran its projects in new hosts, mostly spares, which don't stay up. A body edit in Lib
+        // runs them in the hosts prepared for them meanwhile, which stay up, and hot reloads into the ones that
+        // did stay up. (Not `test --all`: with nothing changed, it ends the hosts that stayed up. Before an
+        // undo, Tests still fails.)
+        IdleHosts($"before {name}, before a body edit");
+        ToggleShout();
+        Run(blaze, "test", check: false);
+        IdleHosts($"before {name}");
+        var live = ReadyLiveHosts(name, libTests);
+        if (live.Count == 0)
+            Fail($"{name}: expected hosts staying up for some of {string.Join(", ", libTests)}:\n{ReadLog("daemon.log")}");
+        var logged = ReadLog("daemon.log").Length;
+        edit();
+        var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+        if (!Rebuilt(output).SetEquals(lib) || output.Contains("hot reloaded"))
+            Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", lib)} and hot reload nothing:\n{output}");
+        var log = ReadLog("daemon.log")[logged..];
+        foreach (var (pid, project) in live)
+        {
+            var ended = Regex.Match(log, $@"hot reload: test host {pid} \({project}\.dll\) ends, and {project}\.dll runs in a new host: (.+?)\r?$", RegexOptions.Multiline);
+            if (!ended.Success || (reason is null ? ended.Groups[1].Value.StartsWith("nothing", StringComparison.Ordinal) : ended.Groups[1].Value != reason))
+                Fail($"{name}: expected host {pid} ({project}) to end{(reason is null ? "" : $" because {reason}")}:\n{log}");
+        }
+        if (fails)
+        {
+            if (exitCode == 0)
+                Fail($"{name}: expected Tests to fail:\n{output}");
+            SameAsDotnetTest(name, output, libTests);
+        }
+        else
+            RanTests(name, output, libTests);
+        Verify(name, [.. lib], null);
+    }
+}
+
+// An edit a delta carries, but whose effect a host that stays up doesn't see: Compute's body, which computed
+// Salutation.Value when Tests first used it. Hot reloaded, Tests still passes, and says it was hot reloaded;
+// the next `test`, with nothing changed, runs it in a new host, where it fails as under dotnet test. Undone,
+// it passes again, once in a new host.
+void HotReloadedPassRunsAgain()
+{
+    if (HotReloadUnavailableBecause() is not null)
+        return;
+    const string name = "hot reloaded pass";
+    // Five test projects run with Lib, and hosts stay up for the four run last: body edits until Tests' does.
+    Dictionary<int, string> live;
+    for (var edits = 0; (live = ReadyLiveHosts(name, ["Tests"])).Count == 0; edits++)
+    {
+        if (edits == 4)
+            Fail($"{name}: expected a host to stay up for Tests after {edits} body edits in Lib:\n{ReadLog("daemon.log")}");
+        ToggleShout();
+        Run(blaze, "test");
+        IdleHosts($"before {name}");
+    }
+    var reloadedIn = live.Single().Key;
+    Replace("Lib/Salutation.cs", "Compute() => 1", "Compute() => 2");
+    var output = Run(blaze, "test", check: false);
+    if (!Regex.IsMatch(output, @"^blaze-cs: Tests\.dll: hot reloaded Lib \(net10\.0\)", RegexOptions.Multiline)
+        || !Regex.IsMatch(output, @"^Passed!\s+- .* - Tests\.dll \(hot reloaded\)\r?$", RegexOptions.Multiline))
+        Fail($"{name}: expected Tests to pass hot reloaded, on the Value its host computed before the edit:\n{output}");
+    IdleHosts($"after {name}");
+    // The next test runs Tests in another process than the one it hot reloaded into: that host ends because
+    // nothing changed, or ended already when Tests dropped out of the projects that get a host (Prestart).
+    var (next, exitCode) = RunWithExit(blaze, "test", check: false);
+    if (exitCode == 0 || Regex.IsMatch(next, @"^blaze-cs: unchanged since last run: .*\bTests \(", RegexOptions.Multiline)
+        || next.Contains("hot reloaded") || !Summaries(next).TryGetValue("Tests", out var summary) || summary.Label != "Failed!"
+        || !FailedTests(next).GetValueOrDefault("Tests", []).Select(Method).Contains("Computes")
+        || !Regex.IsMatch(ReadLog("daemon.log"), $@"hot reload: test host {reloadedIn} \(Tests\.dll\) ends\b"))
+        Fail($"{name}: expected the next test to run Tests again, not in host {reloadedIn}, and fail Computes:\n{next}");
+    SameAsDotnetTest(name, next, [.. Summaries(next).Keys]);
+
+    Replace("Lib/Salutation.cs", "Compute() => 2", "Compute() => 1");
+    // A host that started after the edit computed Value as 2, and a delta doesn't change it: this run may
+    // fail where dotnet test passes. The next one runs every such project in a new host.
+    Run(blaze, "test", check: false);
+    Run(blaze, "test");
+    Verify($"{name} undone", [.. lib], null);
+    Console.WriteLine($"ok  {name}: Tests passed hot reloaded on a stale static, said so, and the next test ran it in a new host, where it failed as under dotnet test");
+}
+
+// An edit that comes before a live host's hot reload session is ready (here, BLAZE_CS_HOT_RELOAD_DELAY holds
+// each session back 30 s) isn't held back for it: each host that stayed up ends, saying so, and its project
+// runs in a new host, with dotnet test's failures. Undone, the tests pass.
+void SessionNotReady()
+{
+    if (HotReloadUnavailableBecause() is not null)
+        return;
+    const string name = "session not ready";
+    Run(blaze, "stop");
+    try
+    {
+        Run(blaze, "build", environment: new() { ["BLAZE_CS_HOT_RELOAD_DELAY"] = "30000" });
+        Run(blaze, "test");
+        IdleHosts($"before {name}");
+        var live = LiveHosts().Where(host => libTests.Contains(host.Value)).ToDictionary();
+        if (live.Count == 0)
+            Fail($"{name}: expected hosts staying up for some of {string.Join(", ", libTests)}:\n{ReadLog("daemon.log")}");
+        var logged = ReadLog("daemon.log").Length;
+        Replace("Lib/Greeter.cs", "\"Hello there, \"", "\"Howdy there, \"");
+        var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+        var log = ReadLog("daemon.log")[logged..];
+        if (exitCode == 0 || output.Contains("hot reloaded")
+            || live.FirstOrDefault(host => !log.Contains($"hot reload: test host {host.Key} ({host.Value}.dll) ends, and {host.Value}.dll runs in a new host: its hot reload session wasn't ready")) is { Key: > 0 } waited)
+            Fail($"{name}: expected each host that stayed up to end because its session wasn't ready, and the greeting tests to fail:\n{output}\n{log}");
+        SameAsDotnetTest(name, output, libTests);
+        Replace("Lib/Greeter.cs", "\"Howdy there, \"", "\"Hello there, \"");
+        // (NUnitTests runs under dotnet test by now: RunSettingsTheHostDoesNotApply left it a .runsettings the host doesn't apply.)
+        if (!Summaries(Run(blaze, "test")).Keys.ToHashSet().SetEquals(libTests))
+            Fail($"{name}, undone: expected {string.Join(", ", libTests)} to run and pass");
+        Console.WriteLine($"ok  {name}: an edit before the sessions were ready ran {string.Join(", ", live.Values.Order())} in new hosts, not their live ones; the failures matched dotnet test's");
+    }
+    finally
+    {
+        Run(blaze, "stop", check: false);
+    }
+}
+
+// A body edit in Lib that changes no test's result: Shout's, which no test runs.
+void ToggleShout()
+{
+    if (File.ReadAllText(Path.Combine(work, "Lib/Greeter.cs")).Contains("who.ToUpperInvariant().ToString()"))
+        Replace("Lib/Greeter.cs", "who.ToUpperInvariant().ToString()", "who.ToUpperInvariant()");
+    else
+        Replace("Lib/Greeter.cs", "who.ToUpperInvariant()", "who.ToUpperInvariant().ToString()");
+}
+
+// Each project's summary and failed tests in a blaze-cs run, as `dotnet test --no-build` reports them.
+void SameAsDotnetTest(string name, string output, string[] projects)
+{
+    var ours = Summaries(output);
+    var ourFailures = FailedTests(output);
+    foreach (var project in projects)
+    {
+        var theirOutput = RunWithExit("dotnet", $"test --no-build {project} -nologo", check: false).Output;
+        var theirs = Summaries(theirOutput).GetValueOrDefault(project);
+        var theirFailures = FailedTests(theirOutput).Values.SelectMany(names => names).Select(Method).ToHashSet();
+        if (ours.GetValueOrDefault(project) is not { } summary || summary != theirs
+            || !ourFailures.GetValueOrDefault(project, []).Select(Method).ToHashSet().SetEquals(theirFailures))
+            Fail($"{name}: {project}: expected the run to match dotnet test's: {ours.GetValueOrDefault(project)} failing {string.Join(", ", ourFailures.GetValueOrDefault(project, []))}, "
+                + $"dotnet test {theirs} failing {string.Join(", ", theirFailures)}:\n{theirOutput}");
+    }
+}
+
+// A test's name without its namespace and class, which NUnit's adapter leaves out under dotnet test and the host doesn't.
+static string Method(string test) => test[(test[..(test.IndexOf('(') is >= 0 and var arguments ? arguments : test.Length)].LastIndexOf('.') + 1)..];
+
+// The tests each project's run failed, by project: "  Failed <name>" (with " [<duration>]" from dotnet test), or
+// xUnit's "<name> [FAIL]". A project's lines come before its summary line; those after the last one are under "".
+// (dotnet test prints xUnit's lines after its summary: of its output, take every name.)
+static Dictionary<string, HashSet<string>> FailedTests(string output)
+{
+    var failed = new Dictionary<string, HashSet<string>>();
+    var pending = new HashSet<string>();
+    foreach (var line in output.Split('\n').Select(line => line.TrimEnd('\r')))
+    {
+        if (Regex.Match(line, @"^  Failed (\S+)(?: \[[^\]]*\])?$|^(?:\[xUnit\.net [^\]]*\])?\s+(\S+) \[FAIL\]$") is { Success: true } test)
+            pending.Add(test.Groups[1].Success ? test.Groups[1].Value : test.Groups[2].Value);
+        else if (Regex.Match(line, @"^\s*\w+!\s+- Failed:.* - (\S+)\.dll\b") is { Success: true } summary)
+        {
+            failed[summary.Groups[1].Value] = pending;
+            pending = [];
+        }
+    }
+    failed[""] = pending;
+    return failed;
+}
+
+// Without the SDK's hot reload engine (here, BLAZE_CS_DOTNET_WATCH names an empty directory in its place), a
+// daemon's first test run says so once, with why, and runs as before: no host stays up after its run, none is
+// started so it could, and the next run says nothing more about it.
+void HotReloadUnavailable()
+{
+    var empty = Directory.CreateDirectory(Path.Combine(work, ".no-dotnet-watch")).FullName;
+    Run(blaze, "stop");
+    try
+    {
+        Run(blaze, "build", environment: new() { ["BLAZE_CS_DOTNET_WATCH"] = empty });
+        var daemon = Daemons().Last().Pid;
+        var unavailable = OperatingSystem.IsWindows() ? "blaze-cs: hot reload is unavailable: on Windows"
+            : $"blaze-cs: hot reload is unavailable: the SDK has no Microsoft.CodeAnalysis.Workspaces.dll in {empty}";
+        var first = Run(blaze, "test");
+        if (Regex.Matches(first, "^blaze-cs: hot reload", RegexOptions.Multiline).Count != 1 || !first.Contains(unavailable))
+            Fail($"hot reload unavailable: expected one line \"{unavailable}\":\n{first}");
+        Replace("Lib/Greeter.cs", "Twice(int amount) => amount + amount", "Twice(int amount) => amount * 2");
+        var next = Run(blaze, "test");
+        if (next.Contains("hot reload") || !Summaries(next).Keys.Order().SequenceEqual(libTests.Order()))
+            Fail($"hot reload unavailable: expected the next run to run {string.Join(", ", libTests)} as before, without a word about hot reload:\n{next}");
+        var log = ReadLog("daemon.log");
+        var since = log.LastIndexOf($"(pid {daemon}, exits after", StringComparison.Ordinal);
+        if (since < 0 || log[since..].Contains("stays up for"))
+            Fail($"hot reload unavailable: expected no host to stay up after its run:\n{log}");
+        if (OperatingSystem.IsLinux() && TestHostProcesses().FirstOrDefault(host => Modifiable(host.Pid)) is { Pid: > 0 } modifiable)
+            Fail($"hot reload unavailable: expected no host started with DOTNET_MODIFIABLE_ASSEMBLIES, found {modifiable.Command}");
+        Console.WriteLine("ok  hot reload unavailable: said once why, and the test runs went on as before, with no host kept or started for it");
+    }
+    finally
+    {
+        Run(blaze, "stop", check: false);
+        Directory.Delete(empty);
+        if (File.ReadAllText(Path.Combine(work, "Lib/Greeter.cs")).Contains("Twice(int amount) => amount * 2"))
+            Replace("Lib/Greeter.cs", "Twice(int amount) => amount * 2", "Twice(int amount) => amount + amount");
+    }
+}
+
+// Linux: whether a process runs with DOTNET_MODIFIABLE_ASSEMBLIES set.
+static bool Modifiable(int pid)
+{
+    try
+    {
+        return File.ReadAllText($"/proc/{pid}/environ").Split('\0').Any(variable => variable.StartsWith("DOTNET_MODIFIABLE_ASSEMBLIES=", StringComparison.Ordinal));
+    }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        return false;
+    }
 }
 
 // Linux: a host's mapped assemblies, once it has its warm-up assembly, include none of the solution's projects.
@@ -1176,23 +1545,30 @@ void HostCannotLoad()
     Console.WriteLine($"ok  host that can't load an assembly: failed in {failedIn.TotalSeconds:F1} s; the next run passed");
 }
 
-// A test project whose tests failed runs again on the next `test`, though nothing changed since.
+// A test project whose tests failed runs again on the next `test`, though nothing changed since: in a new host,
+// not the one that stayed up for it, whose statics the first run left (TestRunner.Plan). That host ends then,
+// or ended already if the project dropped out of the ones that get a host.
 void FailedRunsAgain()
 {
-    Replace("Tests/WelcomeTests.cs", "\"Hello\"", "\"Goodbye\"");
+    Replace("Tests/WelcomeTests.cs", "StartsWith(\"Hello\"", "StartsWith(\"Goodbye\"");
     try
     {
+        int? live = null; // the host that stayed up for Tests after run 1, if one did: run 2 must not run in it
         for (var run = 1; run <= 2; run++)
         {
             var (output, exitCode) = RunWithExit(blaze, "test", check: false);
             if (exitCode == 0 || !Regex.IsMatch(output, @"^\s*Failed!\s+- Failed:\s+1, .* - Tests\.dll\b", RegexOptions.Multiline)
-                || run == 2 && Rebuilt(output).Count != 0)
-                Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? " and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
+                || run == 2 && (Rebuilt(output).Count != 0
+                    || output.Contains("ran again") || output.Contains("hot reloaded")
+                    || HotReloadUnavailableBecause() is null && live is { } kept && !Regex.IsMatch(ReadLog("daemon.log"), $@"hot reload: test host {kept} \(Tests\.dll\) ends\b")))
+                Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? ", in a new host, and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
+            if (run == 1 && LiveHosts().FirstOrDefault(host => host.Value == "Tests") is { Key: > 0 } stayedUp)
+                live = stayedUp.Key;
         }
     }
     finally
     {
-        Replace("Tests/WelcomeTests.cs", "\"Goodbye\"", "\"Hello\"");
+        Replace("Tests/WelcomeTests.cs", "StartsWith(\"Goodbye\"", "StartsWith(\"Hello\"");
     }
     RanTests("test after a failed run", Run(blaze, "test"), ["Tests"]);
     Console.WriteLine("ok  failed test project: ran again with unchanged inputs, and passed once fixed");
@@ -1393,10 +1769,12 @@ static Dictionary<string, Summary> Summaries(string output) =>
 // The test projects a run reports: exactly the expected ones, once each, with all their tests passed and
 // counted as dotnet test counts them (explicit tests that weren't asked for aren't), and none through
 // dotnet test, since the warm host must run them on the runtime each one targets. Every other test
-// project in the solution (`among`, by default all) is listed as unchanged since its last run.
+// project in the solution (`among`, by default all) is listed as unchanged since its last run. A project
+// whose last pass was hot reloaded is among the expected ones: such a pass doesn't count.
 void RanTests(string name, string output, string[] expected, string[]? among = null)
 {
     among ??= allTests;
+    expected = [.. expected.Union(hotReloadedBefore.Intersect(among))];
     var unchanged = Regex.Match(output, @"^blaze-cs: unchanged since last run: (.+)$", RegexOptions.Multiline) is { Success: true } line
         ? line.Groups[1].Value.TrimEnd('\r').Split(", ").Select(project => project.Split(" (")[0]).ToList()
         : [];
@@ -1412,8 +1790,9 @@ void RanTests(string name, string output, string[] expected, string[]? among = n
             Fail($"{name}: {project}: expected {TestCount(project)} tests passed and no others, got {summary}:\n{output}");
 }
 
-// Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings.
-static int TestCount(string project) => project switch { "ComponentTests" => 2, "Tests11" => 1, "NUnitTests" or "MSTestTests" => 4, _ => 3 };
+// Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings;
+// Tests also has Exclaims, ReadsGreeting and Computes (HotReloadFallsBack, HotReloadedPassRunsAgain).
+static int TestCount(string project) => project switch { "Tests" => 6, "ComponentTests" => 2, "Tests11" => 1, "NUnitTests" or "MSTestTests" => 4, _ => 3 };
 
 // Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources. After a fallback, MSBuild
 // built everything, so every output must be identical. Returns that build's output, with its warnings.
@@ -1462,6 +1841,11 @@ string Run(string file, string arguments, bool check = true, Dictionary<string, 
     var stderr = process.StandardError.ReadToEndAsync();
     var output = process.StandardOutput.ReadToEnd() + stderr.Result;
     process.WaitForExit();
+    if (file == blaze && arguments.StartsWith("test", StringComparison.Ordinal))
+    {
+        hotReloadedBefore = hotReloaded;
+        hotReloaded = [.. Regex.Matches(output, @"^Passed!\s+- .* - (\S+)\.dll \(hot reloaded\)\r?$", RegexOptions.Multiline).Select(m => m.Groups[1].Value)];
+    }
     if (check && process.ExitCode != 0)
         Fail($"{file} {arguments} exited {process.ExitCode}:\n{output}");
     return (output, process.ExitCode);

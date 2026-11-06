@@ -10,10 +10,14 @@ namespace BlazeCs;
 //
 // 1. Run (TestHostRequest), always first: the host runs that test assembly and reports a result.
 // 2. If the result's CannotHotReload is null, the host stays up and waits for the next message:
-//    - Update (TestHostUpdate): the host applies each delta to the loaded assembly whose module version id
-//      it names, with MetadataUpdater.ApplyUpdate, then runs the same test assembly again with a new runner
-//      (so the framework discovers its tests anew) and reports a result, back to 2. A delta it can't
-//      apply ends it: that result has Unsupported and CannotHotReload set, and ran nothing.
+//    - Update (TestHostUpdate): the host applies each delta to the assembly whose module version id it
+//      names (loading it from the delta's baseline if the tests haven't loaded it), with
+//      MetadataUpdater.ApplyUpdate, then runs the same test assembly again with a new runner (so the
+//      framework discovers its tests anew) and reports a result, back to 2. A delta it can't apply ends
+//      it: that result has Unsupported and CannotHotReload set, and ran nothing. So does an update without
+//      deltas: the daemon runs unchanged tests in a new host, where their statics start anew. An assembly
+//      loaded from a baseline has the baseline's Assembly.Location (the daemon's copy), not the path the
+//      tests would have loaded it from.
 //    - Exit (TestHostExit): the host exits.
 //    Otherwise CannotHotReload says why, and the host exits after that one run, as hosts always did.
 // A line the host can't read, or a message out of turn, gets a result with Error and CannotHotReload set
@@ -23,7 +27,8 @@ namespace BlazeCs;
 //
 // A host can hot reload when the runtime allows updates (MetadataUpdater.IsSupported), which takes
 // DOTNET_MODIFIABLE_ASSEMBLIES=debug in its environment, and only assemblies compiled without
-// optimizations (Debug) take a delta. The daemon doesn't start its hosts with it yet (TestRunner.StartHost).
+// optimizations (Debug) take a delta. The daemon starts only the hosts it prepares for a Debug project with it
+// (TestRunner.StartHost).
 
 static class TestHostProtocol
 {
@@ -43,19 +48,21 @@ abstract record TestHostMessage;
 /// <summary>What a test host runs: a framework (xunit3, xunit2, nunit, mstest), an assembly, and the .runsettings it applies, if any.</summary>
 sealed record TestHostRequest(string Framework, string Assembly, string? RunSettings) : TestHostMessage;
 
-/// <summary>Deltas to apply, in order, before the host runs its test assembly again.</summary>
+/// <summary>Deltas to apply, in order, before the host runs its test assembly again; at least one.</summary>
 sealed record TestHostUpdate(TestHostDelta[] Deltas) : TestHostMessage;
 
 /// <summary>Ends a host that waits for an update.</summary>
 sealed record TestHostExit : TestHostMessage;
 
 /// <summary>
-/// One edit's change to one assembly the host has loaded, as Compilation.EmitDifference (or Roslyn's hot
-/// reload service) writes it: the assembly is the one whose manifest module has this version id (MVID), and
-/// UpdatedTypes are the TypeDef tokens of the types the delta changes, if known (null: the host clears the
-/// caches of every type).
+/// One edit's change to one assembly, as Compilation.EmitDifference (or Roslyn's hot reload service) writes
+/// it: the assembly is the one whose manifest module has this version id (MVID), and UpdatedTypes are the
+/// TypeDef tokens of the types the delta changes, if known (null: the host clears the caches of every type).
+/// Baseline is a file of that module, which a host that hasn't loaded the assembly yet loads into its tests'
+/// context before applying the delta (the assembly's file on disk may since have been rebuilt); without it,
+/// the host must have loaded the module.
 /// </summary>
-sealed record TestHostDelta(Guid Module, byte[] Metadata, byte[] IL, byte[] Pdb, int[]? UpdatedTypes = null);
+sealed record TestHostDelta(Guid Module, byte[] Metadata, byte[] IL, byte[] Pdb, int[]? UpdatedTypes = null, string? Baseline = null);
 
 /// <summary>
 /// What a test host reports for one run. Unsupported means it ran nothing (it doesn't know this framework

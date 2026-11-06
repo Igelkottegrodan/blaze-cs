@@ -22,6 +22,10 @@
     <!-- Likewise MSBuild (MSBuildHost): the SDK's own, loaded from the SDK directory once a project file is
          edited. Compiled against the MSBuild of SDK 10.0.100, the oldest the daemon supports. -->
     <PackageReference Include="Microsoft.Build" Version="18.0.2" ExcludeAssets="runtime" />
+    <!-- Hot reload (HotReload.cs): the Workspaces API the SDK's Edit and Continue engine takes, compiled against
+         and loaded at run time from the SDK's dotnet-watch, like the compiler. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="$(RoslynVersion)" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.Common" Version="$(RoslynVersion)" ExcludeAssets="runtime" />
     <InternalsVisibleTo Include="BlazeCs.Tests" />
   </ItemGroup>
   <ItemGroup>

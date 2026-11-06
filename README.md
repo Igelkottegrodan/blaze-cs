@@ -128,7 +128,7 @@ its own:
   member (or whose source generators' output changes). Changes that code can reach without naming them
   (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
 - **Started tests.** xUnit (v2 and v3), NUnit and MSTest assemblies run in-process in test hosts that the
-  daemon starts ahead of time; each host runs one assembly and exits. A host waits for each of the four
+  daemon starts ahead of time; each host runs one assembly. A host waits for each of the four
   test projects run most recently, with the project's NuGet packages loaded and its test framework
   already run once on a few tests of blaze-cs's own, so the framework's code is compiled before the
   build finishes. It loads none of the solution's outputs until the run, so a rebuilt reference is always
@@ -137,6 +137,23 @@ its own:
   that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is applied in the
   host; projects with any other `.runsettings`, and anything a host can't run, go through
   `dotnet test --no-build`.
+- **Hot reload into the test host.** A Debug test project's host stays up after its run. When the next
+  edit is method bodies only, the daemon diffs it with the SDK's own Edit and Continue engine (the one
+  `dotnet watch` uses), sends the host the metadata deltas, and the tests run again in the same process:
+  `blaze-cs: Tests.dll: hot reloaded Lib (net10.0) (1 type) into its test host (pid …)`. Any other edit
+  (a signature, a new member, a static field's initializer, a changed resource, package or `.runsettings`),
+  a run with nothing changed (`--all`, or a project whose last run failed), a Release project, or an SDK
+  whose engine blaze-cs doesn't know (such as 10.0.100's) runs the project in a new host as before;
+  `.blaze-cs/daemon.log` says why. The assemblies on disk are still what `dotnet build` makes. Limits:
+  - Static state carries over from one hot reloaded run to the next, which `dotnet test` starts fresh, so
+    tests that depend on it can pass or fail where `dotnet test` doesn't ([#129](https://github.com/Igelkottegrodan/blaze-cs/issues/129)).
+    That includes statics computed by code an edit changed: a `static readonly` field whose initializer
+    calls an edited method, a `Lazy<T>` whose lambda was edited, a cache filled before the edit. They keep
+    the value the old code computed. So a hot reloaded run's summary line ends in `(hot reloaded)`, and its
+    pass doesn't count: the next `test` runs that project again in a new host, even with nothing changed.
+  - A delta to a project output the tests hadn't loaded yet loads it from the daemon's copy in
+    `.blaze-cs/hotreload/`, so its `Assembly.Location` is that copy, not the `bin/` file.
+  - Not on Windows yet: a host that stays up would keep the project outputs it loaded locked.
 - **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
   (its own, and every project output copied next to it), its `.deps.json` or its `.runsettings` differs
   from when it last ran in this daemon, when it hasn't run in this daemon yet, or when its last run
@@ -246,9 +263,9 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | Path | What |
 |---|---|
 | `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
-| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner, compiler-server pipe (`CompilerServer`, `CompilerServerProtocol`) |
+| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner, compiler-server pipe (`CompilerServer`, `CompilerServerProtocol`), and hot reload through the SDK's Edit and Continue engine (`HotReload`) |
 | `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile, each project's `RunSettingsFilePath` |
-| `src/BlazeCs.TestHost` | the test host (xUnit v2 and v3, NUnit, MSTest), and its protocol with the daemon (`Protocol.cs`): one run, then, started with `DOTNET_MODIFIABLE_ASSEMBLIES=debug`, metadata deltas applied and the tests run again in the same process (the daemon sends none yet) |
+| `src/BlazeCs.TestHost` | the test host (xUnit v2 and v3, NUnit, MSTest), and its protocol with the daemon (`Protocol.cs`): one run, then, started with `DOTNET_MODIFIABLE_ASSEMBLIES=debug`, metadata deltas applied and the tests run again in the same process |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, what counts as a dependent naming an identifier, the test host applying a delta (with `tests/TestHostKits`, each test framework's packages), and the compiler-server wire format against the SDK's own implementation |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |

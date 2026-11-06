@@ -52,7 +52,7 @@ static partial class Program
             {
                 case TestHostUpdate update:
                     // Applied, it runs the tests again; otherwise it reports that it ran nothing, and exits.
-                    result = Apply(update) is { } failure ? new TestHostResult(0, 0, 0, 0, null, failure, failure) : null;
+                    result = Apply(update, loaded!.Context) is { } failure ? new TestHostResult(0, 0, 0, 0, null, failure, failure) : null;
                     break;
                 case TestHostExit:
                     Exit();
@@ -315,16 +315,27 @@ static partial class Program
     /// <summary>
     /// Applies an update's deltas to the loaded assemblies they name, then calls every loaded assembly's
     /// metadata update handlers (the runtime's reflection caches among them) as dotnet-watch's agent does,
-    /// so the next run's reflection sees the updated types. Returns why it couldn't, or null.
+    /// so the next run's reflection sees the updated types. An assembly the tests haven't loaded yet is loaded
+    /// into their context from the delta's baseline first: the file on disk may be newer than the baseline,
+    /// and a delta only applies to the module it was made against. Returns why it couldn't, or null.
     /// </summary>
-    static string? Apply(TestHostUpdate update)
+    static string? Apply(TestHostUpdate update, TestContext context)
     {
+        if (update.Deltas.Length == 0)
+            return "the test host couldn't apply the update: it has no deltas";
         List<Type>? updatedTypes = [];
         try
         {
             foreach (var delta in update.Deltas)
             {
                 var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => !a.IsDynamic && a.ManifestModule.ModuleVersionId == delta.Module);
+                if (assembly is null && delta.Baseline is not null)
+                {
+                    // Throws if the context has loaded another build of it, which no delta made here applies to.
+                    assembly = context.LoadFromAssemblyPath(delta.Baseline);
+                    if (assembly.ManifestModule.ModuleVersionId != delta.Module)
+                        return $"the test host couldn't apply the update: {delta.Baseline} is module {assembly.ManifestModule.ModuleVersionId}, not {delta.Module}";
+                }
                 if (assembly is null)
                     return $"the test host couldn't apply the update: it has loaded no assembly with module {delta.Module}";
                 MetadataUpdater.ApplyUpdate(assembly, delta.Metadata, delta.IL, delta.Pdb);
