@@ -47,7 +47,8 @@ On Windows, build it with the .NET SDK: `dotnet build BlazeCs.slnx`.
 
 The build also compiles the small `blaze-cs` client Native AOT, so a command that reaches a running daemon
 starts in about 5 ms instead of 60. That needs a C toolchain: clang and zlib headers on Linux, the Visual
-Studio C++ build tools on Windows.
+Studio C++ build tools on Windows. The `blaze-cs` and `blaze-cs.cmd` launchers in the clone use it; the
+installed tool is the managed CLI alone and starts in about 60 ms.
 
 ## Try it
 
