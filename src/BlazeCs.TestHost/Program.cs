@@ -40,9 +40,10 @@ static partial class Program
             return;
         }
         var loaded = Load(request, prepared, out var result);
+        string[]? classes = null; // all
         while (true)
         {
-            result ??= RunTests(request.Framework, loaded!);
+            result ??= RunTests(request.Framework, loaded!, classes);
             result = result with { CannotHotReload = result.CannotHotReload ?? CannotHotReload(loaded, result) };
             Report(protocol, result);
             if (result.CannotHotReload is not null)
@@ -53,6 +54,7 @@ static partial class Program
                 case TestHostUpdate update:
                     // Applied, it runs the tests again; otherwise it reports that it ran nothing, and exits.
                     result = Apply(update, loaded!.Context) is { } failure ? new TestHostResult(0, 0, 0, 0, null, failure, failure) : null;
+                    classes = update.Classes;
                     break;
                 case TestHostExit:
                     Exit();
@@ -200,7 +202,7 @@ static partial class Program
                 // Its results and output go nowhere: stdout carries the run's.
                 Console.SetOut(TextWriter.Null);
                 Console.SetError(TextWriter.Null);
-                _ = Runner(framework, context, context.LoadFromAssemblyPath(warmUp), directory, TextWriter.Null, settings)();
+                _ = Runner(framework, context, context.LoadFromAssemblyPath(warmUp), directory, TextWriter.Null, settings, null)();
             }
         }
         catch (Exception) { }
@@ -280,16 +282,18 @@ static partial class Program
 
     /// <summary>
     /// Runs a loaded test assembly's tests with a new runner, which discovers them anew: after an update, the
-    /// assembly's current methods and types.
+    /// assembly's current methods and types. With classes, only those classes' tests run (none if it is empty).
     /// </summary>
-    static TestHostResult RunTests(string framework, Loaded loaded)
+    static TestHostResult RunTests(string framework, Loaded loaded, string[]? classes)
     {
+        if (classes is [])
+            return new TestHostResult(0, 0, 0, 0, null, null, Classes: []);
         var (output, error) = (Console.Out, Console.Error);
         Func<TestHostResult> run;
         try
         {
             var directory = EnterDirectory(loaded.Assembly.Location);
-            run = Runner(framework, loaded.Context, loaded.Assembly, directory, output, loaded.Settings);
+            run = Runner(framework, loaded.Context, loaded.Assembly, directory, output, loaded.Settings, classes?.ToHashSet(StringComparer.Ordinal));
         }
         catch (Exception e)
         {
@@ -434,30 +438,35 @@ static partial class Program
     }
 
     /// <summary>
-    /// A framework's runner for one test assembly, ready to run. The directory is the test project's output
-    /// directory, where xUnit v2's adapter is.
+    /// A framework's runner for one test assembly, ready to run: every test, or only the tests of the given
+    /// classes, through the framework's own filter. The directory is the test project's output directory, where
+    /// xUnit v2's adapter is.
     /// </summary>
-    static Func<TestHostResult> Runner(string framework, AssemblyLoadContext context, Assembly assembly, string directory, TextWriter output, Settings settings) => framework switch
+    static Func<TestHostResult> Runner(string framework, AssemblyLoadContext context, Assembly assembly, string directory, TextWriter output, Settings settings,
+        IReadOnlySet<string>? classes) => framework switch
     {
-        "xunit3" => XunitV3(context, assembly, output),
+        "xunit3" => XunitV3(context, assembly, output, classes),
         "xunit2" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyPath(XunitV2Adapter(directory))
-            .GetType("Xunit.Runner.VisualStudio.VsTestRunner", throwOnError: true)!),
-        "nunit" => NUnit(context, assembly, output, settings),
+            .GetType("Xunit.Runner.VisualStudio.VsTestRunner", throwOnError: true)!, classes),
+        "nunit" => NUnit(context, assembly, output, settings, classes),
         "mstest" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyName(new AssemblyName("MSTest.TestAdapter"))
-            .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!),
+            .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!, classes),
         _ => throw new NotSupportedException($"no runner for {framework}"),
     };
 
     /// <summary>
     /// xUnit's in-process runner, which takes the test assembly explicitly: the assembly's own Main would
-    /// run whatever Assembly.GetEntryAssembly() is, this host. Totals come from its XML report.
+    /// run whatever Assembly.GetEntryAssembly() is, this host. Classes go to its -class option, which takes a
+    /// class's full name, a nested class's with a '+'. Totals come from its XML report, and each test's class
+    /// from its test element's type; an error outside a test (a fixture's, a collection's) leaves the classes
+    /// unaccounted for.
     /// </summary>
-    static Func<TestHostResult> XunitV3(AssemblyLoadContext context, Assembly assembly, TextWriter output)
+    static Func<TestHostResult> XunitV3(AssemblyLoadContext context, Assembly assembly, TextWriter output, IReadOnlySet<string>? classes)
     {
         var reportPath = Path.Combine(Path.GetTempPath(), $"blaze-cs-{Environment.ProcessId}.xml");
         var runnerType = context.LoadFromAssemblyName(new AssemblyName("xunit.v3.runner.inproc.console"))
             .GetType("Xunit.Runner.InProc.SystemConsole.ConsoleRunner", throwOnError: true)!;
-        string[] arguments = ["-noLogo", "-noColor", "-xml", reportPath];
+        string[] arguments = ["-noLogo", "-noColor", "-xml", reportPath, .. classes?.Order(StringComparer.Ordinal).SelectMany(name => new[] { "-class", name }) ?? []];
         var runner = (IDisposable)Activator.CreateInstance(runnerType, [arguments, assembly])!;
         var entryPoint = runnerType.GetMethod("EntryPoint") ?? throw new MissingMethodException(runnerType.FullName, "EntryPoint");
         return () =>
@@ -472,8 +481,16 @@ static partial class Program
                 var report = XDocument.Load(reportPath).Root!.Element("assembly")
                     ?? throw new InvalidOperationException("xUnit wrote no results");
                 int Count(string name) => int.Parse(report.Attribute(name)?.Value ?? "0");
+                var byClass = Count("errors") > 0 ? null : ByClass(report.Descendants("test").Select(test => (test.Attribute("type")?.Value, test.Attribute("result")?.Value switch
+                {
+                    "Pass" => "Passed",
+                    "Fail" => "Failed",
+                    "Skip" => "Skipped",
+                    _ => "NotRun", // an explicit test that wasn't asked for
+                })));
                 // Its total includes explicit tests that weren't asked for, which `dotnet test` leaves out.
-                return new TestHostResult(Count("total") - Count("not-run"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null);
+                return new TestHostResult(Count("total") - Count("not-run"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null,
+                    Classes: byClass);
             }
             finally
             {
@@ -484,9 +501,10 @@ static partial class Program
 
     /// <summary>
     /// NUnit's FrameworkController, which its engine and VSTest adapter drive too: RunTests returns the
-    /// results as XML (a test-suite with totals, and a test-case per test with any failure and output).
+    /// results as XML (a test-suite with totals, and a test-case per test with its class, any failure and
+    /// output). Classes go to its filter's class elements, which match a test's class name.
     /// </summary>
-    static Func<TestHostResult> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings settings)
+    static Func<TestHostResult> NUnit(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings settings, IReadOnlySet<string>? classes)
     {
         var type = context.LoadFromAssemblyName(new AssemblyName("nunit.framework"))
             .GetType("NUnit.Framework.Api.FrameworkController", throwOnError: true)!;
@@ -502,7 +520,9 @@ static partial class Program
         return () =>
         {
             load.Invoke(controller, []);
-            var suite = XElement.Parse((string)runTests.Invoke(controller, ["<filter/>"])!);
+            var filter = classes is null ? new XElement("filter")
+                : new XElement("filter", new XElement("or", classes.Order(StringComparer.Ordinal).Select(name => new XElement("class", name))));
+            var suite = XElement.Parse((string)runTests.Invoke(controller, [filter.ToString(SaveOptions.DisableFormatting)])!);
             foreach (var test in suite.Descendants("test-case").Where(t => t.Attribute("result")?.Value == "Failed"))
             {
                 var failure = test.Element("failure");
@@ -510,18 +530,26 @@ static partial class Program
                     failure?.Element("stack-trace")?.Value, test.Element("output")?.Value);
             }
             int Count(string name) => int.Parse(suite.Attribute(name)?.Value ?? "0");
+            var byClass = ByClass(suite.Descendants("test-case").Select(test => (test.Attribute("classname")?.Value, test.Attribute("result")?.Value switch
+            {
+                "Passed" or "Failed" => test.Attribute("result")!.Value,
+                _ => "Skipped", // as below
+            })));
             // As the VSTest adapter does by default: warnings and inconclusive results count as skipped.
             return new TestHostResult(Count("total"), Count("passed"), Count("failed"),
-                Count("skipped") + Count("inconclusive") + Count("warnings"), null, null);
+                Count("skipped") + Count("inconclusive") + Count("warnings"), null, null, Classes: byClass);
         };
     }
 
     /// <summary>
     /// A VSTest adapter's executor (MSTest's, xUnit v2's), as vstest's testhost runs it, with the run's
     /// .runsettings. Its run context and framework handle are proxies for the test's own copy of the VSTest
-    /// object model, so the host doesn't reference it.
+    /// object model, so the host doesn't reference it. Classes go to the run context's test case filter, which
+    /// both adapters ask for (`dotnet test --filter` reaches them that way): it matches a test whose fully
+    /// qualified name is one of their names, a dot and a method name, the class a result is counted under.
     /// </summary>
-    static Func<TestHostResult> VSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings runSettings, Type executorType)
+    static Func<TestHostResult> VSTest(AssemblyLoadContext context, Assembly assembly, TextWriter output, Settings runSettings, Type executorType,
+        IReadOnlySet<string>? classes)
     {
         var executor = Activator.CreateInstance(executorType)!;
         var objectModel = context.LoadFromAssemblyName(new AssemblyName("Microsoft.VisualStudio.TestPlatform.ObjectModel"));
@@ -530,10 +558,17 @@ static partial class Program
             ?? throw new MissingMethodException("ITestExecutor", "RunTests");
         var settings = Proxy.Create(Adapter("IRunSettings"), (method, _) =>
             method.Name == "get_SettingsXml" ? runSettings.Xml : null);
+        var filter = classes is null ? null : Proxy.Create(Adapter("ITestCaseFilterExpression"), (method, arguments) => method.Name switch
+        {
+            "get_TestCaseFilterValue" => "blaze-cs: " + string.Join("|", classes),
+            "MatchTestCase" => classes.Contains(VSTestRecorder.Class(arguments[0]!)),
+            _ => null,
+        });
         var runContext = Proxy.Create(Adapter("IRunContext"), (method, _) => method.Name switch
         {
             "get_RunSettings" => settings,
             "get_TestRunDirectory" => Path.GetDirectoryName(assembly.Location),
+            "GetTestCaseFilter" => filter,
             _ => null,
         });
         var recorder = new VSTestRecorder(output);
@@ -557,8 +592,12 @@ static partial class Program
     sealed class VSTestRecorder(TextWriter output)
     {
         int _total, _passed, _failed, _skipped;
+        readonly ConcurrentQueue<(string? Class, string Outcome)> _outcomes = [];
 
-        public TestHostResult Result() => new(_total, _passed, _failed, _skipped, null, null);
+        public TestHostResult Result() => new(_total, _passed, _failed, _skipped, null, null, Classes: ByClass(_outcomes));
+
+        /// <summary>A test case's class: its fully qualified name up to the method's name, which both adapters append after a dot.</summary>
+        public static string Class(object testCase) => Get(testCase, "FullyQualifiedName") is string name && name.LastIndexOf('.') is var dot and > 0 ? name[..dot] : "";
 
         public object? Invoke(MethodInfo method, object?[] arguments)
         {
@@ -575,7 +614,9 @@ static partial class Program
         void Record(object result)
         {
             Interlocked.Increment(ref _total);
-            switch (Get(result, "Outcome")?.ToString())
+            var outcome = Get(result, "Outcome")?.ToString();
+            _outcomes.Enqueue((Class(Get(result, "TestCase")!), outcome is "Passed" or "Failed" ? outcome : "Skipped"));
+            switch (outcome)
             {
                 case "Passed":
                     Interlocked.Increment(ref _passed);
@@ -611,6 +652,31 @@ static partial class Program
                     output.WriteLine($"   {line.TrimEnd('\r')}");
             }
         }
+    }
+
+    /// <summary>
+    /// A run's counts by test class, from each test's class and outcome (Passed, Failed or Skipped; anything else,
+    /// such as an explicit test that wasn't asked for, isn't counted); null if a test has no class.
+    /// </summary>
+    static Dictionary<string, TestCounts>? ByClass(IEnumerable<(string? Class, string Outcome)> tests)
+    {
+        var classes = new Dictionary<string, TestCounts>(StringComparer.Ordinal);
+        foreach (var (name, outcome) in tests)
+        {
+            TestCounts? counts = outcome switch
+            {
+                "Passed" => new(1, 0, 0),
+                "Failed" => new(0, 1, 0),
+                "Skipped" => new(0, 0, 1),
+                _ => null,
+            };
+            if (counts is null)
+                continue;
+            if (string.IsNullOrEmpty(name))
+                return null;
+            classes[name] = classes.TryGetValue(name, out var sum) ? sum + counts : counts;
+        }
+        return classes;
     }
 
     static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;

@@ -43,6 +43,41 @@ public class HotReloadTests
         Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the host should exit on the exit message");
     }
 
+    /// <summary>
+    /// A run reports its counts by test class, named as the framework names them (a nested class after its
+    /// declaring class and a '+'), and an update that names classes runs only theirs, through the framework's
+    /// own filter; none, if it names none.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Frameworks))]
+    public void AnUpdateWithClassesRunsOnlyTheirTests(string framework)
+    {
+        using var subject = new Subject(framework, extraClasses: true);
+        using var host = new Host(hotReload: true);
+
+        var first = host.Send(subject.Run);
+        Assert.Equal((4, 3, 1), (first.Total, first.Passed, first.Failed));
+        Assert.Equal(new Dictionary<string, TestCounts>
+        {
+            ["AnswerTests"] = new(1, 1, 0),
+            ["OtherTests"] = new(1, 0, 0),
+            ["Outer+Inner"] = new(1, 0, 0),
+        }, first.Classes);
+
+        var second = host.Send(new TestHostUpdate([subject.Edit(42)], ["AnswerTests", "Outer+Inner"]));
+        Assert.Equal((3, 3, 0), (second.Total, second.Passed, second.Failed));
+        Assert.Equal(new Dictionary<string, TestCounts> { ["AnswerTests"] = new(2, 0, 0), ["Outer+Inner"] = new(1, 0, 0) }, second.Classes);
+
+        var third = host.Send(new TestHostUpdate([subject.Edit(43)], []));
+        Assert.Equal((0, 0, 0), (third.Total, third.Passed, third.Failed));
+        Assert.Equal(new Dictionary<string, TestCounts>(), third.Classes);
+        Assert.Null(third.CannotHotReload);
+
+        var fourth = host.Send(new TestHostUpdate([subject.Edit(44)], ["OtherTests"]));
+        Assert.Equal((1, 1, 0), (fourth.Total, fourth.Passed, fourth.Failed));
+        Assert.Equal(new Dictionary<string, TestCounts> { ["OtherTests"] = new(1, 0, 0) }, fourth.Classes);
+    }
+
     [Fact]
     public void AHostThatCannotApplyUpdatesSaysSoAndRunsOnce()
     {
@@ -239,6 +274,33 @@ public class HotReloadTests
         Assert.False(live.Process.HasExited, "the live host is the caller's to end");
     }
 
+    /// <summary>
+    /// An update that names no test class to run (its delta reaches none, TestSelection) runs no test: that is
+    /// what it asked for, not a framework that lost its tests, so the live host stays the project's, with no
+    /// fallback. An update that names classes and runs no test still falls back.
+    /// </summary>
+    [Fact]
+    public void AnUpdateThatRunsNoTestClassStaysInItsHost()
+    {
+        using var subject = new Subject("xunit3");
+        using var live = new Host(hotReload: true);
+        Assert.Null(live.Send(subject.Run).CannotHotReload);
+
+        var output = new List<string>();
+        var run = TestRunner.RunLive(live.Process, new TestHostUpdate([subject.Edit(42)], []), null, subject.Run,
+            () => throw new InvalidOperationException("a run of no test class must not fall back"), output);
+
+        Assert.Null(run.Fallback);
+        Assert.Same(live.Process, run.Host);
+        Assert.Equal((0, 0, 0), (run.Result!.Total, run.Result.Passed, run.Result.Failed));
+        Assert.Equal(new Dictionary<string, TestCounts>(), run.Result.Classes);
+
+        using var fresh = new Host(hotReload: true);
+        run = TestRunner.RunLive(live.Process, new TestHostUpdate([subject.Edit(43)], ["NoSuchTests"]), null, subject.Run, () => fresh.Process, output);
+        Assert.Equal("it found no tests after the update", run.Fallback);
+        Assert.Same(fresh.Process, run.Host);
+    }
+
     /// <summary>A test host process, as the daemon starts one, with or without the runtime's switch for updates.</summary>
     sealed class Host : IDisposable
     {
@@ -290,7 +352,7 @@ public class HotReloadTests
     /// </summary>
     sealed class Subject : IDisposable
     {
-        readonly string _framework, _extraTest;
+        readonly string _framework, _extraTest, _extraClasses;
         readonly DirectoryInfo _directory;
         readonly CSharpCompilation _compilation;
         readonly EmitBaseline _baseline;
@@ -298,9 +360,32 @@ public class HotReloadTests
         readonly Func<int, string> _source;
 
         /// <param name="extraTest">A third test in the test class, in the framework's attributes.</param>
-        public Subject(string framework, string extraTest = "", bool answerInLibrary = false)
+        /// <param name="extraClasses">More test classes, OtherTests and Outer+Inner, with a passing test each.</param>
+        public Subject(string framework, string extraTest = "", bool answerInLibrary = false, bool extraClasses = false)
         {
             (_framework, _extraTest) = (framework, extraTest);
+            var (attribute, test) = framework switch
+            {
+                "xunit3" => ("", "[Fact]"),
+                "nunit" => ("", "[Test]"),
+                _ => ("[TestClass]", "[TestMethod]"),
+            };
+            _extraClasses = extraClasses ? $$"""
+                {{attribute}}
+                public class OtherTests
+                {
+                    {{test}} public void Passes() { }
+                }
+
+                public class Outer
+                {
+                    {{attribute}}
+                    public class Inner
+                    {
+                        {{test}} public void Passes() { }
+                    }
+                }
+                """ : "";
             var kit = framework switch { "xunit3" => "XunitV3Kit", "nunit" => "NUnitKit", "mstest" => "MSTestKit", _ => throw new ArgumentOutOfRangeException(nameof(framework)) };
             var kitDirectory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "kits", kit));
             _directory = Directory.CreateTempSubdirectory("blaze-cs-hot-reload-");
@@ -369,19 +454,32 @@ public class HotReloadTests
         }
 
         /// <summary>The delta that makes Answer.Value return 42, as the daemon would send it.</summary>
-        public TestHostDelta Fix()
+        public TestHostDelta Fix() => Difference(_compilation, _baseline, 42).Delta;
+
+        // The generation the deltas Edit made so far lead to.
+        CSharpCompilation? _edited;
+        EmitBaseline? _editedBaseline;
+
+        /// <summary>The delta that makes Answer.Value return an answer, after those Edit made before it.</summary>
+        public TestHostDelta Edit(int answer)
         {
-            var fixedCompilation = _compilation.ReplaceSyntaxTree(_compilation.SyntaxTrees.Single(), Parse(_source(42)));
+            (var delta, _edited, _editedBaseline) = Difference(_edited ?? _compilation, _editedBaseline ?? _baseline, answer);
+            return delta;
+        }
+
+        (TestHostDelta Delta, CSharpCompilation Compilation, EmitBaseline Baseline) Difference(CSharpCompilation compilation, EmitBaseline baseline, int answer)
+        {
+            var fixedCompilation = compilation.ReplaceSyntaxTree(compilation.SyntaxTrees.Single(), Parse(_source(answer)));
             ISymbol Value(Compilation compilation) => compilation.GetTypeByMetadataName("Answer")!.GetMembers("Value").Single();
             using var metadata = new MemoryStream();
             using var il = new MemoryStream();
             using var pdb = new MemoryStream();
-            var result = fixedCompilation.EmitDifference(_baseline,
-                [new SemanticEdit(SemanticEditKind.Update, Value(_compilation), Value(fixedCompilation), null, null, default)],
+            var result = fixedCompilation.EmitDifference(baseline,
+                [new SemanticEdit(SemanticEditKind.Update, Value(compilation), Value(fixedCompilation), null, null, default)],
                 _ => false, metadata, il, pdb, EmitDifferenceOptions.Default, TestContext.Current.CancellationToken);
             Assert.True(result.Success, string.Join("\n", result.Diagnostics));
-            return new TestHostDelta(_module, metadata.ToArray(), il.ToArray(), pdb.ToArray(),
-                [.. result.ChangedTypes.Select(type => MetadataTokens.GetToken(type))], Baseline);
+            return (new TestHostDelta(_module, metadata.ToArray(), il.ToArray(), pdb.ToArray(),
+                [.. result.ChangedTypes.Select(type => MetadataTokens.GetToken(type))], Baseline), fixedCompilation, result.Baseline!);
         }
 
         static string AnswerSource(int answer) => $$"""
@@ -434,6 +532,8 @@ public class HotReloadTests
                 }}}
                 {{_extraTest}}
             }
+
+            {{_extraClasses}}
             """;
 
         static void Copy(string from, string to)

@@ -17,9 +17,13 @@ public class WelcomeTests
         Assert.That(Environment.GetEnvironmentVariable("BLAZE_CS_FIXTURE_VARIABLE"), Is.EqualTo("from runsettings"));
         Assert.That(TestContext.Parameters["fixtureParameter"], Is.EqualTo("from runsettings"));
     }
+}
 
+// Uses nothing of Lib, so a hot reloaded edit there runs only WelcomeTests, and lists this class as unchanged.
+public class RuntimeTests
+{
     [Test]
     public void RunsOnTargetRuntime() => Assert.That(
         Environment.Version.Major.ToString(),
-        Is.EqualTo(typeof(WelcomeTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "TargetRuntimeMajor").Value));
+        Is.EqualTo(typeof(RuntimeTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "TargetRuntimeMajor").Value));
 }
