@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text.Json;
@@ -9,7 +10,8 @@ namespace BlazeCs.TestHost;
 /// <summary>
 /// A single-use test host. The daemon starts it ahead of time, so the runtime is already up when a run
 /// needs it; it reads one request line from stdin, runs that test assembly in-process, writes
-/// the result as the last line and exits. Test output goes to stdout. Exiting keeps every run's statics,
+/// the result as the last line and exits. Stdin closing at any point means the daemon is gone (it stopped
+/// or died), and the host exits at once, running tests or not. Test output goes to stdout. Exiting keeps every run's statics,
 /// threads and console redirections apart, and lets the tests load into an ordinary (non-collectible)
 /// context, where precompiled code is used: measured on the fixture, about twice as fast as a collectible one.
 /// </summary>
@@ -23,10 +25,23 @@ static class Program
         // End of input means the daemon stopped (or died) without needing this host.
         if (Console.ReadLine() is not { } request)
             return;
+        WatchDaemon();
         var result = Run(JsonSerializer.Deserialize<Request>(request)!);
         Console.Out.Flush();
         protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result));
     }
+
+    /// <summary>
+    /// Kills this process when stdin ends, on Linux and Windows alike: the daemon's end of the pipe closes with
+    /// the daemon, however it died. The daemon sends nothing after the request, so this reads nothing else.
+    /// The raw stream, since the tests may read Console.In.
+    /// </summary>
+    static void WatchDaemon() => new Thread(() =>
+    {
+        var stdin = Console.OpenStandardInput();
+        while (stdin.Read(new byte[256]) > 0) { }
+        Process.GetCurrentProcess().Kill();
+    }) { IsBackground = true }.Start();
 
     static Result Run(Request request)
     {

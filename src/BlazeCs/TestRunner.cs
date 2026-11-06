@@ -21,7 +21,8 @@ sealed record TestHostRequest(string Framework, string Assembly, string? RunSett
 /// Runs the test projects whose inputs changed since they last passed in this daemon. xUnit (v2 and
 /// v3), NUnit and MSTest projects run in test host processes, longest first, like `dotnet test` runs
 /// projects side by side; the rest go through `dotnet test --no-build`. A host runs one assembly and
-/// exits, and a few wait already started, so a run doesn't wait for a runtime to start.
+/// exits. Idle hosts wait already started for each runtime the test projects target, as many as run at
+/// once, so a run doesn't wait for a runtime to start.
 /// </summary>
 sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
 {
@@ -33,7 +34,13 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
     const int MaxHosts = 4;
 
     // Idle hosts by runtime version: a test project runs on the runtime it targets, as under `dotnet test`.
-    readonly ConcurrentDictionary<string, ConcurrentBag<Process>> _idleHosts = [];
+    // "" is the host's own runtime, for an assembly whose runtimeconfig.json can't be read.
+    readonly Dictionary<string, List<Process>> _idleHosts = [];
+    // Idle hosts to keep per runtime: as many as run at once, but no more than its hosted test projects.
+    Dictionary<string, int> _targets = [];
+    // Held while hosts start, so concurrent refills don't overshoot a target.
+    readonly object _refilling = new();
+    bool _disposed;
     readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(PathComparer.Instance);
 
     /// <summary>
@@ -247,28 +254,86 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
         return new Outcome(passed, result.Skipped > 0 ? $"{result.Passed} passed, {result.Skipped} skipped" : $"{result.Passed} passed");
     }
 
-    /// <summary>An idle host for a runtime, and a new one started in its place for the next run.</summary>
-    Process TakeHost(string? runtime)
+    /// <summary>
+    /// Works out how many idle hosts each runtime needs from the test projects loaded, and starts the missing
+    /// ones in the background: the daemon calls it after loading and after each command, so a run finds them
+    /// ready.
+    /// </summary>
+    public void Prestart()
     {
-        var idleHosts = _idleHosts.GetOrAdd(runtime ?? "", _ => []);
-        Process? host = null;
-        while (host is null && idleHosts.TryTake(out var idle))
+        // Read now: the next command may change the units while the hosts start.
+        var targets = builder.Units.Where(u => Framework(u) is not null && InHost(u.Unit, _ => { }, out _))
+            .GroupBy(u => RuntimeVersion(builder.InstalledPath(u)))
+            .ToDictionary(g => g.Key, g => Math.Min(MaxHosts, g.Count()));
+        lock (_idleHosts)
+            _targets = targets;
+        Task.Run(() =>
         {
-            if (idle.HasExited)
-                idle.Dispose();
-            else
-                host = idle;
+            foreach (var runtime in targets.Keys)
+                Refill(runtime);
+        });
+    }
+
+    /// <summary>Starts hosts until a runtime has all its idle ones.</summary>
+    void Refill(string runtime)
+    {
+        lock (_refilling)
+        {
+            while (true)
+            {
+                lock (_idleHosts)
+                {
+                    if (_disposed || IdleHosts(runtime).Count >= _targets.GetValueOrDefault(runtime))
+                        return;
+                }
+                var host = StartHost(runtime);
+                lock (_idleHosts)
+                {
+                    if (!_disposed)
+                    {
+                        IdleHosts(runtime).Add(host);
+                        continue;
+                    }
+                }
+                Stop(host);
+                return;
+            }
         }
-        host ??= StartHost(runtime);
-        idleHosts.Add(StartHost(runtime));
-        return host;
+    }
+
+    List<Process> IdleHosts(string runtime)
+    {
+        if (!_idleHosts.TryGetValue(runtime, out var idle))
+            _idleHosts[runtime] = idle = [];
+        return idle;
+    }
+
+    /// <summary>An idle host for a runtime, or a new one if none is ready; the pool refills in the background.</summary>
+    Process TakeHost(string runtime)
+    {
+        Process? host = null;
+        lock (_idleHosts)
+        {
+            var idle = IdleHosts(runtime);
+            while (host is null && idle.Count > 0)
+            {
+                var candidate = idle[0];
+                idle.RemoveAt(0);
+                if (candidate.HasExited)
+                    candidate.Dispose();
+                else
+                    host = candidate;
+            }
+        }
+        _ = Task.Run(() => Refill(runtime));
+        return host ?? StartHost(runtime);
     }
 
     /// <summary>
     /// The runtime a test assembly targets, from its runtimeconfig.json: "10.0.0" for a release, the exact
-    /// version for a preview (as a preview SDK writes it); null (the host's own) when that can't be read.
+    /// version for a preview (as a preview SDK writes it); "" (the host's own) when that can't be read.
     /// </summary>
-    static string? RuntimeVersion(string assembly)
+    static string RuntimeVersion(string assembly)
     {
         try
         {
@@ -286,7 +351,7 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
             }
         }
         catch (Exception e) when (e is IOException or JsonException or KeyNotFoundException or FormatException or InvalidOperationException) { }
-        return null;
+        return "";
     }
 
     readonly Dictionary<string, string> _hostConfigs = [];
@@ -313,7 +378,7 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
         }
     }
 
-    Process StartHost(string? runtime)
+    Process StartHost(string runtime)
     {
         var start = new ProcessStartInfo("dotnet")
         {
@@ -322,7 +387,7 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
             RedirectStandardOutput = true,
         };
         var host = Path.Combine(AppContext.BaseDirectory, "blaze-cs-testhost.dll");
-        if (runtime is null)
+        if (runtime.Length == 0)
             start.ArgumentList.Add(host);
         else
         {
@@ -332,7 +397,7 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
         // Tests run with the runtime's defaults, as under `dotnet test`, not the daemon's tuning.
         foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
             start.Environment.Remove(variable);
-        // An idle host exits when its stdin closes, so the daemon exiting any way takes them with it.
+        // A host exits when its stdin closes, so the daemon dying any way takes every host with it.
         return Process.Start(start)!;
     }
 
@@ -345,10 +410,12 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
 
     public void Dispose()
     {
-        foreach (var idleHosts in _idleHosts.Values)
+        lock (_idleHosts)
         {
-            while (idleHosts.TryTake(out var host))
+            _disposed = true;
+            foreach (var host in _idleHosts.Values.SelectMany(idle => idle))
                 Stop(host);
+            _idleHosts.Clear();
         }
         foreach (var config in _hostConfigs.Values)
             File.Delete(config);
