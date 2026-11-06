@@ -21,11 +21,23 @@
 
 ## Install
 
-It needs the .NET 10 or 11 SDK for the solution you build. The repo itself pins SDK 10 and builds on it
-with [devbox](https://www.jetify.com/devbox):
+It needs the .NET 10 or 11 SDK for the solution you build. blaze-cs is a .NET tool, not on nuget.org yet:
+pack it from a clone and install it from the folder it was packed into.
 
 ```sh
 git clone https://github.com/igelkottegrodan/blaze-cs && cd blaze-cs
+dotnet pack src/BlazeCs -c Release          # artifacts/packages/blaze-cs.<version>.nupkg
+dotnet tool install -g blaze-cs --add-source artifacts/packages
+```
+
+Then `blaze-cs build` works in any directory on Linux and Windows. CI packs the tool on every run and
+uploads it as an artifact (`blaze-cs-tool-*`), which you can install from the same way. The package carries
+the CLI, the daemon and the test host, and no Roslyn: the daemon uses the one in your solution's SDK.
+Update with `dotnet tool update -g blaze-cs --add-source artifacts/packages`.
+
+To work on blaze-cs itself, the repo pins SDK 10 and builds on it with [devbox](https://www.jetify.com/devbox):
+
+```sh
 devbox shell          # .NET SDK 10.0.403, go-task, hyperfine, fontconfig
 task build
 ```
@@ -43,7 +55,7 @@ blaze-cs run [dotnet run args]  build, then dotnet run --no-build
 blaze-cs stop                   stop this solution's daemon
 ```
 
-Run it as `/path/to/blaze-cs/blaze-cs build` (on Windows, `\path\to\blaze-cs\blaze-cs.cmd build`).
+From a build in a clone instead of the tool, run `/path/to/blaze-cs/blaze-cs build` (on Windows, `\path\to\blaze-cs\blaze-cs.cmd build`).
 
 The first command starts a daemon for that solution and runs a real `dotnet build`, so it takes as long
 as one. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
@@ -119,7 +131,7 @@ its own:
 ## Contributing
 
 `task test` runs the unit tests (`tests/BlazeCs.Tests`). `task check` runs the fixture check
-(`tests/fixture/check.cs`). In devbox on WSL, `task check:windows` also runs the fixture check on native Windows, for SDK 10 and 11: it installs them into `%LOCALAPPDATA%\blaze-cs\dotnet`
+(`tests/fixture/check.cs`); `BLAZE_CS=<path>` runs it with another blaze-cs command, which is how CI checks the installed tool (`task pack`, then `dotnet tool install --tool-path`). In devbox on WSL, `task check:windows` also runs the fixture check on native Windows, for SDK 10 and 11: it installs them into `%LOCALAPPDATA%\blaze-cs\dotnet`
 on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 
 | Path | What |

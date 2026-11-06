@@ -11,6 +11,11 @@ tasks:
     cmds:
       - dotnet run --project tests/BlazeCs.Tests
 
+  pack:
+    desc: Pack the blaze-cs dotnet tool into artifacts/packages
+    cmds:
+      - dotnet pack src/BlazeCs -c Release -nologo -v:q
+
   check:
     desc: Edit the fixture solution every way blaze-cs handles and compare its output with dotnet build
     deps: [build]

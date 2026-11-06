@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -180,14 +181,14 @@ static class Program
         string[] arguments = ["exec", "--runtimeconfig", SdkRoslyn.CompilerRuntimeConfig(Path.GetDirectoryName(solutionPath)!),
             typeof(Program).Assembly.Location, "daemon", solutionPath];
         if (OperatingSystem.IsWindows())
-            StartDetachedOnWindows([Environment.ProcessPath!, .. arguments], log, environment);
+            StartDetachedOnWindows([DotnetHost(), .. arguments], log, environment);
         else
         {
             // Detached into its own session so it outlives this terminal and ignores its Ctrl+C.
             var start = new ProcessStartInfo("/bin/sh") { UseShellExecute = false };
             start.ArgumentList.Add("-c");
             start.ArgumentList.Add("log=$1; shift; setsid \"$@\" </dev/null >>\"$log\" 2>&1 &");
-            foreach (var argument in new[] { "sh", log, Environment.ProcessPath! }.Concat(arguments))
+            foreach (var argument in new[] { "sh", log, DotnetHost() }.Concat(arguments))
                 start.ArgumentList.Add(argument);
             foreach (var (name, value) in environment)
                 start.Environment[name] = value;
@@ -202,6 +203,18 @@ static class Program
             Thread.Sleep(20);
         }
         return null;
+    }
+
+    /// <summary>
+    /// The `dotnet` that runs this process. As an installed tool the process is the tool's own launcher, not
+    /// `dotnet`, so the muxer is found from the runtime's directory (`dotnet/shared/Microsoft.NETCore.App/x.y.z`).
+    /// </summary>
+    static string DotnetHost()
+    {
+        if (Path.GetFileNameWithoutExtension(Environment.ProcessPath) == "dotnet")
+            return Environment.ProcessPath!;
+        var root = Path.Combine(RuntimeEnvironment.GetRuntimeDirectory(), "..", "..", "..");
+        return Path.GetFullPath(Path.Combine(root, OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet"));
     }
 
     /// <summary>

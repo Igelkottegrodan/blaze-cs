@@ -3,6 +3,7 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>blaze-cs-testhost</AssemblyName>
     <RootNamespace>BlazeCs.TestHost</RootNamespace>
+    <UseAppHost>false</UseAppHost>
     <!-- The daemon starts the host on the runtime the test project targets (a runtimeconfig.json
          per major), so there is no roll-forward past this one. -->
   </PropertyGroup>

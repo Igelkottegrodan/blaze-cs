@@ -3,7 +3,16 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>blaze-cs</AssemblyName>
     <RootNamespace>BlazeCs</RootNamespace>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>blaze-cs</ToolCommandName>
+    <PackageId>blaze-cs</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Faster rebuilds for C# solutions: a warm daemon that recompiles only what an edit needs.</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- The test host runs from the CLI's directory, so the tool package carries it too. -->
+    <ProjectReference Include="..\BlazeCs.TestHost\BlazeCs.TestHost.csproj" />
+  </ItemGroup>
   <ItemGroup>
     <!-- Compiled against RoslynVersion (Directory.Build.props); at run time the daemon loads the Roslyn
          that ships with the solution's SDK (see SdkRoslyn), so its output matches csc byte for byte. -->
