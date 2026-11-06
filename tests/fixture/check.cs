@@ -303,7 +303,9 @@ void ProjectRemovedAndRestored()
     output = Run(blaze, "test");
     if (!Rebuilt(output).SetEquals([removed]))
         Fail($"project restored: expected blaze-cs to compile {removed} again:\n{output}");
-    RanTests("test after the project was restored", output, [removed]);
+    // Back as a test project: its bytes are what it last ran with (the edit is undone), so it is listed
+    // as unchanged since that run (#35) rather than run again.
+    RanTests("test after the project was restored", output, []);
     Console.WriteLine($"ok  project removed and restored: {removed} was dropped with the rest kept warm, never compiled or tested, and came back as a unit");
 }
 
