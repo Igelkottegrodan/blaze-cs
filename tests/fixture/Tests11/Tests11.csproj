@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Only in the solution under a .NET 11 SDK (check.cs): net11.0 does not restore on an older one. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The runtime the tests must report: the major version of this project's own target framework. -->
+    <AssemblyMetadata Include="TargetRuntimeMajor" Value="$([System.Version]::Parse($(TargetFrameworkVersion.Substring(1))).Major)" />
+  </ItemGroup>
+</Project>

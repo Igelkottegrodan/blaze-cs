@@ -3,9 +3,8 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>blaze-cs-testhost</AssemblyName>
     <RootNamespace>BlazeCs.TestHost</RootNamespace>
-    <!-- A test project may target a newer runtime than this host does (net11.0 on a net10.0 host
-         cannot load), so run on the newest one installed. -->
-    <RollForward>LatestMajor</RollForward>
+    <!-- The daemon starts the host on the runtime the test project targets (a runtimeconfig.json
+         per major), so there is no roll-forward past this one. -->
   </PropertyGroup>
   <ItemGroup>
     <!-- Test projects often need ASP.NET Core; the shared framework must be in the host's
