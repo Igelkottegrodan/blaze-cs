@@ -65,7 +65,7 @@ static class SdkRoslyn
         Path.Combine(FindSdkDirectory(solutionDir), "Roslyn", "bincore", "csc.runtimeconfig.json");
 
     /// <summary>The SDK `dotnet build` would pick in this directory, honouring global.json.</summary>
-    static string FindSdkDirectory(string solutionDir)
+    internal static string FindSdkDirectory(string solutionDir)
     {
         var version = Run(solutionDir, "--version").Trim();
         foreach (var line in Run(solutionDir, "--list-sdks").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))

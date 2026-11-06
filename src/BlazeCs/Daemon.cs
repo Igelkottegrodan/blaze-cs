@@ -25,13 +25,55 @@ static class Daemon
         listener.Bind(new UnixDomainSocketEndPoint(socketPath));
         listener.Listen(16);
         Console.WriteLine($"{DateTime.Now:O} serving {solutionPath} on {socketPath} (pid {Environment.ProcessId}, exits after {IdleTimeout.TotalSeconds:F0} s idle)");
+        var builder = new SolutionBuilder(solutionPath, sdkDirectory);
+        var collector = new IdleCollector(IdleCollector.DefaultDelay, IdleCollector.CollectAndLog);
+        // Commands and compiles through the pipe overlap: the idle collection waits for the last of them to end.
+        var busy = 0;
+        void Busy()
+        {
+            lock (collector)
+            {
+                if (busy++ == 0)
+                    collector.Busy();
+            }
+        }
+        void Idle()
+        {
+            lock (collector)
+            {
+                if (--busy == 0)
+                    collector.Idle(builder.Idling);
+            }
+        }
+        var pipeName = CompilerServer.PipeName(solutionPath);
+        CompilerServer? server = null;
+        if (CompilerServer.Enabled)
+        {
+            // The Csc task sends the commit of the SDK's Roslyn, which the SDK's server (VBCSCompiler, beside the
+            // compiler the daemon loaded) compares with its own.
+            var bincore = Path.GetDirectoryName(typeof(Microsoft.CodeAnalysis.Compilation).Assembly.Location)!;
+            var compilerHash = CompilerServer.CommitHash(Path.Combine(bincore, "VBCSCompiler.dll")) ?? "";
+            server = CompilerServer.Start(pipeName, compilerHash, request =>
+                {
+                    Busy();
+                    try { return builder.Serve(request, compilerHash); }
+                    finally { Idle(); }
+                },
+                note => Console.WriteLine($"{DateTime.Now:O} compiler server: {note}"));
+            if (server is not null)
+                Console.WriteLine($"{DateTime.Now:O} compiler server on pipe {pipeName} (Roslyn {compilerHash}): dotnet build -p:SharedCompilationId={pipeName} compiles through this daemon");
+        }
+        else
+            Console.WriteLine($"{DateTime.Now:O} compiler server off (BLAZE_CS_COMPILER_SERVER=0)");
+
         // Before any reply that ends this daemon: once the client has its answer it may start a daemon that
         // binds the same path, and disposing the listener after that deletes the file by its path too,
-        // leaving that daemon unreachable (the next command starts another beside it).
+        // leaving that daemon unreachable (the next command starts another beside it). The pipe goes with it.
         void CloseSocket()
         {
             listener.Dispose();
             File.Delete(socketPath);
+            server?.Dispose();
         }
 
         // Projects compile in parallel and Roslyn parallelizes inside each one; both block on the
@@ -39,27 +81,33 @@ static class Daemon
         ThreadPool.GetMinThreads(out _, out var completionThreads);
         ThreadPool.SetMinThreads(Environment.ProcessorCount * 4, completionThreads);
 
-        var builder = new SolutionBuilder(solutionPath, sdkDirectory);
         using var tests = new TestRunner(builder);
-        var collector = new IdleCollector(IdleCollector.DefaultDelay, IdleCollector.CollectAndLog);
         var loaded = false;
+        DateTime lastCommand;
 
         while (true)
         {
-            Socket accepted;
-            using (var idle = new CancellationTokenSource(IdleTimeout))
+            // Idle time counts from the end of the last command: a long one (a first load) doesn't use it up.
+            lastCommand = DateTime.UtcNow;
+            Socket? accepted = null;
+            while (accepted is null)
             {
-                try { accepted = listener.AcceptAsync(idle.Token).AsTask().GetAwaiter().GetResult(); }
-                catch (OperationCanceledException)
+                // Builds that compile through the pipe keep the daemon up too.
+                var lastUse = server is null || server.LastRequest < lastCommand ? lastCommand : server.LastRequest;
+                var left = lastUse + IdleTimeout - DateTime.UtcNow;
+                if (left <= TimeSpan.Zero)
                 {
                     Console.WriteLine($"{DateTime.Now:O} no command for {IdleTimeout.TotalSeconds:F0} s; exiting");
                     CloseSocket();
                     return 0;
                 }
+                using var idle = new CancellationTokenSource(left);
+                try { accepted = listener.AcceptAsync(idle.Token).AsTask().GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { }
             }
             // First of all, so a command never waits for it; then a collection already running ends first.
             builder.CancelBackgroundAnalysis();
-            collector.Busy();
+            Busy();
             using var client = accepted;
             using var stream = new NetworkStream(client);
             using var reader = new StreamReader(stream);
@@ -76,6 +124,9 @@ static class Daemon
             }
 
             int exitCode;
+            // Released before the exit code goes out: a build that compiles through the pipe right after the
+            // command returns must find the daemon free.
+            var command = builder.Command();
             try
             {
                 // The socket goes before the reply (see CloseSocket).
@@ -103,6 +154,8 @@ static class Daemon
                     loaded = builder.Load(Log, warmUpLater: true);
                     if (loaded)
                         tests.Prestart();
+                    if (loaded && server is not null)
+                        Log($"blaze-cs: dotnet build -p:SharedCompilationId={pipeName} compiles through this daemon");
                     exitCode = !loaded ? 1 : request?.Command switch
                     {
                         // --all reports every analyzer's warnings, so it waits for the warm-up.
@@ -133,13 +186,17 @@ static class Daemon
                 Log($"blaze-cs: internal error: {e.Message} (details in .blaze-cs/daemon.log)");
                 exitCode = 1;
             }
+            finally
+            {
+                command.Dispose();
+            }
 
             try { writer.WriteLine($"{DaemonClient.ExitPrefix}{exitCode}"); }
             catch (IOException) { }
             if (loaded)
                 builder.AnalyzeWhenIdle();
             // Once the idle work ends: the warm-up, then the background analysis, which allocates heavily.
-            collector.Idle(builder.Idling);
+            Idle();
         }
     }
 }

@@ -249,6 +249,15 @@ sealed class ProjectCompiler
             changed = true;
         }
 
+        // A config file the arguments name and that is gone: the build drops it from them. Edits to one show up
+        // as a changed MSBuild input, but not the deletion of one that came after the last load (a build
+        // through the pipe brought in its arguments).
+        if (ConfigPaths.FirstOrDefault(path => !File.Exists(path)) is { } deletedConfig)
+        {
+            StaleArguments = $"{Path.GetRelativePath(Unit.ProjectDirectory, deletedConfig)} was deleted";
+            changed = true;
+        }
+
         foreach (var (path, stamp) in _inputs.ToList())
         {
             var current = FileStamp.Of(path);
@@ -289,6 +298,92 @@ sealed class ProjectCompiler
         return true;
     }
 
+    /// <summary>Whether csc prints its diagnostics in UTF-8 (/utf8output), which the Csc task reads its output as.</summary>
+    public bool Utf8Output => _args.Utf8Output;
+
+    /// <summary>
+    /// Why only csc can answer a compile request for this unit, or null if the daemon can: csc would write a
+    /// file the daemon doesn't.
+    /// </summary>
+    public string? CscOnly()
+    {
+        if (_args.ErrorLogOptions is not null)
+            return "it writes an /errorlog, which only csc does";
+        if (!string.IsNullOrEmpty(_args.TouchedFilesPath))
+            return "it writes /touchedfiles, which only csc does";
+        if (Unit.Arguments.Any(a => a.StartsWith("/generatedfilesout:", StringComparison.OrdinalIgnoreCase)))
+            return "it writes generated files (/generatedfilesout), which only csc does";
+        return null;
+    }
+
+    /// <summary>
+    /// The analysis csc runs beside its compile: every analyzer of the project on the whole compilation,
+    /// generated files included, with the project's options, and its diagnostic suppressors applied to what
+    /// the analyzers and the compiler report (only the suppressors under /skipanalyzers+). Runs off the
+    /// calling thread, alongside the emit. Its result holds the compiler's diagnostics too, and those the
+    /// suppressors silenced, marked suppressed (see <see cref="AsCsc"/>). An analyzer that throws is reported
+    /// as csc reports it (AD0001). Null if the project has neither analyzers nor suppressors.
+    /// </summary>
+    public Task<ImmutableArray<Diagnostic>>? AnalyzeAsCsc(Prepared prepared, CancellationToken cancellationToken = default)
+    {
+        var all = _analyzerCache.Analyzers(AnalyzerPaths, suppressorsOnly: _args.SkipAnalyzers);
+        if (all.IsEmpty)
+            return null;
+        // As csc without /errorlog, only analyzers that can report a warning or an error here, and suppressors.
+        var mayWarn = _config.MayWarn(prepared.Compilation.SyntaxTrees.Select(tree => tree.FilePath), _args.CompilationOptions.SpecificDiagnosticOptions);
+        ImmutableArray<DiagnosticAnalyzer> analyzers = [.. all.Where(analyzer => analyzer is DiagnosticSuppressor || Reports(analyzer, mayWarn))];
+        if (analyzers.IsEmpty)
+            return null;
+        var options = new CompilationWithAnalyzersOptions(
+            new AnalyzerOptions([.. _additionalTexts.Values], _config.Options()),
+            onAnalyzerException: null,
+            concurrentAnalysis: true,
+            logAnalyzerExecutionTime: false,
+            reportSuppressedDiagnostics: true);
+        return Task.Run(() => prepared.Compilation.WithAnalyzers(analyzers, options).GetAllDiagnosticsAsync(cancellationToken), cancellationToken);
+    }
+
+    /// <summary>Whether an analyzer has a diagnostic csc could report; one whose descriptors can't be read runs, as in csc.</summary>
+    static bool Reports(DiagnosticAnalyzer analyzer, Func<DiagnosticDescriptor, bool> mayWarn)
+    {
+        try { return analyzer.SupportedDiagnostics.Any(mayWarn); }
+        catch (Exception) { return true; }
+    }
+
+    /// <summary>
+    /// What csc prints for a compile: the emit's diagnostics and the analysis's (<see cref="AnalyzeAsCsc"/>),
+    /// each once, without hidden and info ones (csc prints those only to an /errorlog) and those a suppressor or
+    /// #pragma silenced.
+    /// </summary>
+    public static List<Diagnostic> AsCsc(ImmutableArray<Diagnostic> emitted, ImmutableArray<Diagnostic> analyzed)
+    {
+        static string Key(Diagnostic d) =>
+            $"{d.Id}|{d.Location.SourceTree?.FilePath}|{d.Location.SourceSpan}|{d.GetMessage(System.Globalization.CultureInfo.InvariantCulture)}";
+        var emittedKeys = emitted.Select(Key).ToHashSet(StringComparer.Ordinal);
+        var suppressed = analyzed.Where(d => d.IsSuppressed).Select(Key).ToHashSet(StringComparer.Ordinal);
+        return [.. emitted.Where(d => !suppressed.Contains(Key(d)))
+            .Concat(analyzed.Where(d => !emittedKeys.Contains(Key(d))))
+            .Where(d => d.Severity >= DiagnosticSeverity.Warning && !d.IsSuppressed)
+            .DistinctBy(Key)];
+    }
+
+    /// <summary>
+    /// Whether csc reports this diagnostic as an error. The daemon reports warnings-as-errors (from the
+    /// command line or config files) as warnings; csc fails on them.
+    /// </summary>
+    public bool ErrorUnderCsc(Diagnostic diagnostic)
+    {
+        if (diagnostic.Severity == DiagnosticSeverity.Error)
+            return true;
+        if (diagnostic.Severity != DiagnosticSeverity.Warning || diagnostic.IsSuppressed)
+            return false;
+        var options = _args.CompilationOptions;
+        var specific = options.SpecificDiagnosticOptions.GetValueOrDefault(diagnostic.Id, ReportDiagnostic.Default);
+        return specific == ReportDiagnostic.Error
+            || _config.MakesError(diagnostic.Location.SourceTree?.FilePath, diagnostic.Id)
+            || options.GeneralDiagnosticOption == ReportDiagnostic.Error && specific == ReportDiagnostic.Default;
+    }
+
     static string HashOf(string path) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)));
 
     /// <summary>
@@ -296,7 +391,11 @@ sealed class ProjectCompiler
     /// added that csc didn't get goes, and a source or additional file on disk that csc didn't get is one
     /// MSBuild excludes. Then refreshes as usual. True if anything the unit compiles from changed.
     /// </summary>
-    public bool Realign()
+    /// <param name="analyzed">
+    /// Whether that build analyzed every file as it is now: one that ran outside the daemon did. A compile
+    /// through the pipe, which realigns before it compiles, has analyzed nothing yet (see <see cref="AnalyzedAsCsc"/>).
+    /// </param>
+    public bool Realign(bool analyzed = true)
     {
         var order = new List<string>();
         var changed = false;
@@ -307,6 +406,7 @@ sealed class ProjectCompiler
                 if (!File.Exists(path))
                     continue;
                 _sources[path] = SourceFile.Read(path, this);
+                _unanalyzed.Add(path);
                 changed = true;
             }
             order.Add(path);
@@ -328,11 +428,19 @@ sealed class ProjectCompiler
         _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(PathComparer.Instance);
         changed = Refresh() | changed;
         // The real build analyzed every file as it is now.
-        _unanalyzed.Clear();
+        if (analyzed)
+            _unanalyzed.Clear();
         if (changed)
             _version = new object();
         return changed;
     }
+
+    /// <summary>
+    /// A compile through the pipe wrote its outputs, with what csc's analysis (<see cref="AnalyzeAsCsc"/>) found
+    /// on every file of it: the files as it compiled them are analyzed, as after a build outside the daemon.
+    /// </summary>
+    public void AnalyzedAsCsc(Prepared prepared) =>
+        _unanalyzed.RemoveWhere(path => _sources.TryGetValue(path, out var source) && prepared.Compilation.ContainsSyntaxTree(source.Tree));
 
     /// <summary>Picks up new images of the units this one references; true if any reference changed.</summary>
     public bool RefreshReferences()
