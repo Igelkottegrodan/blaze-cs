@@ -84,15 +84,33 @@ static class Daemon
                     return 0;
                 }
 
-                // Loading runs the first `dotnet build`, so its output belongs to the first command.
+                // Loading runs the first `dotnet build`, so its output belongs to the first command. That build
+                // is the command's build: the command returns once the solution is loaded (tests run on what
+                // dotnet build wrote), and the warm-up runs on until the next command waits for it.
                 if (!loaded)
-                    loaded = builder.Load(Log);
-                exitCode = !loaded ? 1 : request?.Command switch
                 {
-                    "build" => builder.Build(Log) ? 0 : 1,
-                    "test" => builder.Build(Log) ? tests.Run(request is { All: true }, Log) : 1,
-                    _ => 2,
-                };
+                    loaded = builder.Load(Log, warmUpLater: true);
+                    if (loaded)
+                        tests.Prestart();
+                    exitCode = !loaded ? 1 : request?.Command switch
+                    {
+                        "build" => 0,
+                        "test" => tests.Run(request is { All: true }, Log),
+                        _ => 2,
+                    };
+                }
+                else
+                {
+                    exitCode = request?.Command switch
+                    {
+                        "build" => builder.Build(Log) ? 0 : 1,
+                        "test" => builder.Build(Log) ? tests.Run(request is { All: true }, Log) : 1,
+                        _ => 2,
+                    };
+                }
+                // A build may have reloaded the solution, and a run took hosts.
+                if (loaded)
+                    tests.Prestart();
             }
             catch (Exception e)
             {
