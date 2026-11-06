@@ -58,6 +58,10 @@ cd /path/to/your/solution
 
 On Windows, build it with the .NET SDK (`dotnet build BlazeCs.slnx`) and run `\path\to\blaze-cs\blaze-cs.cmd build`.
 
+To work on blaze-cs, `task check` runs the fixture check (`tests/fixture/check.cs`). In devbox on WSL,
+`task check:windows` also runs it on native Windows, for SDK 10 and 11: it installs them into
+`%LOCALAPPDATA%\blaze-cs\dotnet` on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
+
 ## Numbers
 
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.
