@@ -13,7 +13,7 @@ namespace BlazeCs;
 /// sources changed and, in dependency order, the ones whose references' public API changed, then writes
 /// the same files `dotnet build` would. Anything it can't do alone goes through a real `dotnet build`.
 /// </summary>
-sealed class SolutionBuilder
+sealed partial class SolutionBuilder
 {
     readonly string _solutionPath;
     readonly string _solutionDirectory;
@@ -138,30 +138,29 @@ sealed class SolutionBuilder
             .ToDictionary(i => i.Path, i => i.Image, PathComparer.Instance);
 
         var held = _units.ToDictionary(c => c.Unit.AssemblyPath, PathComparer.Instance);
-        var compilers = units.Values.AsParallel()
-            .Select(unit => held.TryGetValue(unit.AssemblyPath, out var kept) && kept.Matches(unit)
-                ? kept
-                : new ProjectCompiler(unit, ResolveReference, _analyzers))
-            .ToList();
-        var byImage = compilers.ToDictionary(c => c.ImagePath, PathComparer.Instance);
-        _producers = _imagePaths.ToDictionary(p => p.Key, p => byImage[p.Value], PathComparer.Instance);
-        _dependencies = compilers.ToDictionary(c => c, c => c.References
-            .Select(r => _producers.GetValueOrDefault(r.Reference))
-            .OfType<ProjectCompiler>()
-            .Distinct()
-            .ToList());
-        _dependents = compilers.ToDictionary(c => c, c => compilers.Where(d => _dependencies[d].Contains(c)).ToList());
-        _units = TopologicalOrder(compilers);
+        List<ProjectCompiler> compilers;
+        try
+        {
+            compilers = units.Values.AsParallel()
+                .Select(unit => held.TryGetValue(unit.AssemblyPath, out var kept) && kept.Matches(unit)
+                    ? kept
+                    : new ProjectCompiler(unit, ResolveReference, _analyzers))
+                .ToList();
+        }
+        // Cached arguments name an input that is gone (a deleted .editorconfig, say) while the build that
+        // dropped it ran outside the daemon, and this one compiled nothing to log newer ones: log them all.
+        catch (AggregateException e) when (!fresh && e.InnerExceptions.All(i => i is FileNotFoundException or DirectoryNotFoundException))
+        {
+            log($"blaze-cs: cached compiler arguments name a file that is gone ({e.InnerExceptions[0].Message}); running dotnet build --no-incremental");
+            return Load(log, fresh: true);
+        }
+        Assemble(compilers);
         // The units csc ran for in this build (but not in the daemon's first, which started it), and the ones
         // still pending, by their assembly.
         var pending = _wholeAnalysisPending.Select(u => u.AssemblyPath).ToHashSet(PathComparer.Instance);
         if (held.Count > 0)
             pending.UnionWith(info.Units.Select(u => u.AssemblyPath));
         _wholeAnalysisPending = [.. compilers.Where(c => pending.Contains(c.AssemblyPath))];
-        _analyzerUnits = compilers.SelectMany(c => c.AnalyzerPaths)
-            .Select(path => _producers.GetValueOrDefault(path))
-            .OfType<ProjectCompiler>()
-            .ToHashSet();
         _msbuildInputs = MSBuildInputs();
         foreach (var gone in _surfaces.Keys.Concat(_lastDuration.Keys).Except(compilers).ToList())
         {
@@ -203,6 +202,24 @@ sealed class SolutionBuilder
             return true;
         }
         return !StaleAfterWarmUp(log, verify, logged, fresh) || Load(log, fresh: true);
+    }
+
+    /// <summary>The graph of these units: who produces each image, who references whom, and in what order they build.</summary>
+    void Assemble(List<ProjectCompiler> compilers)
+    {
+        var byImage = compilers.ToDictionary(c => c.ImagePath, PathComparer.Instance);
+        _producers = _imagePaths.ToDictionary(p => p.Key, p => byImage[p.Value], PathComparer.Instance);
+        _dependencies = compilers.ToDictionary(c => c, c => c.References
+            .Select(r => _producers.GetValueOrDefault(r.Reference))
+            .OfType<ProjectCompiler>()
+            .Distinct()
+            .ToList());
+        _dependents = compilers.ToDictionary(c => c, c => compilers.Where(d => _dependencies[d].Contains(c)).ToList());
+        _units = TopologicalOrder(compilers);
+        _analyzerUnits = compilers.SelectMany(c => c.AnalyzerPaths)
+            .Select(path => _producers.GetValueOrDefault(path))
+            .OfType<ProjectCompiler>()
+            .ToHashSet();
     }
 
     /// <summary>The first load's warm-up, which runs on after the command that started the daemon returns.</summary>
@@ -394,11 +411,35 @@ sealed class SolutionBuilder
     {
         if (_warmUp is { IsCompleted: false })
             return;
-        _background.Start([.. _units.Where(_wholeAnalysisPending.Contains).Select(unit =>
+        // Compiles through the pipe run beside it (see Serve): each unit is taken while none compiles it, and one
+        // compiling now is left for the next idle, unless that compile reports on it first.
+        var units = new List<(ProjectCompiler, Func<CancellationToken, Task<(object, ImmutableArray<Diagnostic>)>>)>();
+        _serving.EnterReadLock();
+        try
         {
-            var analysis = unit.WholeAnalysis(compilationEndOnly: true);
-            return (unit, (Func<CancellationToken, Task<(object, ImmutableArray<Diagnostic>)>>)(async token => (analysis.Version, await analysis.Run(token).ConfigureAwait(false))));
-        })]);
+            List<ProjectCompiler> pending;
+            lock (_wholeAnalysisPending)
+                pending = [.. _units.Where(_wholeAnalysisPending.Contains)];
+            foreach (var unit in pending)
+            {
+                if (!Monitor.TryEnter(unit))
+                    continue;
+                try
+                {
+                    var analysis = unit.WholeAnalysis(compilationEndOnly: true);
+                    units.Add((unit, async token => (analysis.Version, await analysis.Run(token).ConfigureAwait(false))));
+                }
+                finally
+                {
+                    Monitor.Exit(unit);
+                }
+            }
+        }
+        finally
+        {
+            _serving.ExitReadLock();
+        }
+        _background.Start(units);
     }
 
     /// <summary>The background analysis the last idle started, until it ends or a command cancels it.</summary>
@@ -771,18 +812,19 @@ sealed class SolutionBuilder
         var content = OutputContent.Of(bytes);
         if (_published.Holds(path, content))
             return;
-        void Replace(string target)
-        {
-            // Replace rather than overwrite: a running test host may have the old file mapped.
-            var temporary = target + ".blaze-cs.tmp";
-            File.WriteAllBytes(temporary, bytes);
-            File.Move(temporary, target, overwrite: true);
-        }
         // The path itself last: while it holds the bytes, so does every copy, and a write that failed
         // partway is done again in full.
-        Parallel.ForEach(Closure(path).Skip(1), Replace);
-        Replace(path);
+        Parallel.ForEach(Closure(path).Skip(1), copy => Replace(copy, bytes));
+        Replace(path, bytes);
         _published.Wrote(path, content);
+    }
+
+    /// <summary>Writes a file by replacing it rather than overwriting it: a running test host may have the old file mapped.</summary>
+    static void Replace(string path, byte[] bytes)
+    {
+        var temporary = path + ".blaze-cs.tmp";
+        File.WriteAllBytes(temporary, bytes);
+        File.Move(temporary, path, overwrite: true);
     }
 
     /// <summary>What the daemon last wrote to or verified in each output file.</summary>

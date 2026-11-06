@@ -171,6 +171,20 @@ its own:
   Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon. After the real
   build, every project whose compiler arguments didn't change stays compiled in memory; only the others
   are loaded again, and only projects whose assembly that build changed are compiled once to check it.
+- **`dotnet build` can compile through it too.** The daemon serves the compiler-server pipe that the SDK's
+  `Csc` task sends each compile to (the protocol of the SDK's own `VBCSCompiler`). Build with
+  `-p:SharedCompilationId=<name>`, where the first `blaze-cs build` prints the name (the same for every daemon
+  of the solution, so it can go in a `Directory.Build.props`), and `dotnet build`, `dotnet test` or an IDE
+  build compiles each of the solution's projects from the daemon's warm compilation and writes what csc
+  would. The daemon takes each project's compiler arguments from the request, so such a build keeps it
+  current instead of leaving its cached arguments stale. Each such compile runs the project's analyzers
+  and suppressors over the whole project, compilation-end rules included, as csc does, and reports what
+  csc would; the background analysis then has nothing left to report on that project. A compile it can't
+  answer as csc would is rejected, and the task runs csc itself: another solution's project, a Csc task
+  from another Roslyn (compiler hash), a compile with a warning csc makes an error (warnings as errors, an
+  `error` severity in a config file), or any compile while a `blaze-cs` command runs. A `VBCSCompiler` that
+  a build started on the pipe while no daemon ran is shut down when the next daemon starts.
+  `BLAZE_CS_COMPILER_SERVER=0` in the environment the daemon starts in turns the pipe off.
 
 ## Good to know
 
@@ -195,7 +209,8 @@ its own:
   compiler's still only for the projects it compiles). Diagnostic suppressors don't silence compiler
   warnings.
   Warnings-as-errors, and rules set to `error`, are reported as warnings and don't fail the build. Run
-  `dotnet build` or CI for every warning.
+  `dotnet build` or CI for every warning: a `dotnet build` through the daemon's pipe reports them all as csc
+  does, analyzers on every file and errors failing the build.
 - **Skipped dependents' PDBs:** a dependent the API diff skipped keeps its DLL. Its code is identical, but
   its PDB still records the old ID of the reference that changed, so its bytes differ from a fresh build
   until the next `dotnet build` recompiles it.
@@ -231,11 +246,11 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | Path | What |
 |---|---|
 | `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
-| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
+| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner, compiler-server pipe (`CompilerServer`, `CompilerServerProtocol`) |
 | `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile, each project's `RunSettingsFilePath` |
 | `src/BlazeCs.TestHost` | the test host (xUnit v2 and v3, NUnit, MSTest), and its protocol with the daemon (`Protocol.cs`): one run, then, started with `DOTNET_MODIFIABLE_ASSEMBLIES=debug`, metadata deltas applied and the tests run again in the same process (the daemon sends none yet) |
 | `scripts/` | benchmark edits, timing, and output verification |
-| `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, what counts as a dependent naming an identifier, and the test host applying a delta (with `tests/TestHostKits`, each test framework's packages) |
+| `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, what counts as a dependent naming an identifier, the test host applying a delta (with `tests/TestHostKits`, each test framework's packages), and the compiler-server wire format against the SDK's own implementation |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
 | `docs/brand/outrun/` | the header above and `gen.cs`, which draws it (`dotnet run docs/brand/outrun/gen.cs`) |
 
