@@ -3,6 +3,7 @@ using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 
 namespace BlazeCs;
@@ -18,7 +19,7 @@ sealed class SolutionBuilder
     readonly string _solutionDirectory;
     readonly string _stateDirectory;
     readonly string _sdkDirectory;
-    readonly GeneratorCache _generators;
+    readonly AnalyzerCache _analyzers;
     readonly ConcurrentDictionary<(string, MetadataReferenceProperties), MetadataReference> _external = new();
 
     List<ProjectCompiler> _units = [];
@@ -44,7 +45,7 @@ sealed class SolutionBuilder
         _stateDirectory = Path.Combine(_solutionDirectory, ".blaze-cs");
         _sdkDirectory = sdkDirectory;
         Directory.CreateDirectory(_stateDirectory);
-        _generators = new GeneratorCache(Path.Combine(_stateDirectory, "shadow"));
+        _analyzers = new AnalyzerCache(Path.Combine(_stateDirectory, "shadow"));
     }
 
     public IReadOnlyList<ProjectCompiler> Units => _units;
@@ -125,7 +126,7 @@ sealed class SolutionBuilder
         var compilers = units.Values.AsParallel()
             .Select(unit => held.TryGetValue(unit.AssemblyPath, out var kept) && kept.Matches(unit)
                 ? kept
-                : new ProjectCompiler(unit, ResolveReference, _generators))
+                : new ProjectCompiler(unit, ResolveReference, _analyzers))
             .ToList();
         var byImage = compilers.ToDictionary(c => c.ImagePath, PathComparer.Instance);
         _producers = _imagePaths.ToDictionary(p => p.Key, p => byImage[p.Value], PathComparer.Instance);
@@ -311,9 +312,10 @@ sealed class SolutionBuilder
             run.Schedule(unit, change);
         run.Wait();
 
-        var output = run.Diagnostics.SelectMany(r => r.Value
+        // As csc prints them: an analyzer's rules with their help link.
+        var output = run.Diagnostics.Concat(run.AnalyzerDiagnostics).SelectMany(r => r.Value
             .Where(d => d.Severity >= DiagnosticSeverity.Warning)
-            .Select(d => $"{d} [{r.Key.Unit.ProjectFile}]"));
+            .Select(d => $"{CSharpDiagnosticFormatter.Instance.Format(d, System.Globalization.CultureInfo.CurrentUICulture)} [{r.Key.Unit.ProjectFile}]"));
         foreach (var line in output.Order())
             log(line);
         var rebuilt = run.Diagnostics.Keys.ToList();
@@ -329,11 +331,13 @@ sealed class SolutionBuilder
         }
         var times = run.Times;
         var unaffected = run.Unaffected.Count == 0 ? "" : $"; {run.Unaffected.Count} dependents checked and unaffected";
+        var analyzed = run.AnalyzerTimes.IsEmpty ? ""
+            : $", analyzers {run.AnalyzerTimes.Values.Sum(t => t.Time.TotalMilliseconds):F0} ms on {run.AnalyzerTimes.Values.Sum(t => t.Files)} file(s)";
         log(rebuilt.Count == 0
             ? $"blaze-cs: up to date ({stopwatch.ElapsedMilliseconds} ms)"
             : $"blaze-cs: rebuilt {string.Join(", ", rebuilt.Select(u => u.Unit.Name).Order())} in {stopwatch.ElapsedMilliseconds} ms "
               + $"(scan {scanned} ms; {run.Compiles} compiles; summed over projects: compile {times.Values.Sum(t => t.Compile.TotalMilliseconds):F0} ms, "
-              + $"write {times.Values.Sum(t => t.Write.TotalMilliseconds):F0} ms{unaffected})");
+              + $"write {times.Values.Sum(t => t.Write.TotalMilliseconds):F0} ms{analyzed}{unaffected})");
         if (times.Count > 1)
             log("blaze-cs: slowest: " + string.Join(", ", times.OrderByDescending(t => t.Value.Compile).Take(5)
                 .Select(t => $"{t.Key.Unit.Name} {t.Value.Compile.TotalMilliseconds:F0} ms (generators {t.Value.Generators.TotalMilliseconds:F0})")));
@@ -358,6 +362,13 @@ sealed class SolutionBuilder
         int _compiles;
 
         public ConcurrentDictionary<ProjectCompiler, ImmutableArray<Diagnostic>> Diagnostics { get; } = new();
+        /// <summary>
+        /// What the analyzers reported on the files each unit's written compiles were the first to see. Kept
+        /// apart from <see cref="Diagnostics"/>, which a later compile of the unit in this build replaces.
+        /// </summary>
+        public ConcurrentDictionary<ProjectCompiler, ImmutableArray<Diagnostic>> AnalyzerDiagnostics { get; } = new();
+        /// <summary>How long each unit's analysis ran (alongside its emit), and on how many files.</summary>
+        public ConcurrentDictionary<ProjectCompiler, (TimeSpan Time, int Files)> AnalyzerTimes { get; } = new();
         public ConcurrentDictionary<ProjectCompiler, (TimeSpan Compile, TimeSpan Generators, TimeSpan Write)> Times { get; } = new();
         /// <summary>Units whose compile or write failed; their diagnostics say why.</summary>
         public ConcurrentDictionary<ProjectCompiler, bool> Failed { get; } = new();
@@ -480,8 +491,9 @@ sealed class SolutionBuilder
             Interlocked.Increment(ref _compiles);
 
             // Dependents need the new surface only if the image changes, but then they need it at once:
-            // build it while the emit runs.
+            // build it while the emit runs. So do the analyzers, on the files this compile is the first to see.
             var surface = builder._dependents[unit].Count > 0 ? Task.Run(() => new ApiSurface(prepared.Compilation)) : null;
+            var analysis = unit.Analyze(prepared);
             var (emitted, diagnostics) = unit.Emit(prepared);
             var compiled = Stopwatch.GetElapsedTime(started);
             builder._lastDuration[unit] = compiled;
@@ -542,6 +554,16 @@ sealed class SolutionBuilder
                 written.SetResult();
             }
             Times[unit] = (compiled, unit.LastGeneratorTime, Stopwatch.GetElapsedTime(started));
+
+            // Reported once the outputs are written, so a failed compile or write reports its files' warnings
+            // with the next build that writes them. Dependents are on their way already.
+            if (analysis is not null)
+            {
+                var (found, time) = analysis.Result.GetAwaiter().GetResult();
+                AnalyzerDiagnostics.AddOrUpdate(unit, found, (_, earlier) => earlier.AddRange(found));
+                AnalyzerTimes.AddOrUpdate(unit, (time, analysis.Trees.Count), (_, earlier) => (earlier.Time + time, earlier.Files + analysis.Trees.Count));
+                unit.Analyzed(analysis);
+            }
         }
 
         /// <summary>Each unit's latest output writes, done once its files are on disk or have failed.</summary>
@@ -818,28 +840,5 @@ sealed class SolutionBuilder
 
         public void Write(IEnumerable<CompileUnit> units) =>
             File.WriteAllText(path, JsonSerializer.Serialize(units.OrderBy(u => u.AssemblyPath, StringComparer.Ordinal)));
-    }
-}
-
-/// <summary>
-/// Source generators by analyzer path, shared by every unit; analyzers are skipped. Loaded once, and
-/// again after the file changes: a generator project in the solution was built again.
-/// </summary>
-sealed class GeneratorCache(string shadowDirectory)
-{
-    readonly AnalyzerLoader _loader = new(shadowDirectory);
-    readonly ConcurrentDictionary<string, (FileStamp Stamp, ImmutableArray<ISourceGenerator> Generators)> _byPath = new(PathComparer.Instance);
-
-    public ImmutableArray<ISourceGenerator> For(IEnumerable<string> analyzerPaths) =>
-        analyzerPaths.Distinct(PathComparer.Instance).SelectMany(path => Load(path)).ToImmutableArray();
-
-    ImmutableArray<ISourceGenerator> Load(string path)
-    {
-        var stamp = FileStamp.Of(path);
-        if (_byPath.TryGetValue(path, out var cached) && cached.Stamp == stamp)
-            return cached.Generators;
-        var generators = new AnalyzerFileReference(path, _loader).GetGenerators(LanguageNames.CSharp);
-        _byPath[path] = (stamp, generators);
-        return generators;
     }
 }

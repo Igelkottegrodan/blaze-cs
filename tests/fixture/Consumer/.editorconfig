@@ -1,0 +1,3 @@
+# CA1825 is a warning in the other projects (../.editorconfig), not in this one.
+[*.cs]
+dotnet_diagnostic.CA1825.severity = none

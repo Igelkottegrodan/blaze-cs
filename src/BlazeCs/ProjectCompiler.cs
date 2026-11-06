@@ -37,6 +37,13 @@ sealed class ProjectCompiler
     readonly Func<CommandLineReference, MetadataReference> _resolveReference;
     CSharpCompilation _compilation;
     GeneratorDriver? _driver;
+    readonly AnalyzerCache _analyzerCache;
+    ProjectAnalyzers? _analyzers;
+    /// <summary>
+    /// Sources whose current text the analyzers haven't seen in a written build: changed or added since,
+    /// by path. An edit reports the analyzer warnings of these files, as `dotnet build` would.
+    /// </summary>
+    readonly HashSet<string> _unanalyzed = new(PathComparer.Instance);
 
     public CompileUnit Unit { get; }
     /// <summary>How long the last Emit spent in source generators (the rest is binding and emit).</summary>
@@ -60,10 +67,11 @@ sealed class ProjectCompiler
     /// </summary>
     public string? StaleArguments { get; private set; }
 
-    public ProjectCompiler(CompileUnit unit, Func<CommandLineReference, MetadataReference> resolveReference, GeneratorCache generators)
+    public ProjectCompiler(CompileUnit unit, Func<CommandLineReference, MetadataReference> resolveReference, AnalyzerCache analyzers)
     {
         Unit = unit;
         _resolveReference = resolveReference;
+        _analyzerCache = analyzers;
         _args = CSharpCommandLineParser.Default.Parse(unit.Arguments, unit.ProjectDirectory, sdkDirectory: null);
         var errors = _args.Errors.Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
         if (errors.Count > 0)
@@ -107,7 +115,7 @@ sealed class ProjectCompiler
             _args.MetadataReferences.Select(resolveReference),
             CompilationOptions());
 
-        var sourceGenerators = generators.For(_args.AnalyzerReferences.Select(a => a.FilePath));
+        var sourceGenerators = analyzers.Generators(AnalyzerPaths);
         if (sourceGenerators.Length > 0)
         {
             var baseDirectory = string.IsNullOrWhiteSpace(_args.GeneratedFilesOutputDirectory)
@@ -117,7 +125,7 @@ sealed class ProjectCompiler
                 sourceGenerators,
                 _additionalTexts.Values,
                 _args.ParseOptions,
-                _config.GeneratorOptions(),
+                _config.Options(),
                 DriverOptions(baseDirectory));
         }
     }
@@ -177,6 +185,7 @@ sealed class ProjectCompiler
             {
                 _sources.Remove(file.Path);
                 _order.Remove(file.Path);
+                _unanalyzed.Remove(file.Path);
                 filesAddedOrRemoved = true;
                 continue;
             }
@@ -191,6 +200,7 @@ sealed class ProjectCompiler
                 continue;
             }
             _sources[file.Path] = updated;
+            _unanalyzed.Add(file.Path);
             compilation = compilation.ReplaceSyntaxTree(file.Tree, updated.Tree);
             changed = true;
         }
@@ -201,6 +211,7 @@ sealed class ProjectCompiler
                 continue;
             _sources[path] = SourceFile.Read(path, this);
             _order.Insert(GlobPosition(path), path);
+            _unanalyzed.Add(path);
             filesAddedOrRemoved = true;
         }
 
@@ -309,7 +320,10 @@ sealed class ProjectCompiler
         }
         _ignoredOnDisk = DiscoverFiles([".cs"]).Where(path => !_sources.ContainsKey(path)).ToHashSet(PathComparer.Instance);
         _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(PathComparer.Instance);
-        return Refresh() | changed;
+        changed = Refresh() | changed;
+        // The real build analyzed every file as it is now.
+        _unanalyzed.Clear();
+        return changed;
     }
 
     /// <summary>Picks up new images of the units this one references; true if any reference changed.</summary>
@@ -379,6 +393,55 @@ sealed class ProjectCompiler
         if (!result.Success)
             return (null, diagnostics);
         return (new EmitOutput(assembly.ToArray(), pdb?.ToArray(), documentation?.ToArray(), referenceAssembly?.ToArray()), diagnostics);
+    }
+
+    /// <summary>This project's analyzers, loaded on first use: from the assemblies its generators come from.</summary>
+    public ProjectAnalyzers Analyzers => LazyInitializer.EnsureInitialized(ref _analyzers,
+        () => new ProjectAnalyzers(_analyzerCache.Analyzers(AnalyzerPaths, suppressorsOnly: _args.SkipAnalyzers), _config.Options()));
+
+    /// <summary>The analysis of the sources this compile is the first to see, running; see <see cref="Analyzed"/>.</summary>
+    public sealed record Analysis(IReadOnlyList<SyntaxTree> Trees, Task<(ImmutableArray<Diagnostic> Diagnostics, TimeSpan Time)> Result);
+
+    /// <summary>
+    /// Starts the analyzers on the prepared compilation's sources that changed since the last written
+    /// build (none if the project has no analyzer that can report), off the calling thread, so it runs
+    /// alongside the emit. Null if there is nothing to analyze. Never fails: a failure is a warning.
+    /// </summary>
+    public Analysis? Analyze(Prepared prepared, CancellationToken cancellationToken = default)
+    {
+        if (_unanalyzed.Count == 0 || !Analyzers.CanReport)
+            return null;
+        var trees = _unanalyzed.Select(path => _sources[path].Tree).Where(prepared.Compilation.ContainsSyntaxTree).ToList();
+        if (trees.Count == 0)
+            return null;
+        var analyzers = Analyzers;
+        ImmutableArray<AdditionalText> additionalFiles = [.. _additionalTexts.Values];
+        return new Analysis(trees, Task.Run(async () =>
+        {
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                var diagnostics = await analyzers.AnalyzeAsync(prepared.Compilation, trees, additionalFiles, cancellationToken).ConfigureAwait(false);
+                return (diagnostics, System.Diagnostics.Stopwatch.GetElapsedTime(started));
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                Console.WriteLine($"{DateTime.Now:O} {Unit.Name}: analyzers failed: {e}");
+                ImmutableArray<Diagnostic> failed = [Diagnostic.Create("BLAZE002", "blaze-cs", $"analyzers failed, so this build reports none of their warnings: {e.Message} (details in .blaze-cs/daemon.log)",
+                    DiagnosticSeverity.Warning, DiagnosticSeverity.Warning, isEnabledByDefault: true, warningLevel: 1)];
+                return (failed, System.Diagnostics.Stopwatch.GetElapsedTime(started));
+            }
+        }, cancellationToken));
+    }
+
+    /// <summary>The build wrote this compile's outputs and reported its analysis: its trees are analyzed.</summary>
+    public void Analyzed(Analysis analysis)
+    {
+        foreach (var tree in analysis.Trees)
+        {
+            if (_sources.TryGetValue(tree.FilePath, out var source) && source.Tree == tree)
+                _unanalyzed.Remove(tree.FilePath);
+        }
     }
 
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<SyntaxTree, HashSet<string>> IdentifierCache = new();
