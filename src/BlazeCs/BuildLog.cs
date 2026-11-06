@@ -139,7 +139,7 @@ static class BuildLog
 
     /// <summary>The full path with every symlink in it resolved, as realpath(3) does; memoized in
     /// <paramref name="resolved"/>.</summary>
-    static string RealPath(string path, Dictionary<string, string> resolved)
+    public static string RealPath(string path, Dictionary<string, string> resolved)
     {
         path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         if (resolved.TryGetValue(path, out var real))

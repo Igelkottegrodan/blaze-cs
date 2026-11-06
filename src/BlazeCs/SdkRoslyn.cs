@@ -55,19 +55,23 @@ static class SdkRoslyn
         // resolve from there from the start, so no method that mentions an MSBuild type can be compiled before
         // they can load (see MSBuildHost); the rest of the root (NuGet, Newtonsoft.Json and the like) only once
         // MSBuild has started, so nothing else, such as a generator missing a dependency, finds it there before.
-        // After Roslyn's handler: the root has its own copy of the compiler, which must not answer first.
+        // After Roslyn's handler: the root has its own copy of the compiler, which must not answer first. From
+        // where a symlinked SDK directory points, as `dotnet build` runs MSBuild (a dotnet root assembled from
+        // links, as in nix): the paths MSBuild derives from its own location, such as the restore spec's, must
+        // be the ones that build wrote.
+        var msbuildDir = BuildLog.RealPath(sdkDir, []);
         AssemblyLoadContext.Default.Resolving += (context, name) =>
         {
             if (name.Name is not { } simple || !(s_msbuildStarted || simple.StartsWith("Microsoft.Build", StringComparison.Ordinal)))
                 return null;
-            var candidate = Path.Combine(sdkDir, simple + ".dll");
+            var candidate = Path.Combine(msbuildDir, simple + ".dll");
             return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
         };
-        s_sdkDirectory = sdkDir;
+        s_msbuildDirectory = msbuildDir;
         return sdkDir;
     }
 
-    static string? s_sdkDirectory;
+    static string? s_msbuildDirectory;
     static volatile bool s_msbuildStarted;
 
     /// <summary>
@@ -85,7 +89,7 @@ static class SdkRoslyn
     /// </summary>
     public static string StartMSBuild()
     {
-        var sdkDir = s_sdkDirectory ?? throw new InvalidOperationException("Roslyn was not installed from an SDK");
+        var sdkDir = s_msbuildDirectory ?? throw new InvalidOperationException("Roslyn was not installed from an SDK");
         if (s_msbuildStarted)
             return sdkDir;
         if (!File.Exists(Path.Combine(sdkDir, "MSBuild.dll")))
