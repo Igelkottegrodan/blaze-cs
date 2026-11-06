@@ -129,7 +129,7 @@ static class Program
         string[] arguments = ["exec", "--runtimeconfig", SdkRoslyn.CompilerRuntimeConfig(Path.GetDirectoryName(solutionPath)!),
             typeof(Program).Assembly.Location, "daemon", solutionPath];
         if (OperatingSystem.IsWindows())
-            StartDetachedOnWindows(arguments, environment);
+            StartDetachedOnWindows([Environment.ProcessPath!, .. arguments], log, environment);
         else
         {
             // Detached into its own session so it outlives this terminal and ignores its Ctrl+C. The daemon
@@ -157,14 +157,15 @@ static class Program
     /// <summary>
     /// Through ShellExecute, in a hidden console of its own: it gets none of this process's handles (a
     /// plain start would inherit the pipe a caller reads this process's output from, and that caller
-    /// would wait for the daemon to exit), and this terminal's Ctrl+C doesn't reach it. ShellExecute
-    /// passes this process's environment, so the daemon's variables are set here for the start.
+    /// would wait for the daemon to exit), and this terminal's Ctrl+C doesn't reach it. cmd redirects
+    /// into the log what the runtime prints when it dies, as sh does on Linux. ShellExecute passes this
+    /// process's environment, so the daemon's variables are set here for the start.
     /// </summary>
-    static void StartDetachedOnWindows(string[] arguments, Dictionary<string, string> environment)
+    static void StartDetachedOnWindows(string[] command, string log, Dictionary<string, string> environment)
     {
-        var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
-        foreach (var argument in arguments)
-            start.ArgumentList.Add(argument);
+        // cmd /s /c "…": cmd strips the outer quotes and runs the rest as typed. Paths can't contain quotes.
+        var line = string.Join(" ", command.Select(part => $"\"{part}\"")) + $" <NUL >>\"{log}\" 2>&1";
+        var start = new ProcessStartInfo("cmd.exe", $"/d /s /c \"{line}\"") { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
         var previous = environment.Keys.ToDictionary(name => name, Environment.GetEnvironmentVariable);
         foreach (var (name, value) in environment)
             Environment.SetEnvironmentVariable(name, value);

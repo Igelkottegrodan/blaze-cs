@@ -86,8 +86,7 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
   its PDB still records the old ID of the reference that changed, so its bytes differ from a fresh build
   until the next `dotnet build` recompiles it.
 - **Platforms:** Windows is covered only by the fixture check in CI; jellyfin and the numbers above are
-  Linux, and the benchmark scripts are Linux-only. On Windows, the daemon loads generators from copies
-  (as on Linux) and logs to `.blaze-cs/daemon.log`, but a crash of the runtime itself isn't logged there.
+  Linux, and the benchmark scripts are Linux-only.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
   by a real solution. .NET 11 (RC3) is covered by the fixture check
   (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
