@@ -15,7 +15,8 @@ var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
 var blaze = Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
 
-// BLAZE_CS_SDK=<version> checks against another SDK than the repo's pin, such as a .NET 11 one.
+// BLAZE_CS_SDK=<exact version> checks against another SDK than the repo's pin, such as a .NET 11 one or the
+// oldest supported .NET 10 (rollForward is off: a newer installed SDK must not stand in for it).
 var sdk = Environment.GetEnvironmentVariable("BLAZE_CS_SDK") is { Length: > 0 } pinned ? pinned : null;
 // Tests11 (net11.0) joins the solution only under a .NET 11 or newer SDK; the pin is 10.
 var hasNet11 = sdk is not null && Version.Parse(sdk.Split('-')[0]).Major >= 11;
@@ -84,7 +85,7 @@ if (Directory.Exists(work))
 CopyFixture(fixture, work);
 if (sdk is not null)
     File.WriteAllText(Path.Combine(work, "global.json"),
-        $$"""{ "sdk": { "version": "{{sdk}}", "allowPrerelease": true, "rollForward": "latestFeature" } }""");
+        $$"""{ "sdk": { "version": "{{sdk}}", "allowPrerelease": true, "rollForward": "disable" } }""");
 else
     File.Copy(Path.Combine(root, "global.json"), Path.Combine(work, "global.json"));
 if (hasNet11)

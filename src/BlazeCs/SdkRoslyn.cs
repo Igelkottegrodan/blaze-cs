@@ -13,8 +13,10 @@ static class SdkRoslyn
 {
     /// <summary>
     /// Why this solution's SDK cannot be used, or null if it can. The daemon is compiled against the
-    /// Roslyn of SDK 10; an older SDK's Roslyn would fail with MissingMethod and TypeLoad errors. The
-    /// client checks this before it starts a daemon, so the message reaches the user's terminal.
+    /// Roslyn of SDK 10.0.4xx, but runs on that of 10.0.100 (Roslyn 5.0), the oldest SDK 10 and the one the
+    /// fixture check tests in CI; an SDK before 10 has an older Roslyn that fails with MissingMethod and
+    /// TypeLoad errors. The client checks this before it starts a daemon, so the message reaches the
+    /// user's terminal.
     /// </summary>
     public static string? Unsupported(string solutionDir)
     {
@@ -22,8 +24,8 @@ static class SdkRoslyn
         {
             var version = Run(solutionDir, "--version").Trim();
             if (int.TryParse(version.Split('.')[0], out var major) && major < MinimumMajor)
-                return $"needs .NET SDK {MinimumMajor} or later; this solution's global.json selects SDK {version}. " +
-                    $"Pin {MinimumMajor}.0.x (or set rollForward) to use blaze-cs.";
+                return $"needs .NET SDK {MinimumMajor}.0.100 or later; this solution's global.json selects SDK {version}. " +
+                    $"Pin {MinimumMajor}.0.100 or later (or set rollForward) to use blaze-cs.";
             return null;
         }
         catch (InvalidOperationException e)

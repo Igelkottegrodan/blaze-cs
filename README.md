@@ -21,7 +21,8 @@
 
 ## Install
 
-It needs the .NET 10 or 11 SDK for the solution you build. The repo itself pins SDK 10 and builds on it
+It needs .NET SDK 10.0.100 or later (10 or 11) for the solution you build; older SDKs are refused with that message.
+CI runs the fixture check on 10.0.100 (the oldest), the newest 10 and 11. The repo itself pins SDK 10 and builds on it
 with [devbox](https://www.jetify.com/devbox):
 
 ```sh
