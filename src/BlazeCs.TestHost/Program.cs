@@ -43,6 +43,16 @@ static class Program
             var context = new TestContext(assemblyPath);
             _ = context.EnterContextualReflection(); // for the rest of this process
             var assembly = context.LoadFromAssemblyPath(assemblyPath);
+            // A reference this host can't load (an assembly built for a newer runtime) would surface as an
+            // error from deep inside a framework's runner, or not at all.
+            foreach (var reference in assembly.GetReferencedAssemblies())
+            {
+                try { _ = context.LoadFromAssemblyName(reference); }
+                catch (Exception e) when (e is IOException or BadImageFormatException)
+                {
+                    return new Result(0, 0, 0, 0, $"the test host (.NET {Environment.Version}) can't load {reference.FullName}: {e.Message}", null);
+                }
+            }
             run = framework switch
             {
                 "xunit3" => XunitV3(context, assembly, output),

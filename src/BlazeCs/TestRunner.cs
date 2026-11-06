@@ -97,12 +97,16 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         TestHostResult? result = null;
         while (host.StandardOutput.ReadLine() is { } line)
         {
-            if (!line.StartsWith(ResultPrefix, StringComparison.Ordinal))
+            // Test output may end mid-line, with the result after it.
+            var start = line.IndexOf(ResultPrefix, StringComparison.Ordinal);
+            if (start < 0)
             {
                 output.Add(line);
                 continue;
             }
-            result = JsonSerializer.Deserialize<TestHostResult>(line[ResultPrefix.Length..])!;
+            if (start > 0)
+                output.Add(line[..start]);
+            result = JsonSerializer.Deserialize<TestHostResult>(line[(start + ResultPrefix.Length)..])!;
             break;
         }
         Stop(host);
