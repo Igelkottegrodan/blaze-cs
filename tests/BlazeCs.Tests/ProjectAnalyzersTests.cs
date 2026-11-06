@@ -57,6 +57,42 @@ public sealed class ProjectAnalyzersTests : IDisposable
         Assert.Equal(("AD0001", DiagnosticSeverity.Warning), (diagnostic.Id, diagnostic.Severity));
     }
 
+    [Fact]
+    public async Task ABodyEditAnalyzesOnlyItsMemberAndMovesTheRest()
+    {
+        const string before = "class A\n{\n    void Other() { }\n\n    void Bad() { }\n}\n";
+        const string after = "class A\n{\n    void Other() {\n        var x = 1;\n    }\n\n    void Bad() { }\n}\n";
+        var (compilation, config) = Project("", ("A.cs", before));
+        var analyzer = new BadMethodAnalyzer();
+        var analyzers = new ProjectAnalyzers([analyzer], config.Options());
+        await analyzers.AnalyzeAsync(compilation, [.. compilation.SyntaxTrees], [], TestContext.Current.CancellationToken);
+        var oldTree = compilation.SyntaxTrees.Single();
+        var newTree = oldTree.WithChangedText(Microsoft.CodeAnalysis.Text.SourceText.From(after));
+        Assert.NotNull(BodyEdit.Between(oldTree, newTree, TestContext.Current.CancellationToken));
+
+        analyzer.Visited.Clear();
+        var edited = compilation.ReplaceSyntaxTree(oldTree, newTree);
+        var incremental = await analyzers.AnalyzeAsync(edited, [newTree], [], TestContext.Current.CancellationToken);
+        var full = await new ProjectAnalyzers([new BadMethodAnalyzer()], config.Options()).AnalyzeAsync(edited, [newTree], [], TestContext.Current.CancellationToken);
+
+        Assert.Equal(["Other"], analyzer.Visited.Order());
+        Assert.Equal(Formatted(full), Formatted(incremental));
+        Assert.Contains("(7,10): warning TST001", Assert.Single(Formatted(incremental)));
+    }
+
+    [Theory]
+    [InlineData("a declaration", "class A\n{\n    void Renamed() { }\n\n    void Bad() { }\n}\n")]
+    [InlineData("two members", "class A\n{\n    void Other() { var x = 1; }\n\n    void Bad() { var y = 2; }\n}\n")]
+    [InlineData("a directive in a body", "class A\n{\n    void Other()\n    {\n#pragma warning disable TST001\n    }\n\n    void Bad() { }\n}\n")]
+    public void OtherEditsAreNoBodyEdit(string edit, string after)
+    {
+        var before = CSharpSyntaxTree.ParseText("class A\n{\n    void Other() { }\n\n    void Bad() { }\n}\n", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.True(BodyEdit.Between(before, before.WithChangedText(Microsoft.CodeAnalysis.Text.SourceText.From(after)), TestContext.Current.CancellationToken) is null, edit);
+    }
+
+    static string[] Formatted(ImmutableArray<Diagnostic> diagnostics) =>
+        [.. diagnostics.Select(d => CSharpDiagnosticFormatter.Instance.Format(d)).Order(StringComparer.Ordinal)];
+
     /// <summary>A project of these files in the temporary directory, with this .editorconfig, as csc compiles it.</summary>
     (CSharpCompilation, ProjectConfig) Project(string editorConfig, params (string Name, string Source)[] files)
     {
@@ -85,6 +121,9 @@ public sealed class ProjectAnalyzersTests : IDisposable
     {
         public static readonly DiagnosticDescriptor Rule = new("TST001", "Bad method", "Method '{0}' is bad", "Test", DiagnosticSeverity.Warning, isEnabledByDefault: true);
 
+        /// <summary>The methods it was run on.</summary>
+        public System.Collections.Concurrent.ConcurrentQueue<string> Visited { get; } = new();
+
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => [Rule];
 
         public override void Initialize(AnalysisContext context)
@@ -94,6 +133,7 @@ public sealed class ProjectAnalyzersTests : IDisposable
             context.RegisterSyntaxNodeAction(c =>
             {
                 var method = (MethodDeclarationSyntax)c.Node;
+                Visited.Enqueue(method.Identifier.ValueText);
                 if (method.Identifier.ValueText == "Bad")
                     c.ReportDiagnostic(Diagnostic.Create(Rule, method.Identifier.GetLocation(), method.Identifier.ValueText));
             }, SyntaxKind.MethodDeclaration);

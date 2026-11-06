@@ -360,13 +360,24 @@ void AnalyzerWarnings()
     output = Run(blaze, "build");
     if (Warnings(output, "CA1825").Count != 0 || !Rebuilt(output).SetEquals([]))
         Fail($"analyzer warnings, built again: expected nothing rebuilt and no CA1825:\n{output}");
+
+    // An edit inside the body of a member above it analyzes only that member again: the warning is reported
+    // again where it moved to, as dotnet build reports it.
+    Replace("Lib/Greeter.cs", "=> \"Bye, \" + name;", "=> \"Bye, \"\n        + name;");
+    output = Run(blaze, "build");
+    rebuilt = Rebuilt(output);
+    var moved = Warnings(output, "CA1825");
+    theirs = Warnings(Verify("analyzer warnings, body edit above", rebuilt, null), "CA1825");
+    if (!rebuilt.SetEquals(lib) || moved.Count != lib.Length || moved.SequenceEqual(ours) || !moved.Distinct().SequenceEqual(theirs.Distinct()))
+        Fail($"analyzer warnings, body edit above: expected Lib rebuilt and CA1825 one line further down, as dotnet build reports it, got:\n{string.Join("\n", moved)}\n"
+            + $"dotnet build reported:\n{string.Join("\n", theirs)}\nblaze-cs output:\n{output}");
     Replace("Lib/Greeter.cs", greeter, "");
     Replace("Consumer/Welcome.cs", welcome, "");
     File.Delete(Path.Combine(work, "Lib/Quiet.cs"));
     output = Run(blaze, "build");
     if (Warnings(output, "CA1825").Count != 0 || !Rebuilt(output).SetEquals([.. consumer, .. lib]))
         Fail($"analyzer warnings, fixed: expected {string.Join(", ", [.. consumer, .. lib])} rebuilt and no CA1825:\n{output}");
-    Console.WriteLine($"ok  analyzer warnings: {ours.Count} CA1825 warnings, as dotnet build reports them; none where .editorconfig turns it off, none once fixed");
+    Console.WriteLine($"ok  analyzer warnings: {ours.Count} CA1825 warnings, as dotnet build reports them, and where they moved after a body edit above; none where .editorconfig turns it off, none once fixed");
 }
 
 // A build's warnings with this id, without the project MSBuild appends ("[path/Lib.csproj::TargetFramework=net8.0]"), sorted.
