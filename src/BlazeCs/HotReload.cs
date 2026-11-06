@@ -125,11 +125,15 @@ sealed class HotReloadEngine
             return null;
         }
         // The compiler's own assemblies resolve from Roslyn/bincore first (SdkRoslyn); the engine's, and what
-        // they need besides (System.Composition, Microsoft.DiaSymReader), from dotnet-watch.
+        // they need besides (System.Composition, Microsoft.DiaSymReader), from dotnet-watch. A name the SDK's
+        // root has too (MSBuild's: Microsoft.Build.Framework, Microsoft.VisualStudio.SolutionPersistence, which
+        // Workspaces.MSBuild references) loads from there, from where MSBuildHost loads it, whichever of the two
+        // asks first: one copy, MSBuild's. (Microsoft.Build* always resolves there first, SdkRoslyn.Install.)
+        var root = BuildLog.RealPath(sdkDirectory, []);
         AssemblyLoadContext.Default.Resolving += (context, name) =>
         {
-            var candidate = Path.Combine(directory, name.Name + ".dll");
-            return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
+            var candidate = new[] { root, directory }.Select(dir => Path.Combine(dir, name.Name + ".dll")).FirstOrDefault(File.Exists);
+            return candidate is null ? null : context.LoadFromAssemblyPath(candidate);
         };
         try
         {

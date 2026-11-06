@@ -1214,7 +1214,8 @@ void HotReloadedPassRunsAgain()
         return;
     const string name = "hot reloaded pass";
     // Five test projects run with Lib, and hosts stay up for the four run last: body edits until Tests' does.
-    for (var edits = 0; ReadyLiveHosts(name, ["Tests"]).Count == 0; edits++)
+    Dictionary<int, string> live;
+    for (var edits = 0; (live = ReadyLiveHosts(name, ["Tests"])).Count == 0; edits++)
     {
         if (edits == 4)
             Fail($"{name}: expected a host to stay up for Tests after {edits} body edits in Lib:\n{ReadLog("daemon.log")}");
@@ -1222,18 +1223,21 @@ void HotReloadedPassRunsAgain()
         Run(blaze, "test");
         IdleHosts($"before {name}");
     }
+    var reloadedIn = live.Single().Key;
     Replace("Lib/Salutation.cs", "Compute() => 1", "Compute() => 2");
     var output = Run(blaze, "test", check: false);
     if (!Regex.IsMatch(output, @"^blaze-cs: Tests\.dll: hot reloaded Lib \(net10\.0\)", RegexOptions.Multiline)
         || !Regex.IsMatch(output, @"^Passed!\s+- .* - Tests\.dll \(hot reloaded\)\r?$", RegexOptions.Multiline))
         Fail($"{name}: expected Tests to pass hot reloaded, on the Value its host computed before the edit:\n{output}");
     IdleHosts($"after {name}");
-    var logged = ReadLog("daemon.log").Length;
+    // The next test runs Tests in another process than the one it hot reloaded into: that host ends because
+    // nothing changed, or ended already when Tests dropped out of the projects that get a host (Prestart).
     var (next, exitCode) = RunWithExit(blaze, "test", check: false);
     if (exitCode == 0 || Regex.IsMatch(next, @"^blaze-cs: unchanged since last run: .*\bTests \(", RegexOptions.Multiline)
-        || !Summaries(next).TryGetValue("Tests", out var summary) || summary.Label != "Failed!"
-        || !ReadLog("daemon.log")[logged..].Contains("(Tests.dll) ends, and Tests.dll runs in a new host: nothing its tests run with changed"))
-        Fail($"{name}: expected the next test to run Tests again in a new host, and fail:\n{next}");
+        || next.Contains("hot reloaded") || !Summaries(next).TryGetValue("Tests", out var summary) || summary.Label != "Failed!"
+        || !FailedTests(next).GetValueOrDefault("Tests", []).Select(Method).Contains("Computes")
+        || !Regex.IsMatch(ReadLog("daemon.log"), $@"hot reload: test host {reloadedIn} \(Tests\.dll\) ends\b"))
+        Fail($"{name}: expected the next test to run Tests again, not in host {reloadedIn}, and fail Computes:\n{next}");
     SameAsDotnetTest(name, next, [.. Summaries(next).Keys]);
 
     Replace("Lib/Salutation.cs", "Compute() => 2", "Compute() => 1");
@@ -1542,21 +1546,24 @@ void HostCannotLoad()
 }
 
 // A test project whose tests failed runs again on the next `test`, though nothing changed since: in a new host,
-// not the one that stayed up for it, whose statics the first run left (TestRunner.Plan).
+// not the one that stayed up for it, whose statics the first run left (TestRunner.Plan). That host ends then,
+// or ended already if the project dropped out of the ones that get a host.
 void FailedRunsAgain()
 {
     Replace("Tests/WelcomeTests.cs", "StartsWith(\"Hello\"", "StartsWith(\"Goodbye\"");
     try
     {
+        int? live = null; // the host that stayed up for Tests after run 1, if one did: run 2 must not run in it
         for (var run = 1; run <= 2; run++)
         {
-            var logged = ReadLog("daemon.log").Length;
             var (output, exitCode) = RunWithExit(blaze, "test", check: false);
             if (exitCode == 0 || !Regex.IsMatch(output, @"^\s*Failed!\s+- Failed:\s+1, .* - Tests\.dll\b", RegexOptions.Multiline)
                 || run == 2 && (Rebuilt(output).Count != 0
                     || output.Contains("ran again") || output.Contains("hot reloaded")
-                    || HotReloadUnavailableBecause() is null && !ReadLog("daemon.log")[logged..].Contains("(Tests.dll) ends, and Tests.dll runs in a new host: nothing its tests run with changed")))
+                    || HotReloadUnavailableBecause() is null && live is { } kept && !Regex.IsMatch(ReadLog("daemon.log"), $@"hot reload: test host {kept} \(Tests\.dll\) ends\b")))
                 Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? ", in a new host, and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
+            if (run == 1 && LiveHosts().FirstOrDefault(host => host.Value == "Tests") is { Key: > 0 } stayedUp)
+                live = stayedUp.Key;
         }
     }
     finally
