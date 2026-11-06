@@ -134,9 +134,12 @@ its own:
 - **Analyzer warnings for what you edited.** Each build runs the project's analyzers (the ones `dotnet build`
   runs, from the same `/analyzer:` assemblies its generators come from) on the files the edit changed or
   added, while the project compiles, and prints their warnings as the compiler does. It honours the
-  project's `.editorconfig` and global analyzer config severities and its diagnostic suppressors. An edit
-  inside one method's (or accessor's) body analyzes only that member again; the file's other warnings are
-  the ones its last analysis found, moved to where they now are. Analyzers never change the emitted bytes.
+  project's `.editorconfig` and global analyzer config severities and its diagnostic suppressors. After an
+  edit inside one method's (or accessor's) body, analyzers that look at one member at a time analyze only
+  that member again; their other warnings in the file are the ones their last analysis found, moved to
+  where they now are. Analyzers that look across a type's members (CA2213 or IDISP002, from a type's
+  symbol-end action) or at the whole file analyze the whole file again, as Visual Studio does for them.
+  Analyzers never change the emitted bytes.
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
   or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
   project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
@@ -150,11 +153,13 @@ its own:
   untested. jellyfin and the numbers above are Linux, and the benchmark scripts are Linux-only.
 - **Warnings:** a build reports the compiler's warnings for the projects it compiles, and the analyzers'
   for the files the edit touched only: not for the other files of those projects, nor for a dependent
-  the edit changes without touching its files. After a body edit, the rest of the file reports what it
-  reported at its last analysis, even if an edit elsewhere has changed that since. A file's first edit
-  after the daemon starts analyzes the whole file, which on a large file with many analyzers takes longer
-  than the compile (jellyfin's 3,100-line `BaseItem.cs`: 0.55 to 0.7 s, so that build takes about 0.3 s
-  longer; later body edits in it add about 25 ms). Analyzers that report at
+  the edit changes without touching its files. After a body edit, the rest of the file reports what the
+  member-at-a-time analyzers reported at its last analysis, even if an edit elsewhere (a signature in
+  another file) has changed that since. A file's first edit after the daemon starts runs every analyzer
+  on the whole file, which on a large file with many analyzers takes longer than the compile (jellyfin's
+  3,100-line `BaseItem.cs`: that build takes 0.15 to 0.4 s longer; later body edits in it add 5 to 40 ms).
+  An analyzer that reports in another file than the one it analyzes (a partial type's other part) is
+  reported only when that file is analyzed. Analyzers that report at
   compilation end (unused members, unused parameters and the like) don't run, and diagnostic suppressors
   don't silence compiler warnings.
   Warnings-as-errors, and rules set to `error`, are reported as warnings and don't fail the build. Run
