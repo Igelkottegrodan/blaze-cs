@@ -31,8 +31,18 @@ namespace BlazeCs;
 ///   names (an assembly fixture, a test framework), MSTest's assembly and global test initialize and cleanup,
 ///   an NUnit SetUpFixture.
 /// A compiler-generated type (a lambda's, an async method's) is judged as the type that declares it, since
-/// only that type's code creates it. A test class (as the framework reports it) and its base classes are
-/// exempt from these rules: the framework finds them, and the selection is of them.
+/// only that type's code creates it.
+///
+/// Code may reach a type on the chain without naming it too. So for each type the chain reaches (but those the
+/// compiler generated), code that names its base type or an interface reaches it as well, and every test runs
+/// when that base type or interface is outside the solution (code there may create the type or call it without
+/// naming it: a framework that scans for handlers, components or xUnit collection fixtures), or when the type
+/// carries an attribute other than the compiler's. Base types and interfaces no framework finds types by
+/// (object, Exception, Attribute, IDisposable, IEquatable, IEnumerable, ...) don't count.
+///
+/// A test class (as the framework reports it) and its base classes are exempt from these rules: the framework
+/// finds them, and the selection is of them. xUnit's attributes that name a type as two strings (v2's
+/// TestFramework, orderers, discoverers) name it as typeof would.
 ///
 /// Every test also runs when the delta doesn't say which types it updated, or when the framework names a test
 /// class no type of the test assembly has the name of (a generic or parameterized class). A type that looks
@@ -115,6 +125,30 @@ static class TestSelection
         var queue = new Queue<TypeKey>(targets);
         while (queue.TryDequeue(out var type))
         {
+            // Code that holds a type reached here as its base type or an interface reaches it too, and code outside
+            // the solution may create or call it without naming it at all.
+            if (byAssembly.TryGetValue(type.Assembly, out var module) && module.Members.TryGetValue(type.Name, out var members))
+            {
+                foreach (var name in members)
+                {
+                    if (module.Assembly == test.Assembly && exempt.Contains(name))
+                        continue;
+                    var facts = module.Types[name];
+                    foreach (var (supertype, isBase) in facts.Supertypes)
+                    {
+                        var relation = isBase ? "derives from" : "implements";
+                        if (!byAssembly.TryGetValue(supertype.Assembly, out var other) || !other.Types.TryGetValue(supertype.Name, out var super))
+                        {
+                            return Everything($"{Display(name)} ({module.Assembly}) can reach what the delta updates, and it {relation} "
+                                + $"{(supertype.Name.Length > 0 ? $"{Display(supertype.Name)} ({supertype.Assembly})" : "a type it can't name")}, from outside the solution");
+                        }
+                        if (reaching.Add(new TypeKey(other.Assembly, super.Group)))
+                            queue.Enqueue(new TypeKey(other.Assembly, super.Group));
+                    }
+                    if (facts.Attribute is { } attribute)
+                        return Everything($"{Display(name)} ({module.Assembly}) can reach what the delta updates, and it carries [{attribute}]");
+                }
+            }
             foreach (var user in users.GetValueOrDefault(type, []))
             {
                 if (reaching.Add(user))
@@ -181,6 +215,8 @@ static class TestSelection
         public required string Assembly { get; init; }
         /// <summary>Its types by full name.</summary>
         public Dictionary<string, TypeFacts> Types { get; } = new(StringComparer.Ordinal);
+        /// <summary>The types of each of its top-level types (itself and its nested types) that the compiler didn't generate.</summary>
+        public Dictionary<string, List<string>> Members { get; } = new(StringComparer.Ordinal);
         /// <summary>Its types' full names by TypeDef row (from 1).</summary>
         public List<string> ByRow { get; } = [];
         /// <summary>The types each of its top-level types (with its nested ones) names, each as its top-level type.</summary>
@@ -193,8 +229,29 @@ static class TestSelection
         public HashSet<TypeKey> NamedRoots { get; } = [];
     }
 
-    /// <summary>A type: its top-level type (itself, if it isn't nested), its base type, and why code may reach it without naming it, if it may.</summary>
-    sealed record TypeFacts(string Group, TypeKey? Base, string? Untraceable);
+    /// <summary>
+    /// A type: its top-level type (itself, if it isn't nested), its base type, why code may reach it without
+    /// naming it if it may, its base type and interfaces but those in PlumbingSupertypes (each by its full name, a
+    /// generic one's by its definition's), and the first of its attributes not in InertAttributes.
+    /// </summary>
+    sealed record TypeFacts(string Group, TypeKey? Base, string? Untraceable, (TypeKey Type, bool IsBase)[] Supertypes, string? Attribute);
+
+    /// <summary>
+    /// Base types and interfaces code holds a value as only to compare, enumerate or dispose of it, or that no
+    /// framework finds types by: code that created the value named its type, so a type that has only these as
+    /// its base type and interfaces is reached through that code.
+    /// </summary>
+    static readonly HashSet<string> PlumbingSupertypes = ["System.Object", "System.ValueType", "System.Enum", "System.Delegate", "System.MulticastDelegate",
+        "System.Exception", "System.Attribute", "System.IDisposable", "System.IAsyncDisposable", "System.IEquatable`1", "System.IComparable", "System.IComparable`1",
+        "System.Collections.IEnumerable", "System.Collections.Generic.IEnumerable`1", "System.Collections.IEnumerator", "System.Collections.Generic.IEnumerator`1",
+        "System.Collections.Generic.IAsyncEnumerable`1", "System.Collections.Generic.IAsyncEnumerator`1", "System.Runtime.CompilerServices.IAsyncStateMachine"];
+
+    /// <summary>
+    /// xUnit's attributes that name a type by its name and its assembly's, as two strings (v2's test framework,
+    /// orderers and discoverers): the type they name is used as if by typeof.
+    /// </summary>
+    static readonly HashSet<string> StringNamingAttributes = ["TestFrameworkAttribute", "TestCaseOrdererAttribute", "TestCollectionOrdererAttribute",
+        "TestFrameworkDiscovererAttribute", "XunitTestCaseDiscovererAttribute", "TraitDiscovererAttribute"];
 
     static readonly ConcurrentDictionary<string, (FileStamp Stamp, ModuleTypes Types)> Cache = new(PathComparer.Instance);
 
@@ -232,7 +289,7 @@ static class TestSelection
     /// <summary>Attributes the compiler emits, and others no framework finds types by, by namespace or full name.</summary>
     static readonly HashSet<string> InertAttributes = ["System.Runtime.CompilerServices", "System.Diagnostics", "System.Diagnostics.CodeAnalysis",
         "Microsoft.CodeAnalysis", "System.CodeDom.Compiler", "System.Reflection.DefaultMemberAttribute", "System.ObsoleteAttribute", "System.FlagsAttribute",
-        "System.CLSCompliantAttribute"];
+        "System.CLSCompliantAttribute", "System.AttributeUsageAttribute"];
 
     /// <summary>Reads one assembly's types, and what each top-level type names.</summary>
     sealed class ModuleReader : ISignatureTypeProvider<object?, object?>, ICustomAttributeTypeProvider<string?>
@@ -259,9 +316,16 @@ static class TestSelection
                 var type = _md.GetTypeDefinition(handle);
                 var group = Outermost(name);
                 module.ByRow.Add(name);
+                var attribute = Attribute(type);
                 module.Types[name] = new TypeFacts(group, !type.BaseType.IsNil && type.BaseType.Kind is HandleKind.TypeDefinition or HandleKind.TypeReference
                     ? Named(type.BaseType) is { } baseType ? baseType with { Name = FullName(type.BaseType) } : null
-                    : null, Untraceable(type));
+                    : null, Untraceable(type, attribute), Supertypes(type), attribute);
+                if (!name.Split('+').Any(segment => segment.StartsWith('<')))
+                {
+                    if (!module.Members.TryGetValue(group, out var members))
+                        module.Members[group] = members = [];
+                    members.Add(name);
+                }
                 if (!module.Uses.TryGetValue(group, out var uses))
                     module.Uses[group] = uses = [];
                 _uses = uses;
@@ -455,6 +519,8 @@ static class TestSelection
             }
             foreach (var argument in value.FixedArguments.Concat(value.NamedArguments.Select(named => new CustomAttributeTypedArgument<string?>(named.Type, named.Value))))
                 TypeArguments(argument);
+            if (value.FixedArguments is [{ Value: string typeName }, { Value: string assemblyName }] && StringNamingAttributes.Contains(AttributeType(handle).Name))
+                SerializedName($"{typeName}, {assemblyName}", _assembly, _uses);
             return true;
         }
 
@@ -519,7 +585,7 @@ static class TestSelection
         }
 
         /// <summary>Why code may reach a type without naming it (see TestSelection), or null.</summary>
-        string? Untraceable(TypeDefinition type)
+        string? Untraceable(TypeDefinition type, string? attribute)
         {
             if ((type.Attributes & TypeAttributes.Interface) != 0)
                 return "it is an interface";
@@ -540,13 +606,43 @@ static class TestSelection
                 if ((method.Attributes & MethodAttributes.Virtual) != 0)
                     return $"its method {_md.GetString(method.Name)} is virtual";
             }
+            return attribute is null ? null : $"it carries [{attribute}]";
+        }
+
+        /// <summary>The name of the first of a type's attributes not in InertAttributes, or null.</summary>
+        string? Attribute(TypeDefinition type)
+        {
             foreach (var handle in type.GetCustomAttributes())
             {
                 var (ns, name) = AttributeType(handle);
                 if (!InertAttributes.Contains(ns) && !InertAttributes.Contains($"{ns}.{name}"))
-                    return $"it carries [{name}]";
+                    return name;
             }
             return null;
+        }
+
+        /// <summary>A type's base type and interfaces but those in PlumbingSupertypes; one it can't name has an empty name.</summary>
+        (TypeKey Type, bool IsBase)[] Supertypes(TypeDefinition type)
+        {
+            var supertypes = new List<(TypeKey, bool)>();
+            void Add(EntityHandle handle, bool isBase)
+            {
+                if (handle.Kind == HandleKind.TypeSpecification)
+                {
+                    // A generic instantiation's definition: GENERICINST, CLASS or VALUETYPE, then the type.
+                    var blob = _md.GetBlobReader(_md.GetTypeSpecification((TypeSpecificationHandle)handle).Signature);
+                    handle = blob.ReadSignatureTypeCode() == SignatureTypeCode.GenericTypeInstance && blob.ReadSignatureTypeCode() == SignatureTypeCode.TypeHandle
+                        ? blob.ReadTypeHandle() : default;
+                }
+                var name = handle.IsNil ? "" : FullName(handle);
+                if (!PlumbingSupertypes.Contains(name))
+                    supertypes.Add((name.Length > 0 && Named(handle) is { } key ? key with { Name = name } : new TypeKey("", ""), isBase));
+            }
+            if (!type.BaseType.IsNil)
+                Add(type.BaseType, isBase: true);
+            foreach (var implementation in type.GetInterfaceImplementations())
+                Add(_md.GetInterfaceImplementation(implementation).Interface, isBase: false);
+            return [.. supertypes];
         }
 
         /// <summary>An attribute's type's namespace and name.</summary>

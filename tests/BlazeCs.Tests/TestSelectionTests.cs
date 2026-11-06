@@ -214,10 +214,189 @@ public class TestSelectionTests
             public static void Start() => Mid.Welcome.For("all");
         }
         """, "Setup (Tests)")]
+    [InlineData("""
+        [assembly: Tests.TestFrameworkAttribute("Tests.Framework", "Tests")]
+
+        namespace Tests;
+
+        public sealed class TestFrameworkAttribute(string type, string assembly) : System.Attribute;
+
+        public static class Framework
+        {
+            public static string Start() => Mid.Welcome.For("all");
+        }
+        """, "Framework (Tests)")]
     public void AnEditCodeThatRunsAroundEveryTestReachesRunsEveryTest(string setup, string root)
     {
         using var solution = new Solution(("Lib", Lib), ("Mid", Mid), ("Tests", Tests + NextFile + setup));
         Assert.Equal($"{root} runs around every test and can reach what the delta updates", solution.Select("Lib", "Lib.Greeter").Everything);
+    }
+
+    /// <summary>
+    /// A package's: a scanner that finds IHandler's implementations in an assembly it is given, and stand-ins
+    /// for xUnit's collection fixtures (xUnit's own are among the references too, so in a namespace of their own).
+    /// </summary>
+    const string Outside = """
+        using System;
+        using System.Linq;
+        using System.Reflection;
+
+        namespace Outside
+        {
+            public interface IHandler
+            {
+                int Handle();
+            }
+
+            public static class Scanner
+            {
+                public static int RunAll(Assembly assembly) => assembly.GetTypes().Where(type => typeof(IHandler).IsAssignableFrom(type) && !type.IsInterface)
+                    .Sum(type => ((IHandler)Activator.CreateInstance(type)!).Handle());
+            }
+        }
+
+        namespace Outside.Xunit
+        {
+            public interface ICollectionFixture<T>;
+
+            public sealed class CollectionDefinitionAttribute(string name) : Attribute;
+
+            public sealed class CollectionAttribute(string name) : Attribute;
+        }
+        """;
+
+    /// <summary>
+    /// The scanner finds Handler, which uses Calc, by scanning App: ScanTests names neither, so an edit to Calc
+    /// can run in ScanTests only through code outside the solution.
+    /// </summary>
+    [Fact]
+    public void AnEditATypeOutsideTheSolutionCanReachThroughRunsEveryTest()
+    {
+        using var solution = new Solution(("Outside", Outside), ("App", """
+            namespace App;
+
+            public static class Calc
+            {
+                public static int Two() => 2;
+            }
+
+            public sealed class Handler : Outside.IHandler
+            {
+                public int Handle() => Calc.Two();
+            }
+
+            public sealed class Anchor;
+            """), ("Tests", """
+            namespace Tests;
+
+            public class ScanTests
+            {
+                public void Scans() => Outside.Scanner.RunAll(typeof(App.Anchor).Assembly);
+            }
+
+            public class OtherTests
+            {
+                public void Adds() => System.Math.Max(1, 2);
+            }
+            """));
+        Assert.Equal("Handler (App) can reach what the delta updates, and it implements IHandler (Outside), from outside the solution",
+            solution.Select(["Tests.ScanTests", "Tests.OtherTests"], "App", "App.Calc").Everything);
+    }
+
+    /// <summary>
+    /// xUnit creates DbFixture for the collection DbTests is in, by name: DbTests names neither DbFixture nor
+    /// DbCollection, only the collection's name.
+    /// </summary>
+    [Fact]
+    public void AnEditACollectionFixtureReachesRunsEveryTest()
+    {
+        using var solution = new Solution(("Outside", Outside), ("App", """
+            namespace App;
+
+            public static class Seed
+            {
+                public static void Run() { }
+            }
+            """), ("Tests", """
+            using Outside.Xunit;
+
+            namespace Tests;
+
+            public sealed class DbFixture
+            {
+                public DbFixture() => App.Seed.Run();
+            }
+
+            [CollectionDefinition("Db")]
+            public sealed class DbCollection : ICollectionFixture<DbFixture>;
+
+            [Collection("Db")]
+            public class DbTests
+            {
+                public void Reads() { }
+            }
+
+            public class OtherTests
+            {
+                public void Adds() => System.Math.Max(1, 2);
+            }
+            """));
+        Assert.Equal("DbCollection (Tests) can reach what the delta updates, and it implements ICollectionFixture`1 (Outside), from outside the solution",
+            solution.Select(["Tests.DbTests", "Tests.OtherTests"], "App", "App.Seed").Everything);
+    }
+
+    /// <summary>
+    /// Job uses Calc, and JobTests holds a Job as IJob, which the solution has: code that names IJob reaches Job.
+    /// A type that carries an attribute frameworks may find it by runs every test.
+    /// </summary>
+    [Fact]
+    public void ATypeReachedThroughAnInterfaceOfTheSolutionRunsTheClassesThatNameTheInterface()
+    {
+        const string App = """
+            namespace App;
+
+            public static class Calc
+            {
+                public static int Two() => 2;
+            }
+
+            public interface IJob
+            {
+                int Run();
+            }
+
+            public sealed class Job : IJob, System.IDisposable
+            {
+                public int Run() => Calc.Two();
+
+                public void Dispose() { }
+            }
+
+            public static class Jobs
+            {
+                public static IJob Make() => new Job();
+            }
+            """;
+        const string Tests = """
+            namespace Tests;
+
+            public class JobTests
+            {
+                public void Runs(App.IJob job) => job.Run();
+            }
+
+            public class OtherTests
+            {
+                public void Adds() => System.Math.Max(1, 2);
+            }
+            """;
+        using (var solution = new Solution(("App", App), ("Tests", Tests)))
+            Assert.Equal(["Tests.JobTests"], solution.Select(["Tests.JobTests", "Tests.OtherTests"], "App", "App.Calc").Classes?.Order());
+        using (var solution = new Solution(("App", App + NextFile + "namespace App;\npublic sealed class MarkAttribute : System.Attribute;\n[Mark] public static class Marked { public static int Two() => Calc.Two(); }"), ("Tests", Tests)))
+        {
+            Assert.Equal("Marked (App) can reach what the delta updates, and it carries [MarkAttribute]",
+                solution.Select(["Tests.JobTests", "Tests.OtherTests"], "App", "App.Calc").Everything);
+        }
     }
 
     /// <summary>Every method body of a large assembly reads: Roslyn's, with switches (jump tables) and every kind of operand.</summary>
@@ -250,7 +429,10 @@ public class TestSelectionTests
     /// <summary>Separates an assembly's source files.</summary>
     const string NextFile = "\n// next file\n";
 
-    /// <summary>Assemblies compiled in order, each referencing those before it, into a directory of their own.</summary>
+    /// <summary>
+    /// Assemblies compiled in order, each referencing those before it, into a directory of their own. One named
+    /// Outside stands for a package: it isn't among the solution's assemblies.
+    /// </summary>
     sealed class Solution : IDisposable
     {
         readonly DirectoryInfo _directory = Directory.CreateTempSubdirectory("blaze-cs-selection-");
@@ -268,7 +450,8 @@ public class TestSelectionTests
                 var emitted = compilation.Emit(path);
                 Assert.True(emitted.Success, string.Join("\n", emitted.Diagnostics));
                 references.Add(MetadataReference.CreateFromFile(path));
-                _paths.Add(path);
+                if (name != "Outside")
+                    _paths.Add(path);
             }
         }
 
@@ -292,8 +475,11 @@ public class TestSelectionTests
         }
 
         /// <summary>The selection for a delta to these types of an assembly, its own baseline.</summary>
-        public TestSelection.Selection Select(string assembly, params string[] types) =>
-            TestSelection.Select(Path("Tests"), _paths, [(Path(assembly), Tokens(assembly, types))], Classes);
+        public TestSelection.Selection Select(string assembly, params string[] types) => Select(Classes, assembly, types);
+
+        /// <summary>The selection among these test classes for a delta to these types of an assembly.</summary>
+        public TestSelection.Selection Select(string[] classes, string assembly, params string[] types) =>
+            TestSelection.Select(Path("Tests"), _paths, [(Path(assembly), Tokens(assembly, types))], classes);
 
         public void Dispose()
         {

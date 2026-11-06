@@ -160,12 +160,15 @@ its own:
   - Not on Windows yet: a host that stays up would keep the project outputs it loaded locked.
 - **Only the test classes a hot reload can reach.** After a hot reload, only the test classes that can run
   the updated code run: those whose code, through a chain of types each naming the next (in the
-  solution's assemblies the tests run with), uses an updated type, plus those whose last run failed. The
+  solution's assemblies the tests run with; code that names a type's base class or interface there names
+  the type too), uses an updated type, plus those whose last run failed. The
   others are listed as unchanged since their last run, with their result:
   `blaze-cs: Tests.dll: unchanged since last run: RuntimeTests (1 passed)`. Every test runs when code may
   reach the updated type without naming it (an interface or a base class, a type that implements or
-  derives from one, a generic type, a type with a framework attribute), when code that runs around every
-  test (a module initializer, an assembly fixture, assembly initialize) reaches it, or when the framework
+  derives from one, a generic type, a type with a framework attribute), when a type on the chain
+  implements an interface or derives from a class from outside the solution (a component, a handler a
+  library scans for, an xUnit collection fixture) or carries a framework attribute, when code that runs
+  around every test (a module initializer, an assembly fixture, assembly initialize) reaches it, or when the framework
   names a test class after no type (a generic test class); the daemon log says which. A test class that
   looks types up by name (`Type.GetType`, `Assembly.GetTypes`, `Activator.CreateInstance`) runs after
   every hot reload. `blaze-cs test --all` runs every test.
