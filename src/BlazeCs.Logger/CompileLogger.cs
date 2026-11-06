@@ -19,8 +19,9 @@ public sealed partial class CompileLogger : ILogger
     // another node than the one that builds it, so this is read only once every event has arrived.
     readonly Dictionary<int, string> _runSettings = [];
     readonly List<CompileRecord> _compiles = [];
-    // Each with the id of the evaluation its build ran from, which names its RunSettingsFilePath.
-    readonly HashSet<(string ProjectFile, string? TargetFramework, int Evaluation)> _compiled = [];
+    // Each with the id of the evaluation its build ran from, which names its RunSettingsFilePath, and the global
+    // properties of the first request that ran its CoreCompile.
+    readonly Dictionary<(string ProjectFile, string? TargetFramework, int Evaluation), IReadOnlyDictionary<string, string>> _compiled = [];
     readonly List<CopyRecord> _copies = [];
 
     public LoggerVerbosity Verbosity { get; set; }
@@ -54,7 +55,8 @@ public sealed partial class CompileLogger : ILogger
 
     public void Shutdown()
     {
-        var compiled = _compiled.Select(p => new ProjectRecord(p.ProjectFile, p.TargetFramework, _runSettings.GetValueOrDefault(p.Evaluation)));
+        var compiled = _compiled.Select(p => new ProjectRecord(p.Key.ProjectFile, p.Key.TargetFramework, _runSettings.GetValueOrDefault(p.Key.Evaluation),
+            new Dictionary<string, string>(p.Value)));
         File.WriteAllText(Parameters!, JsonSerializer.Serialize(new BuildRecord(_compiles, [.. compiled], _copies)));
     }
 
@@ -104,7 +106,7 @@ public sealed partial class CompileLogger : ILogger
             project.CoreCompile = target;
             // Skipped as up to date, CoreCompile still starts: that is how a project csc didn't run for shows.
             if (e.TargetFile?.EndsWith("Microsoft.CSharp.Core.targets", PathComparer.Comparison) == true)
-                _compiled.Add((project.File, project.TargetFramework, project.Evaluation));
+                _compiled.TryAdd((project.File, project.TargetFramework, project.Evaluation), project.GlobalProperties);
         }
     }
 
@@ -197,6 +199,7 @@ public sealed partial class CompileLogger : ILogger
     {
         public int Evaluation { get; } = e.BuildEventContext?.EvaluationId ?? BuildEventContext.InvalidEvaluationId;
         public string File { get; } = e.ProjectFile ?? "";
+        public IReadOnlyDictionary<string, string> GlobalProperties { get; } = new Dictionary<string, string>(e.GlobalProperties ?? new Dictionary<string, string>());
         public string? TargetFramework { get; } = e.GlobalProperties?.TryGetValue("TargetFramework", out var framework) == true ? framework : null;
         public int? CoreCompile { get; set; }
         public Dictionary<int, (string Name, string? File)> TargetsAfterCompile { get; } = [];

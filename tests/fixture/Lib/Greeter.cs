@@ -5,6 +5,13 @@ public static class Greeter
     public static string Greet(string name) => "Hello, " + name;
 
     public static int Twice(int value) => value * 2;
+
+    // A define the project file can set: an edit there changes this constant, and App reads it.
+#if FIXTURE_FLAG
+    public const int Flag = 2;
+#else
+    public const int Flag = 1;
+#endif
 #if NET10_0_OR_GREATER
 
     // Only in the net10.0 build, so a change here touches one target framework's API.

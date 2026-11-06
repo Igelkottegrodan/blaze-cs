@@ -291,6 +291,41 @@ use it. It skips `PrepareResources`, so every `/resource:` argument was missing.
 got 152 fewer arguments than in its real build, and three other projects one fewer each.
 `BuildOnlySettings` sets `BuildingProject=true`, as in a real build.
 
+The implementation ([#102](https://github.com/Igelkottegrodan/blaze-cs/issues/102)) adds
+`_CheckForInvalidConfigurationAndPlatform` in front of these targets. A real build runs it before `BeforeBuild`,
+and the SDK's `CheckForDuplicateItems` runs before it, so that check sees the items as evaluated. Without it,
+`CheckForDuplicateItems` ran just before `CoreCompile`, after a project's own target had added a `Compile`
+item again. The fixture's `Lib` does that, and the pass failed with `NETSDK1022`, which the real build doesn't
+raise.
+
+It also runs what the project's own `BuildDependsOn` lists before `CoreBuild`, and what its `CoreBuildDependsOn`
+lists up to `Compile`, as evaluated: `BeforeBuild` with any target hooked to it, and any target a project or an
+import puts in front of either list (a code generator hooked the classic way, say). A fixed list missed those. The pre-build event doesn't run: a project with a non-empty
+`PreBuildEvent`, or a target whose `BeforeTargets` or `AfterTargets` names `PreBuildEvent`, falls back with
+`Lib: it has a pre-build step`.
+
+What the implementation does beyond the tables below, from the review of its first version:
+
+- **The pass gives csc's arguments and nothing else.** So it only takes an edit that changes nothing else
+  (`ProjectFileEdit`). The daemon keeps each unit's project file text from its last build. It compares the
+  edited text with that, without comments and whitespace, and without the compiler properties
+  (`DefineConstants`, `Nullable`, `LangVersion`, `NoWarn` and the like) and compiler items (`Compile`,
+  `AdditionalFiles`, `Using`, without copy metadata) of the project's top-level groups. Anything else that
+  differs falls back, naming it: `Lib: the edit to Lib.csproj changes more than csc's input (<None
+  Update="data.txt">)`. That covers files the build copies, the runtimeconfig and deps.json
+  (`InvariantGlobalization`, `RollForward`), the apphost (`OutputType`), packages, references and every
+  target, a weaving one after `CoreCompile` included. A changed compiler setting that something else reads falls
+  back too: the rest of the project file, or any import outside the SDK (a copy item or a weaving target under
+  a condition on it). References from a compiler property itself don't count, so a Directory.Build.props that
+  appends to `DefineConstants` or `NoWarn` doesn't make every such edit fall back.
+- **The restore check compares the projects restore reaches.** `GenerateRestoreGraphFile` also lists a project
+  only a `ReferenceOutputAssembly="false"` reference leads to (the fixture's `Generator`, from `Consumer`). The
+  spec restore writes leaves it out: restore follows each framework's `projectReferences`. Both specs are cut
+  to that closure, then compared as JSON (`RestoreSpec`).
+- **The XML cache is reset after every dotnet build.** That build may rewrite any file the collection parsed
+  (an import that made the edit fall back, restore's `obj/*.nuget.g.props`). Between builds, each pass reloads
+  the edited project files, and each import of a project it evaluated whose write time changed.
+
 The global properties are the real build's plus four:
 
 | Property | Why |
@@ -353,7 +388,7 @@ Each rule names what it catches, how the daemon detects it, and the one line it 
 
 | Rule | Detection | Logged reason (example) |
 |---|---|---|
-| Restore needed | Regenerate NuGet's restore spec in-process: target `GenerateRestoreGraphFile` with `RestoreGraphOutputPath` set to a file under `.blaze-cs/` and `RestoreRecursive=false`. Compare it byte for byte with `obj/<project>.nuget.dgspec.json`, which the last restore wrote. In the spike it was identical for an unchanged project (4 runs) and after a `DefineConstants` edit, and differed after a `PackageReference` was added (`+ "Humanizer.Core": {`). This is NuGet's own no-op check, so it covers central package versions, framework references, project references, sources and target frameworks without a list kept by hand. 222 to 391 ms warm per edited project | `MediaBrowser.Controller: restore inputs changed (its NuGet restore spec differs)` |
+| Restore needed | Regenerate NuGet's restore spec in-process: target `GenerateRestoreGraphFile` with `RestoreGraphOutputPath` set to a file under `.blaze-cs/` and `RestoreRecursive=false`. Compare it with `obj/<project>.nuget.dgspec.json` (the implementation compares the projects restore reaches, as JSON; see above), which the last restore wrote. In the spike it was identical for an unchanged project (4 runs) and after a `DefineConstants` edit, and differed after a `PackageReference` was added (`+ "Humanizer.Core": {`). This is NuGet's own no-op check, so it covers central package versions, framework references, project references, sources and target frameworks without a list kept by hand. 222 to 391 ms warm per edited project | `MediaBrowser.Controller: restore inputs changed (its NuGet restore spec differs)` |
 | Restore ran outside the daemon | The stamp of a reached unit's `obj/project.assets.json`, `.nuget.g.props` or `.nuget.g.targets` changed since the daemon last loaded | `Emby.Naming: its restore output changed` |
 | The pass needs a restore | The pass fails with `NETSDK1004` (no assets file), or with `NETSDK1005` or `NETSDK1047` (no target for the framework or runtime) | `<unit>: NETSDK1005: …` (the error's first line) |
 | A custom target produces inputs | The pass logger sees a task run in a target defined in a file inside the solution directory, restore output excepted. A target there that only orders SDK targets runs no task of its own and is fine: jellyfin's `_ProduceContentAssetsSkippedByClean` (`Directory.Build.targets`, `BeforeTargets="CoreCompile"`) ran in every pass and only depends on `RunProduceContentAssets`. The real build's logger records the same thing for targets before `CoreCompile`, so a unit known to have one falls back before any pass | `Lib: target GenerateVersion (Directory.Build.targets) runs a task before compile` |
@@ -408,9 +443,23 @@ What hosting adds to the daemon, from the spike's numbers:
 Expected daemon growth, then: about +100 to 150 MB for a `.csproj` edit (one evaluation, its 8 references'
 evaluations inside the pass, MSBuild's code), and up to +400 MB right after a `.props` edit that reaches
 every project. The second shrinks again once the idle GC of
-[#80](https://github.com/Igelkottegrodan/blaze-cs/issues/80) runs. That is an estimate. The issue's
-criterion asks for the real figure, so the first ticket measures daemon RSS before and after the first and
-fifth project-file edit on jellyfin, and records it here.
+[#80](https://github.com/Igelkottegrodan/blaze-cs/issues/80) runs.
+
+**Measured in the daemon** ([#102](https://github.com/Igelkottegrodan/blaze-cs/issues/102), 2026-11-06):
+jellyfin, SDK 10.0.403, the daemon's server GC. Each edit set a new value in `DefineConstants` of
+`MediaBrowser.Controller.csproj`, then `blaze-cs build` ran. RSS is `VmRSS` after the command returned. The
+runs held `bench/.measure.lock`, but other agents were compiling (load average 17 to 30).
+
+| Daemon | Before the first edit | After the first | After the fifth | Later |
+|---|---:|---:|---:|---|
+| main (edit through `dotnet build`), 8 edits | 1,272 MB | 1,298 MB | 1,319 MB | 1,321 MB after the 8th |
+| in-process MSBuild, run 1, 8 edits | 1,239 MB | 1,296 MB | 1,399 MB | 1,446 MB after the 8th |
+| in-process MSBuild, run 2, 20 edits | 1,255 MB | 1,314 MB | 1,470 MB | 1,408 to 1,512 MB from the 4th to the 20th, 1,428 MB after the 20th |
+
+So the first edit adds about 60 MB, MSBuild's code and its first evaluations. Passes then add GC slack and
+MSBuild's caches until RSS levels off 170 to 250 MB above where it started. Over 20 edits it went up and
+down within that band and didn't keep growing. That fits the estimate above, with server GC's slack on top.
+Main's daemon grows by about 50 MB over the same edits, because each `dotnet build` reload reads a build log.
 
 Choices that follow from this:
 

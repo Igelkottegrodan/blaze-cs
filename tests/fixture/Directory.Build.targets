@@ -1,0 +1,12 @@
+<Project>
+  <!-- A code generator hooked the classic way, in front of BuildDependsOn: the in-process pass must run the
+       targets BuildDependsOn lists, so Lib keeps this source. -->
+  <PropertyGroup>
+    <BuildDependsOn>AddPrependedSource;$(BuildDependsOn)</BuildDependsOn>
+  </PropertyGroup>
+  <Target Name="AddPrependedSource" Condition="'$(MSBuildProjectName)' == 'Lib'">
+    <ItemGroup>
+      <Compile Include="$(MSBuildThisFileDirectory)Hooked/Prepended.cs" />
+    </ItemGroup>
+  </Target>
+</Project>

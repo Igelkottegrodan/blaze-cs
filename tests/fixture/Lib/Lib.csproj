@@ -13,4 +13,12 @@
       <Compile Include="Greeter.cs" />
     </ItemGroup>
   </Target>
+
+  <!-- A source only a target hooked to BeforeBuild lists, as a code generator's target would: the in-process
+       pass must run BeforeBuild to see it. Outside the project directory, so no glob lists it. -->
+  <Target Name="AddHookedSource" BeforeTargets="BeforeBuild">
+    <ItemGroup>
+      <Compile Include="../Hooked/Hooked.cs" />
+    </ItemGroup>
+  </Target>
 </Project>

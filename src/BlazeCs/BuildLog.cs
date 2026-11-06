@@ -33,8 +33,10 @@ sealed record CompileUnit(string Name, string ProjectFile, string ProjectDirecto
 /// <param name="Copies">Every file copy MSBuild made or confirmed up to date, source to destination.</param>
 /// <param name="RunSettings">The evaluated RunSettingsFilePath, as a full path, of each unit (by <see cref="CompileUnit.Key"/>)
 /// whose project sets one, whether or not csc ran for it.</param>
+/// <param name="GlobalProperties">The global properties each unit (by <see cref="CompileUnit.Key"/>) was built with, whether
+/// or not csc ran for it.</param>
 sealed record BuildLogInfo(IReadOnlyList<CompileUnit> Units, IReadOnlySet<string> Compiled, IReadOnlyList<(string From, string To)> Copies,
-    IReadOnlyDictionary<string, string> RunSettings);
+    IReadOnlyDictionary<string, string> RunSettings, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> GlobalProperties);
 
 static class BuildLog
 {
@@ -106,8 +108,11 @@ static class BuildLog
         var runSettings = record.Compiled.Where(p => p.RunSettingsFilePath is not null)
             .DistinctBy(KeyOf, PathComparer.Instance)
             .ToDictionary(KeyOf, p => p.RunSettingsFilePath!, PathComparer.Instance);
+        var globalProperties = record.Compiled.Where(p => p.GlobalProperties is not null)
+            .DistinctBy(KeyOf, PathComparer.Instance)
+            .ToDictionary(KeyOf, p => (IReadOnlyDictionary<string, string>)p.GlobalProperties!, PathComparer.Instance);
         return new BuildLogInfo([.. units], record.Compiled.Select(KeyOf).ToHashSet(PathComparer.Instance),
-            [.. record.Copies.Select(c => (c.From, c.To))], runSettings);
+            [.. record.Copies.Select(c => (c.From, c.To))], runSettings, globalProperties);
     }
 
     /// <summary>A unit's name: the project's, and the target framework it was built for, if it was given one.</summary>
@@ -134,7 +139,7 @@ static class BuildLog
 
     /// <summary>The full path with every symlink in it resolved, as realpath(3) does; memoized in
     /// <paramref name="resolved"/>.</summary>
-    static string RealPath(string path, Dictionary<string, string> resolved)
+    public static string RealPath(string path, Dictionary<string, string> resolved)
     {
         path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         if (resolved.TryGetValue(path, out var real))

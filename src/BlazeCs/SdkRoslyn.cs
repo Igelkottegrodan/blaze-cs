@@ -51,7 +51,76 @@ static class SdkRoslyn
             var candidate = Path.Combine(bincore, name.Name + ".dll");
             return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
         };
+        // MSBuild lives at the SDK's root, as MSBuildLocator.RegisterMSBuildPath would find it. Its own assemblies
+        // resolve from there from the start, so no method that mentions an MSBuild type can be compiled before
+        // they can load (see MSBuildHost); the rest of the root (NuGet, Newtonsoft.Json and the like) only once
+        // MSBuild has started, so nothing else, such as a generator missing a dependency, finds it there before.
+        // After Roslyn's handler: the root has its own copy of the compiler, which must not answer first. From
+        // where a symlinked SDK directory points, as `dotnet build` runs MSBuild (a dotnet root assembled from
+        // links, as in nix): the paths MSBuild derives from its own location, such as the restore spec's, must
+        // be the ones that build wrote.
+        var msbuildDir = BuildLog.RealPath(sdkDir, []);
+        AssemblyLoadContext.Default.Resolving += (context, name) =>
+        {
+            if (name.Name is not { } simple || !(s_msbuildStarted || simple.StartsWith("Microsoft.Build", StringComparison.Ordinal)))
+                return null;
+            var candidate = Path.Combine(msbuildDir, simple + ".dll");
+            return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
+        };
+        s_msbuildDirectory = msbuildDir;
         return sdkDir;
+    }
+
+    static string? s_msbuildDirectory;
+    static volatile bool s_msbuildStarted;
+
+    /// <summary>
+    /// The environment MSBuild finds itself and its SDKs by, as MSBuildLocator sets it, and DOTNET_HOST_PATH as
+    /// `dotnet build` sets it for tasks that start `dotnet`. Set once, before MSBuild first runs: its in-process
+    /// node restores the environment it saw when a build started, so nothing may set a variable during one.
+    /// Every process the daemon starts goes without them (<see cref="WithoutMSBuildEnvironment"/>): a child
+    /// `dotnet build` must pick its own SDK, which a global.json edit may have changed.
+    /// </summary>
+    static readonly List<string> s_msbuildVariables = [];
+
+    /// <summary>
+    /// Lets the SDK's MSBuild load in this process, with the rest of the SDK root, and sets its environment:
+    /// what MSBuildLocator.RegisterMSBuildPath does. Returns the SDK directory.
+    /// </summary>
+    public static string StartMSBuild()
+    {
+        var sdkDir = s_msbuildDirectory ?? throw new InvalidOperationException("Roslyn was not installed from an SDK");
+        if (s_msbuildStarted)
+            return sdkDir;
+        if (!File.Exists(Path.Combine(sdkDir, "MSBuild.dll")))
+            throw new InvalidOperationException($"No MSBuild in {sdkDir}");
+        lock (s_msbuildVariables)
+        {
+            void Set(string name, string value)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+                s_msbuildVariables.Add(name);
+            }
+            Set("MSBUILD_EXE_PATH", Path.Combine(sdkDir, "MSBuild.dll"));
+            Set("MSBuildExtensionsPath", sdkDir);
+            Set("MSBuildSDKsPath", Path.Combine(sdkDir, "Sdks"));
+            if (Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") is null && Environment.ProcessPath is { } host
+                && Path.GetFileNameWithoutExtension(host) == "dotnet")
+                Set("DOTNET_HOST_PATH", host);
+        }
+        s_msbuildStarted = true;
+        return sdkDir;
+    }
+
+    /// <summary>Removes what <see cref="StartMSBuild"/> set from a child process's environment.</summary>
+    public static ProcessStartInfo WithoutMSBuildEnvironment(this ProcessStartInfo start)
+    {
+        lock (s_msbuildVariables)
+        {
+            foreach (var name in s_msbuildVariables)
+                start.Environment.Remove(name);
+        }
+        return start;
     }
 
     /// <summary>Simple names of the compiler's own assemblies, which analyzers must share with the daemon.</summary>

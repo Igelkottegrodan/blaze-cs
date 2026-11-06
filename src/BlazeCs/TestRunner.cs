@@ -541,6 +541,9 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         }
     }
 
+    /// <summary>The daemon's current directory as it started, which every host starts in.</summary>
+    readonly string _workingDirectory = Environment.CurrentDirectory;
+
     /// <summary>
     /// Starts a host on a runtime; for a project (its framework, assembly, .runsettings and warm-up assembly),
     /// one that gets the project's run ready while it waits.
@@ -549,10 +552,13 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     {
         var start = new ProcessStartInfo("dotnet")
         {
+            // Hosts start beside a command, and MSBuild's in-process node moves the daemon's current directory
+            // while it builds: each host gets the one the daemon started in, as it always has.
+            WorkingDirectory = _workingDirectory,
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
-        };
+        }.WithoutMSBuildEnvironment();
         var host = Path.Combine(AppContext.BaseDirectory, "blaze-cs-testhost.dll");
         if (runtime.Length == 0)
             start.ArgumentList.Add(host);

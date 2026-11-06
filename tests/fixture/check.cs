@@ -34,7 +34,8 @@ var hasNet11 = sdk is not null && Version.Parse(sdk.Split('-')[0]).Major >= 11;
 
 // (name, edit, units blaze-cs must rebuild, command, fallback); the edits build on each other. Lib and
 // Consumer target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
-// A case with a fallback must instead log it ("blaze-cs: <fallback>") and run dotnet build.
+// A case with a fallback must instead log it ("blaze-cs: <fallback>") and run dotnet build. A case with Logged must
+// log that line ("blaze-cs: <logged>").
 string[] lib = ["Lib (net10.0)", "Lib (net8.0)"], consumer = ["Consumer (net10.0)", "Consumer (net8.0)"];
 // The test projects, and those of them that run with Lib's net10.0 build copied next to them.
 string[] libTests = ["Tests", "XunitV2Tests", "NUnitTests", "MSTestTests", "ComponentTests"], allTests = [.. libTests, .. (hasNet11 ? ["Tests11"] : Array.Empty<string>())];
@@ -127,10 +128,65 @@ Case[] cases =
         [], "build", "Components/Badge.razor.css changed, running dotnet build"),
     new("deleted razor file", () => File.Delete(Path.Combine(work, "Components/Farewell.razor")),
         [], "build", "Components: Farewell.razor was deleted; running dotnet build"),
-    // A project file edit goes through dotnet build, but csc's arguments don't change: every unit stays
-    // warm, and none needs a compile to be trusted, since MSBuild left each assembly as the daemon knew it.
+    // A project file edit is evaluated in the daemon, with MSBuild hosted in its process, and runs no dotnet
+    // build. A comment changes no compiler argument: every unit stays as it was, and nothing compiles.
     new("project file edit", () => Replace("Lib/Lib.csproj", "</Project>", "  <!-- edited -->\n</Project>"),
-        [], "build", "Lib/Lib.csproj changed, running dotnet build", AllKept: true),
+        [], "build", Logged: "evaluated Lib.csproj in process in"),
+    // A define changes both of Lib's units' arguments and, through an #if, a public constant only App reads.
+    new("project file define",
+        () => Replace("Lib/Lib.csproj", "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>",
+            "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>\n    <DefineConstants>$(DefineConstants);FIXTURE_FLAG</DefineConstants>"),
+        ["App", .. lib], "build", Logged: "evaluated Lib.csproj in process in"),
+    // A package needs a restore, which only dotnet build runs. (xunit.abstractions: XunitV2Tests restores it already.)
+    new("project file package reference",
+        () => Replace("Lib/Lib.csproj", "</Project>", "  <ItemGroup>\n    <PackageReference Include=\"xunit.abstractions\" Version=\"2.0.3\" />\n  </ItemGroup>\n</Project>"),
+        [], "build", "Lib: the edit to Lib.csproj changes more than csc's input (<PackageReference Include=\"xunit.abstractions\">); running dotnet build"),
+    // An import goes through dotnet build. The in-process MSBuild has parsed Directory.Build.props before, and
+    // must not evaluate the next project file edit with the copy it cached: Lib's arguments would lose the define.
+    new("Directory.Build.props define",
+        () => Replace("Directory.Build.props", "<ImplicitUsings>enable</ImplicitUsings>",
+            "<ImplicitUsings>enable</ImplicitUsings>\n    <DefineConstants>$(DefineConstants);FIXTURE_DBP</DefineConstants>"),
+        [], "build", "Directory.Build.props changed, running dotnet build"),
+    new("project file edit after a fallback", () => Replace("Lib/Lib.csproj", "<!-- edited -->", "<!-- edited again -->"),
+        [], "build", Logged: "evaluated Lib.csproj in process in"),
+    // Consumer has a ReferenceOutputAssembly="false" reference (Generator), which restore's spec leaves out.
+    new("Consumer project file edit", () => Replace("Consumer/Consumer.csproj", "</Project>", "  <!-- edited -->\n</Project>"),
+        [], "build", Logged: "evaluated Consumer.csproj in process in"),
+    // The pass gives csc's arguments, not the files the build copies.
+    new("project file copy item",
+        () =>
+        {
+            File.WriteAllText(Path.Combine(work, "Lib/data.txt"), "copied next to Lib and its dependents\n");
+            Replace("Lib/Lib.csproj", "</Project>", "  <ItemGroup>\n    <None Update=\"data.txt\" CopyToOutputDirectory=\"PreserveNewest\" />\n  </ItemGroup>\n</Project>");
+        },
+        [], "build", "Lib: the edit to Lib.csproj changes more than csc's input (<None Update=\"data.txt\">); running dotnet build"),
+    new("pre-build step added",
+        () => Replace("Consumer/Consumer.csproj", "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>",
+            "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>\n    <PreBuildEvent>echo pre-build</PreBuildEvent>"),
+        [], "build", "Consumer: the edit to Consumer.csproj changes more than csc's input (<PreBuildEvent>); running dotnet build"),
+    // The pass doesn't run a pre-build step, which a real build runs even when nothing else changed.
+    new("project file edit with a pre-build step", () => Replace("Consumer/Consumer.csproj", "<!-- edited -->", "<!-- edited again -->"),
+        [], "build", "Consumer: it has a pre-build step; running dotnet build"),
+    // A compiler setting, so the pass takes it; the pass must also run AddPrependedSource, which
+    // Directory.Build.targets puts in front of BuildDependsOn, or Lib loses Prepended.cs.
+    new("project file LangVersion",
+        () => Replace("Lib/Lib.csproj", "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>",
+            "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>\n    <LangVersion>latest</LangVersion>"),
+        lib, "build", Logged: "evaluated Lib.csproj in process in"),
+    // An import that reads a compiler setting may do more with it than csc: here, copy a file.
+    new("Directory.Build.targets reads a compiler setting",
+        () =>
+        {
+            File.WriteAllText(Path.Combine(work, "Lib/copied.txt"), "copied when overflow checks are on\n");
+            Replace("Directory.Build.targets", "</Project>",
+                "  <ItemGroup Condition=\"'$(CheckForOverflowUnderflow)' == 'true'\">\n"
+                + "    <None Include=\"$(MSBuildProjectDirectory)/copied.txt\" CopyToOutputDirectory=\"PreserveNewest\" Condition=\"Exists('$(MSBuildProjectDirectory)/copied.txt')\" />\n"
+                + "  </ItemGroup>\n</Project>");
+        },
+        [], "build", "Directory.Build.targets changed, running dotnet build"),
+    new("project file setting an import reads",
+        () => Replace("Lib/Lib.csproj", "<LangVersion>latest</LangVersion>", "<LangVersion>latest</LangVersion>\n    <CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>"),
+        [], "build", "Lib: the edit to Lib.csproj changes more than csc's input ($(CheckForOverflowUnderflow), which Directory.Build.targets reads); running dotnet build"),
 ];
 
 if (Directory.Exists(work))
@@ -158,13 +214,15 @@ try
     WarmedUpIdentical("start", Run(blaze, "build"));
     var prestarted = IdleHosts("before any test command");
     Console.WriteLine($"ok  {prestarted.Count} idle test hosts before any test command, one each for {string.Join(", ", prestarted.Select(h => h.Project).Order())}, and a spare per runtime");
-    foreach (var (name, edit, expected, command, fallback, allKept, ran) in cases)
+    foreach (var (name, edit, expected, command, fallback, ran, logged) in cases)
     {
         edit();
         var output = Run(blaze, command);
+        if (logged is not null && !output.Contains($"blaze-cs: {logged}"))
+            Fail($"{name}: expected blaze-cs to log \"{logged}\":\n{output}");
         if (Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects", RegexOptions.Multiline).LastOrDefault() is { } load)
             loadedProjects = int.Parse(load.Groups[1].Value);
-        var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback, allKept);
+        var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback);
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
         if (command.StartsWith("test", StringComparison.Ordinal))
@@ -444,9 +502,8 @@ void BuildThroughTheDaemon(string pipe)
 }
 
 // A project file edit changes Lib's compiler arguments, and dotnet build compiles Lib through the daemon with the
-// new ones: the daemon takes them from the request, so the next blaze-cs build (a fallback, for the project file)
-// finds every unit's arguments current and keeps it warm. Without the pipe, the warm-up would find Lib's cached
-// arguments stale and run dotnet build --no-incremental.
+// new ones: the daemon takes them from the request. The next blaze-cs build evaluates the project file in process,
+// and the pass must give the arguments the request did: every unit stays, and nothing compiles.
 void ArgumentsChangedThroughTheDaemon(string pipe)
 {
     const string property = "  <PropertyGroup>\n    <DefineConstants>$(DefineConstants);SERVED</DefineConstants>\n  </PropertyGroup>\n";
@@ -457,15 +514,22 @@ void ArgumentsChangedThroughTheDaemon(string pipe)
     if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation") || compiles.Values.Any(result => !result.StartsWith("server: ", StringComparison.Ordinal)))
         Fail($"changed arguments through the daemon: expected it to answer every compile, Lib's among them, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
     var output = Run(blaze, "build");
-    if (output.Contains("stale") || output.Contains("--no-incremental"))
-        Fail($"changed arguments through the daemon: expected the daemon to have them, not to find them stale:\n{output}");
-    FellBack("changed arguments through the daemon", output, "Lib/Lib.csproj changed, running dotnet build", allKept: true);
-    Verify("changed arguments through the daemon", [], "fallback");
+    if (output.Contains("stale") || output.Contains("--no-incremental") || output.Contains("running dotnet build")
+        || !Regex.IsMatch(output, @"^blaze-cs: evaluated Lib\.csproj in process in \d+ ms; compiler arguments unchanged\r?$", RegexOptions.Multiline)
+        || Rebuilt(output).Count != 0)
+        Fail($"changed arguments through the daemon: expected the in-process pass to find Lib's arguments as the request gave them, and nothing to compile:\n{output}");
+    Verify("changed arguments through the daemon", [], "the daemon's pipe");
 
+    // Undone in process: Lib takes the arguments the pass gives, and compiles.
     Replace("Lib/Lib.csproj", property, "");
     Replace("Lib/Greeter.cs", member, "");
-    FellBack("changed arguments undone", Run(blaze, "build"), "Lib/Lib.csproj changed, running dotnet build", allKept: false);
-    Verify("changed arguments undone", [], "fallback");
+    output = Run(blaze, "build");
+    if (!output.Contains("blaze-cs: evaluated Lib.csproj in process in"))
+        Fail($"changed arguments undone: expected blaze-cs to evaluate Lib.csproj in process:\n{output}");
+    var undone = Rebuilt(output);
+    if (!undone.SetEquals(lib))
+        Fail($"changed arguments undone: expected blaze-cs to rebuild {string.Join(", ", lib)}, it rebuilt {string.Join(", ", undone.Order())}:\n{output}");
+    Verify("changed arguments undone", undone, null);
 }
 
 // The daemon answers only its own solution's compiles, and only for the Roslyn it loaded: a project of another
@@ -803,12 +867,13 @@ void CompilationEndAnalyzers()
     if (!Regex.IsMatch(output, @"^blaze-cs: background analysis \(compilation-end rules\) of .*Lib \(net10\.0\).*: no warnings\r?$", RegexOptions.Multiline))
         Fail($"compilation-end analyzers, stale result: expected Lib analyzed again, with no warnings:\n{output}");
 
-    // The class and a project file edit in one step: the fallback compiles Lib, and prints errors only.
+    // The class and a project file edit in one step: the fallback compiles Lib, and prints errors only. A comment
+    // would be evaluated in process; a property the pass doesn't take (FixtureFallback) goes through dotnet build.
     File.WriteAllText(unused, unusedClass);
-    Replace("Lib/Lib.csproj", "</Project>", "  <!-- edited with Unused.cs -->\n</Project>");
+    Replace("Lib/Lib.csproj", "</Project>", "  <PropertyGroup><FixtureFallback>Unused.cs</FixtureFallback></PropertyGroup>\n</Project>");
     built = DateTimeOffset.Now;
     output = Run(blaze, "build");
-    if (!output.Contains($"blaze-cs: {Path.Combine("Lib", "Lib.csproj")} changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
+    if (!output.Contains(FallbackFor("Lib")) || Warnings(output, "CA1812").Count != 0)
         Fail($"compilation-end analyzers, fallback: expected a dotnet build that shows no CA1812:\n{output}");
     WaitForBackgroundAnalysis("compilation-end analyzers, fallback", built);
     output = Run(blaze, "build");
@@ -822,10 +887,10 @@ void CompilationEndAnalyzers()
     Run(blaze, "build");
     File.WriteAllText(unused, unusedClass);
     Run(blaze, "build");
-    Replace("App/App.csproj", "</Project>", "  <!-- edited -->\n</Project>");
+    Replace("App/App.csproj", "</Project>", "  <PropertyGroup><FixtureFallback>App</FixtureFallback></PropertyGroup>\n</Project>");
     built = DateTimeOffset.Now;
     output = Run(blaze, "build");
-    if (!output.Contains($"blaze-cs: {Path.Combine("App", "App.csproj")} changed, running dotnet build"))
+    if (!output.Contains(FallbackFor("App")))
         Fail($"compilation-end analyzers, pending across a fallback: expected a dotnet build:\n{output}");
     // The run may have finished before the fallback, which then reports it.
     if (Warnings(output, "CA1812").Count == 0)
@@ -838,9 +903,9 @@ void CompilationEndAnalyzers()
 
     // Undone through dotnet build, so the cached compiler arguments no longer name Unused.cs.
     File.Delete(unused);
-    Replace("Lib/Lib.csproj", "  <!-- edited with Unused.cs -->\n", "");
+    Replace("Lib/Lib.csproj", "  <PropertyGroup><FixtureFallback>Unused.cs</FixtureFallback></PropertyGroup>\n", "");
     output = Run(blaze, "build");
-    if (!output.Contains($"blaze-cs: {Path.Combine("Lib", "Lib.csproj")} changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
+    if (!output.Contains(FallbackFor("Lib")) || Warnings(output, "CA1812").Count != 0)
         Fail($"compilation-end analyzers, fixed: expected a dotnet build and no CA1812:\n{output}");
     Console.WriteLine("ok  compilation-end analyzers: CA1812 not from the build, then from the background analysis after the next command's build and from build --all, "
         + "as dotnet build reports it; a result for a deleted file dropped; reported after a fallback dotnet build");
@@ -1056,7 +1121,7 @@ void ProjectRemovedAndRestored()
     Replace("Fixture.slnx", $"  <Project Path=\"{removed}/{removed}.csproj\" />\n", "");
     Directory.Delete(Path.Combine(work, removed, "obj"), recursive: true);
     var output = Run(blaze, "build");
-    var none = FellBack("project removed", output, "Fixture.slnx changed, running dotnet build", allKept: false);
+    var none = FellBack("project removed", output, "Fixture.slnx changed, running dotnet build");
     var loaded = Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects.*", RegexOptions.Multiline).Last();
     if (int.Parse(loaded.Groups[1].Value) != before - 1 || Regex.Match(loaded.Value, @"(\d+) kept warm").Groups[1].Value != (before - 1).ToString())
         Fail($"project removed: expected {before - 1} projects, all kept warm (one fewer than the {before} before):\n{output}");
@@ -1072,7 +1137,7 @@ void ProjectRemovedAndRestored()
 
     File.WriteAllText(solution, original);
     output = Run(blaze, "build");
-    FellBack("project restored", output, "Fixture.slnx changed", allKept: false);
+    FellBack("project restored", output, "Fixture.slnx changed");
     Verify("project restored", [], "fallback");
     Replace($"{removed}/WelcomeTests.cs", "\"removed\"", "\"tester\"");
     output = Run(blaze, "test");
@@ -1293,23 +1358,18 @@ HashSet<string> Rebuilt(string output)
     return [.. match.Groups[1].Value.Split(", ")];
 }
 
+// What blaze-cs logs when an edit to a project's file adds FixtureFallback, which the in-process pass doesn't take.
+static string FallbackFor(string project) =>
+    $"blaze-cs: {project}: the edit to {project}.csproj changes more than csc's input (<FixtureFallback>); running dotnet build";
+
 // A case that must go through dotnet build: blaze-cs logs why, and then reloads with every assembly
-// identical to that build's. The projects MSBuild compiled aren't reported, so the set is empty. With
-// allKept, the reload must also keep every unit warm and compile none to verify it.
-HashSet<string> FellBack(string name, string output, string fallback, bool allKept)
+// identical to that build's. The projects MSBuild compiled aren't reported, so the set is empty.
+HashSet<string> FellBack(string name, string output, string fallback)
 {
     // Its message names paths with this OS's separator.
     if (!output.Contains($"blaze-cs: {fallback.Replace('/', Path.DirectorySeparatorChar)}"))
         Fail($"{name}: expected blaze-cs to log \"{fallback}\":\n{output}");
-    var warmUp = WarmedUpIdentical(name, output);
-    if (allKept)
-    {
-        var loaded = Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects .*", RegexOptions.Multiline).LastOrDefault();
-        var kept = Regex.Match(loaded?.Value ?? "", @"(\d+) kept warm").Groups[1].Value;
-        var compiled = Regex.Match(warmUp.Value, @"\((\d+) compiled\)").Groups[1].Value;
-        if (loaded is null || kept != loaded.Groups[1].Value || compiled != "0")
-            Fail($"{name}: expected blaze-cs to keep every project warm and compile none of them again:\n{output}");
-    }
+    WarmedUpIdentical(name, output);
     return [];
 }
 
@@ -1425,4 +1485,4 @@ sealed class CheckFailed(string message) : Exception(message);
 
 sealed record Summary(string Label, int Failed, int Passed, int Skipped, int Total);
 
-sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null, bool AllKept = false, string[]? Ran = null);
+sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null, string[]? Ran = null, string? Logged = null);
