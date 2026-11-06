@@ -201,8 +201,9 @@ its own:
   `dotnet build`, not in the daemon's builds. Run `dotnet build` after changing what they read.
 - **Test inputs are assemblies:** a test project's other files (data files copied to its output,
   environment variables, anything it reads at run time) don't make it run again; use `blaze-cs test --all`.
-- **It trades memory for speed:** on jellyfin the daemon peaks at about 1.3 GB during builds and falls
-  back to about 0.75 GB a few seconds after each.
+- **It trades memory for speed:** on jellyfin the daemon peaks at about 1.5 GB during builds and falls
+  back to about 0.9 GB a few seconds after each, when the idle collection returns memory to the OS
+  (1.6 GB before it did).
 
 ## Contributing
 
