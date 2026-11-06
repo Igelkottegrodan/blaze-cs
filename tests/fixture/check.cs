@@ -13,7 +13,7 @@ using System.Text.RegularExpressions;
 var fixture = Path.GetDirectoryName(Path.GetFullPath(AppContext.GetData("EntryPointFilePath") as string ?? "tests/fixture/check.cs"))!;
 var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
-var blaze = Path.Combine(root, "blaze-cs");
+var blaze = Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
 
 // (name, edit, units blaze-cs must rebuild, command, fallback); the edits build on each other. Lib and
 // Consumer target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
@@ -102,7 +102,11 @@ finally
     Run(blaze, "stop", check: false);
     var log = Path.Combine(work, ".blaze-cs", "daemon.log");
     if (!passed && File.Exists(log))
-        Console.Error.WriteLine($"daemon log ({log}):\n{File.ReadAllText(log)[^Math.Min(4000, (int)new FileInfo(log).Length)..]}");
+    {
+        // Shared for writing: on Windows the daemon's launcher may still hold it.
+        var text = new StreamReader(new FileStream(log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)).ReadToEnd();
+        Console.Error.WriteLine($"daemon log ({log}):\n{text[^Math.Min(4000, text.Length)..]}");
+    }
 }
 return 0;
 
@@ -132,7 +136,8 @@ HashSet<string> Rebuilt(string output)
 // identical to that build's. The projects MSBuild compiled aren't reported, so the set is empty.
 HashSet<string> FellBack(string name, string output, string fallback)
 {
-    if (!output.Contains($"blaze-cs: {fallback}"))
+    // Its message names paths with this OS's separator.
+    if (!output.Contains($"blaze-cs: {fallback.Replace('/', Path.DirectorySeparatorChar)}"))
         Fail($"{name}: expected blaze-cs to log \"{fallback}\":\n{output}");
     // The last warm-up: one that finds stale cached arguments reloads with fresh ones.
     var warmUp = Regex.Matches(output, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical", RegexOptions.Multiline).LastOrDefault();
@@ -179,10 +184,11 @@ void Verify(string name, HashSet<string> rebuilt, string? fallback)
 static bool CompiledBy(HashSet<string> rebuilt, string path) => path.Split('/') is [var project, "obj", _, var framework, ..]
     && (rebuilt.Contains(project) || rebuilt.Contains($"{project} ({framework})"));
 
-// Every obj/ assembly, and the scoped CSS that MSBuild rewrites and bundles (obj/.../scopedcss/).
+// Every obj/ assembly, and the scoped CSS that MSBuild rewrites and bundles (obj/.../scopedcss/), by
+// relative path with / separators on every OS.
 Dictionary<string, byte[]> Outputs() =>
     Directory.EnumerateFiles(work, "*", SearchOption.AllDirectories)
-        .Select(path => Path.GetRelativePath(work, path))
+        .Select(path => Path.GetRelativePath(work, path).Replace('\\', '/'))
         .Where(path => path.Split('/') is [_, "obj", ..] parts && !parts.Contains("refint")
             && (path.EndsWith(".dll", StringComparison.Ordinal) || parts.Contains("scopedcss") && path.EndsWith(".css", StringComparison.Ordinal)))
         .ToDictionary(path => path, path => File.ReadAllBytes(Path.Combine(work, path)));

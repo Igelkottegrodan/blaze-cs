@@ -66,7 +66,7 @@ static class SdkRoslyn
     static string FindSdkDirectory(string solutionDir)
     {
         var version = Run(solutionDir, "--version").Trim();
-        foreach (var line in Run(solutionDir, "--list-sdks").Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        foreach (var line in Run(solutionDir, "--list-sdks").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             // "10.0.403 [/path/to/sdk]"
             var space = line.IndexOf(' ');
@@ -91,7 +91,7 @@ static class SdkRoslyn
         process.WaitForExit();
         if (process.ExitCode != 0)
             throw new InvalidOperationException(
-                $"dotnet {arguments} exited with {process.ExitCode}: {error.Split('\n').FirstOrDefault(l => l.StartsWith("Requested SDK", StringComparison.Ordinal)) ?? error.Trim()}");
+                $"dotnet {arguments} exited with {process.ExitCode}: {error.Split('\n', StringSplitOptions.TrimEntries).FirstOrDefault(l => l.StartsWith("Requested SDK", StringComparison.Ordinal)) ?? error.Trim()}");
         return output;
     }
 }

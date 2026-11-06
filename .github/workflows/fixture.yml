@@ -7,9 +7,11 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         # The SDK the fixture solution is built and compared with; blaze-cs itself always builds on global.json's.
         sdk: ['10.0.x', '11.0.x']
     steps:
@@ -25,6 +27,14 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task build
-      - run: BLAZE_CS_SDK="$(dotnet --list-sdks | grep "^${SDK%.x}" | tail -1 | cut -d' ' -f1)" dotnet run tests/fixture/check.cs
+      - shell: bash
+        # The fixture copy (and its daemon log) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
+        run: TMP="$RUNNER_TEMP" TMPDIR="$RUNNER_TEMP" BLAZE_CS_SDK="$(dotnet --list-sdks | grep "^${SDK%.x}" | tail -1 | cut -d' ' -f1)" dotnet run tests/fixture/check.cs
         env:
           SDK: ${{ matrix.sdk }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-log-${{ matrix.os }}-${{ matrix.sdk }}
+          path: ${{ runner.temp }}/blaze-cs-fixture/.blaze-cs/daemon.log
+          if-no-files-found: ignore

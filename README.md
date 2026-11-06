@@ -3,6 +3,8 @@
 > **Very experimental.** This is a spike: it has been tried on one real solution
 > ([jellyfin](https://github.com/jellyfin/jellyfin)) on Linux, and nothing else. Expect rough edges,
 > and keep `dotnet build` and your CI as the final word.
+>
+> Runs on Linux and Windows (10 1803+ / Server 2019+); CI checks both on the fixture solution. macOS is untested.
 
 Faster rebuilds for C# solutions. Type `blaze-cs build` where you would type `dotnet build`: a daemon
 keeps your solution compiled in memory, and after an edit it rebuilds only what the edit can affect.
@@ -54,6 +56,8 @@ cd /path/to/your/solution
 /path/to/blaze-cs/blaze-cs build
 ```
 
+On Windows, build it with the .NET SDK (`dotnet build BlazeCs.slnx`) and run `\path\to\blaze-cs\blaze-cs.cmd build`.
+
 ## Numbers
 
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.
@@ -81,7 +85,8 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
 - **Skipped dependents' PDBs:** a dependent the API diff skipped keeps its DLL. Its code is identical, but
   its PDB still records the old ID of the reference that changed, so its bytes differ from a fresh build
   until the next `dotnet build` recompiles it.
-- **Platforms:** Linux only so far. The client uses a Unix socket and `setsid`.
+- **Platforms:** Windows is covered only by the fixture check in CI; jellyfin and the numbers above are
+  Linux, and the benchmark scripts are Linux-only.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
   by a real solution. .NET 11 (RC3) is covered by the fixture check
   (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
