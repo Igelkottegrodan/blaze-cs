@@ -99,4 +99,38 @@ public class IdleCollectorTests
         release.Set();
         await busy.WaitAsync(Settled, TestContext.Current.CancellationToken);
     }
+
+    [Fact]
+    public async Task CollectsOnlyOnceTheBackgroundAnalysisHasFinished()
+    {
+        var release = new TaskCompletionSource<int>();
+        var analysis = new IdleWork<string, int>("test run", TimeSpan.Zero, key => key);
+        analysis.Start([("a", _ => release.Task)]);
+        var collector = Collector();
+        collector.Idle(analysis.Running);
+
+        await Task.Delay(Settled, TestContext.Current.CancellationToken);
+        Assert.Equal(0, _collections);
+
+        release.SetResult(1);
+        await Task.Delay(Settled, TestContext.Current.CancellationToken);
+        Assert.Equal(1, _collections);
+    }
+
+    [Fact]
+    public async Task ACommandDuringTheBackgroundAnalysisCancelsTheCollectionToo()
+    {
+        var analysis = new IdleWork<string, int>("test run", TimeSpan.Zero, key => key);
+        analysis.Start([("a", async token => { await Task.Delay(Timeout.Infinite, token); return 1; })]);
+        var collector = Collector();
+        collector.Idle(analysis.Running);
+
+        // What the daemon does when a command arrives: neither waits for the analysis.
+        analysis.Cancel();
+        collector.Busy();
+        await analysis.Running.WaitAsync(Settled, TestContext.Current.CancellationToken);
+
+        await Task.Delay(Settled, TestContext.Current.CancellationToken);
+        Assert.Equal(0, _collections);
+    }
 }

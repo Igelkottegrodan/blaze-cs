@@ -7,3 +7,8 @@ dotnet_diagnostic.CA1825.severity = warning
 
 [Lib/Quiet.cs]
 dotnet_diagnostic.CA1825.severity = none
+
+# For the compilation-end check (check.cs, CompilationEndAnalyzers): CA1812 (an internal class never instantiated)
+# is reported at compilation end, which only an analysis of the whole compilation runs.
+[Lib/*.cs]
+dotnet_diagnostic.CA1812.severity = warning

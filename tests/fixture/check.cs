@@ -172,6 +172,7 @@ try
     }
     IdleCollected();
     AnalyzerWarnings();
+    CompilationEndAnalyzers();
     PreparedHostsSeeNewBytes();
     ProjectRemovedAndRestored();
     HostCannotLoad();
@@ -397,6 +398,133 @@ void AnalyzerWarnings()
     if (Warnings(output, "CA1825").Count != 0 || !Rebuilt(output).SetEquals([.. consumer, .. lib]))
         Fail($"analyzer warnings, fixed: expected {string.Join(", ", [.. consumer, .. lib])} rebuilt and no CA1825:\n{output}");
     Console.WriteLine($"ok  analyzer warnings: {ours.Count} CA1825 warnings, as dotnet build reports them, and where they moved after a body edit above; none where .editorconfig turns it off, none once fixed");
+}
+
+// Compilation-end rules need the whole compilation: CA1812 (an internal class never instantiated, a warning in Lib,
+// see .editorconfig). A build doesn't report it. The background analysis that runs once the daemon is idle does,
+// after the next command's build and once only, under a line saying it comes from that run and when it finished;
+// `build --all` reports it at once. Each time with the id, message and location dotnet build reports. A result for
+// a project the next command changes is dropped, and the project analyzed again. A fallback dotnet build prints
+// errors only, so what it compiled, and what was pending, is analyzed after it.
+void CompilationEndAnalyzers()
+{
+    var unused = Path.Combine(work, "Lib", "Unused.cs");
+    const string unusedClass = "namespace Lib;\n\ninternal sealed class Unused\n{\n}\n";
+    File.WriteAllText(unused, unusedClass);
+    var output = Run(blaze, "build");
+    var built = DateTimeOffset.Now;
+    if (!Rebuilt(output).SetEquals(lib) || Warnings(output, "CA1812").Count != 0)
+        Fail($"compilation-end analyzers: expected {string.Join(", ", lib)} rebuilt and no CA1812 from the build itself:\n{output}");
+    var theirs = Warnings(Verify("compilation-end analyzers", Rebuilt(output), null), "CA1812").Distinct().ToList();
+    if (theirs.Count != 1 || !theirs[0].StartsWith(unused + "(", StringComparison.Ordinal))
+        Fail($"compilation-end analyzers: expected dotnet build to report CA1812 in {unused}, it reported:\n{string.Join("\n", theirs)}");
+    WaitForBackgroundAnalysis("compilation-end analyzers", built);
+    CollectedAfterBackgroundAnalysis("compilation-end analyzers, idle collection", built);
+
+    // Its report comes after the command's own build, its warnings under the line that marks them.
+    output = Run(blaze, "build");
+    var lines = output.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
+    var header = lines.FindIndex(l => Regex.IsMatch(l, @"^blaze-cs: background analysis \(compilation-end rules\) of .*, finished at \d\d:\d\d:\d\d in \d+ ms: 2 warning\(s\)$"));
+    var ours = Warnings(output, "CA1812");
+    var upToDate = lines.FindIndex(l => l.StartsWith("blaze-cs: up to date", StringComparison.Ordinal));
+    if (header < 0 || !lib.All(lines[header].Contains) || ours.Count != lib.Length || !ours.Distinct().SequenceEqual(theirs)
+        || !lines.Skip(header + 1).Take(lib.Length).All(l => l.Contains(": warning CA1812: ", StringComparison.Ordinal)) || upToDate < 0 || upToDate > header)
+        Fail($"compilation-end analyzers, next command: expected the build, then the background analysis line for {string.Join(", ", lib)}, then CA1812 once per "
+            + $"target framework as dotnet build reports it:\n{output}\ndotnet build reported:\n{string.Join("\n", theirs)}");
+    output = Run(blaze, "build");
+    if (Warnings(output, "CA1812").Count != 0 || output.Contains("background analysis"))
+        Fail($"compilation-end analyzers, the command after: expected the background analysis reported once only:\n{output}");
+
+    output = Run(blaze, "build --all");
+    var all = Warnings(output, "CA1812");
+    if (!Regex.IsMatch(output, @"^blaze-cs: full analysis \(every analyzer, compilation-end rules included\) of \d+ projects in \d+ ms: \d+ warning\(s\)\r?$", RegexOptions.Multiline)
+        || all.Count != lib.Length || !all.Distinct().SequenceEqual(theirs))
+        Fail($"compilation-end analyzers, build --all: expected the full analysis to report CA1812 once per target framework as dotnet build reports it:\n{output}");
+
+    // A finished result for a file the next command deletes: dropped, and Lib analyzed again.
+    File.WriteAllText(unused, "// Moved down a line.\n" + unusedClass);
+    Run(blaze, "build");
+    WaitForBackgroundAnalysis("compilation-end analyzers, stale result", DateTimeOffset.Now);
+    File.Delete(unused);
+    built = DateTimeOffset.Now;
+    output = Run(blaze, "build");
+    if (!Rebuilt(output).SetEquals(lib) || Warnings(output, "CA1812").Count != 0 || output.Contains("background analysis"))
+        Fail($"compilation-end analyzers, stale result: expected {string.Join(", ", lib)} rebuilt and the result for the deleted file dropped:\n{output}");
+    WaitForBackgroundAnalysis("compilation-end analyzers, stale result", built);
+    output = Run(blaze, "build");
+    if (!Regex.IsMatch(output, @"^blaze-cs: background analysis \(compilation-end rules\) of .*Lib \(net10\.0\).*: no warnings\r?$", RegexOptions.Multiline))
+        Fail($"compilation-end analyzers, stale result: expected Lib analyzed again, with no warnings:\n{output}");
+
+    // The class and a project file edit in one step: the fallback compiles Lib, and prints errors only.
+    File.WriteAllText(unused, unusedClass);
+    Replace("Lib/Lib.csproj", "</Project>", "  <!-- edited with Unused.cs -->\n</Project>");
+    built = DateTimeOffset.Now;
+    output = Run(blaze, "build");
+    if (!output.Contains("blaze-cs: Lib/Lib.csproj changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
+        Fail($"compilation-end analyzers, fallback: expected a dotnet build that shows no CA1812:\n{output}");
+    WaitForBackgroundAnalysis("compilation-end analyzers, fallback", built);
+    output = Run(blaze, "build");
+    if (!Warnings(output, "CA1812").Distinct().SequenceEqual(theirs))
+        Fail($"compilation-end analyzers, fallback: expected the background analysis to report CA1812 after the dotnet build:\n{output}");
+
+    // A build, then at once a fallback for another project's file: what was pending still reports.
+    File.Delete(unused);
+    Run(blaze, "build");
+    WaitForBackgroundAnalysis("compilation-end analyzers, pending across a fallback", DateTimeOffset.Now);
+    Run(blaze, "build");
+    File.WriteAllText(unused, unusedClass);
+    Run(blaze, "build");
+    Replace("App/App.csproj", "</Project>", "  <!-- edited -->\n</Project>");
+    built = DateTimeOffset.Now;
+    output = Run(blaze, "build");
+    if (!output.Contains("blaze-cs: App/App.csproj changed, running dotnet build"))
+        Fail($"compilation-end analyzers, pending across a fallback: expected a dotnet build:\n{output}");
+    // The run may have finished before the fallback, which then reports it.
+    if (Warnings(output, "CA1812").Count == 0)
+    {
+        WaitForBackgroundAnalysis("compilation-end analyzers, pending across a fallback", built);
+        output = Run(blaze, "build");
+    }
+    if (!Warnings(output, "CA1812").Distinct().SequenceEqual(theirs))
+        Fail($"compilation-end analyzers, pending across a fallback: expected CA1812 from the background analysis:\n{output}");
+
+    // Undone through dotnet build, so the cached compiler arguments no longer name Unused.cs.
+    File.Delete(unused);
+    Replace("Lib/Lib.csproj", "  <!-- edited with Unused.cs -->\n", "");
+    output = Run(blaze, "build");
+    if (!output.Contains("blaze-cs: Lib/Lib.csproj changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
+        Fail($"compilation-end analyzers, fixed: expected a dotnet build and no CA1812:\n{output}");
+    Console.WriteLine("ok  compilation-end analyzers: CA1812 not from the build, then from the background analysis after the next command's build and from build --all, "
+        + "as dotnet build reports it; a result for a deleted file dropped; reported after a fallback dotnet build");
+}
+
+// A background analysis of both of Lib's units that finished after this moment, within 60 s. The run a build
+// leaves starts a second after it returns, and the build cancelled any earlier one.
+// The idle collection waits for the background analysis, which allocates heavily, so that it gives back what
+// the analysis grew the heap to: the first one after the command is logged after the analysis finished.
+void CollectedAfterBackgroundAnalysis(string name, DateTimeOffset after)
+{
+    DateTimeOffset[] Logged(string line) => [.. Regex.Matches(ReadLog("daemon.log"), $@"^(\S+) blaze-cs: {line}", RegexOptions.Multiline)
+        .Select(m => DateTimeOffset.Parse(m.Groups[1].Value)).Where(t => t > after)];
+    var waited = Stopwatch.StartNew();
+    while (Logged("idle collection took ").Length == 0 && waited.Elapsed < TimeSpan.FromSeconds(30))
+        Thread.Sleep(100);
+    var collected = Logged("idle collection took ");
+    var analyzed = Logged("background analysis finished in ");
+    if (collected.Length == 0 || analyzed.Length == 0 || collected[0] < analyzed[0])
+        Fail($"{name}: expected the first idle collection after {after:O} to follow the background analysis' end:\n{ReadLog("daemon.log")}");
+    Console.WriteLine($"ok  {name}: ran {(collected[0] - analyzed[0]).TotalMilliseconds:F0} ms after the background analysis finished");
+}
+
+void WaitForBackgroundAnalysis(string name, DateTimeOffset after)
+{
+    var waited = Stopwatch.StartNew();
+    bool Finished() => Regex.Matches(ReadLog("daemon.log"), @"^(\S+) blaze-cs: background analysis finished in \d+ ms: (.*)$", RegexOptions.Multiline)
+        .Any(m => DateTimeOffset.Parse(m.Groups[1].Value) > after && lib.All(m.Groups[2].Value.Contains));
+    while (!Finished() && waited.Elapsed < TimeSpan.FromSeconds(60))
+        Thread.Sleep(100);
+    if (!Finished())
+        Fail($"{name}: expected a background analysis of {string.Join(", ", lib)} to finish within 60 s after {after:O}:\n{ReadLog("daemon.log")}");
 }
 
 // A build's warnings with this id, without the project MSBuild appends ("[path/Lib.csproj::TargetFramework=net8.0]"), sorted.

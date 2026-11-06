@@ -57,6 +57,8 @@ static class Daemon
                     return 0;
                 }
             }
+            // First of all, so a command never waits for it; then a collection already running ends first.
+            builder.CancelBackgroundAnalysis();
             collector.Busy();
             using var client = accepted;
             using var stream = new NetworkStream(client);
@@ -103,7 +105,8 @@ static class Daemon
                         tests.Prestart();
                     exitCode = !loaded ? 1 : request?.Command switch
                     {
-                        "build" => 0,
+                        // --all reports every analyzer's warnings, so it waits for the warm-up.
+                        "build" => request is not { All: true } || builder.Build(Log, all: true) ? 0 : 1,
                         "test" => tests.Run(request is { All: true }, Log),
                         _ => 2,
                     };
@@ -112,11 +115,14 @@ static class Daemon
                 {
                     exitCode = request?.Command switch
                     {
-                        "build" => builder.Build(Log) ? 0 : 1,
+                        "build" => builder.Build(Log, all: request is { All: true }) ? 0 : 1,
                         "test" => builder.Build(Log) ? tests.Run(request is { All: true }, Log) : 1,
                         _ => 2,
                     };
                 }
+                // After the build, which may have changed what it analyzed. build --all reported all of it.
+                if (loaded && request is { Command: "build" or "test" } and not { Command: "build", All: true })
+                    builder.ReportBackgroundAnalysis(Log);
                 // A build may have reloaded the solution, and a run took hosts.
                 if (loaded)
                     tests.Prestart();
@@ -130,7 +136,10 @@ static class Daemon
 
             try { writer.WriteLine($"{DaemonClient.ExitPrefix}{exitCode}"); }
             catch (IOException) { }
-            collector.Idle(builder.WarmingUp);
+            if (loaded)
+                builder.AnalyzeWhenIdle();
+            // Once the idle work ends: the warm-up, then the background analysis, which allocates heavily.
+            collector.Idle(builder.Idling);
         }
     }
 }

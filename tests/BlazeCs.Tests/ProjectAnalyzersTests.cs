@@ -159,6 +159,44 @@ public sealed class ProjectAnalyzersTests : IDisposable
     static string[] Formatted(ImmutableArray<Diagnostic> diagnostics) =>
         [.. diagnostics.Select(d => CSharpDiagnosticFormatter.Instance.Format(d)).Order(StringComparer.Ordinal)];
 
+    [Fact]
+    public async Task ReportsCompilationEndRulesOnlyFromTheWholeCompilation()
+    {
+        var (compilation, config) = Project("[C.cs]\ndotnet_diagnostic.TST003.severity = none\n",
+            ("A.cs", "class Lonely { }"), ("B.cs", "class B { void Bad() { } static B Make() => new B(); }"), ("C.cs", "class Alone { }"));
+        DiagnosticAnalyzer[] analyzers = [new BadMethodAnalyzer(), new UnusedClassAnalyzer()];
+
+        // A file's analysis can't see that nothing in the project uses the class.
+        Assert.Equal(["TST001"], (await Analyze(analyzers, config, compilation, "A.cs", "B.cs")).Select(d => d.Id));
+        // The background run reports what that analysis can't, with each file's .editorconfig severity.
+        var compilationEnd = await AnalyzeCompilation(analyzers, config, compilation, compilationEndOnly: true);
+        Assert.Equal([("TST003", "A.cs")], compilationEnd.Select(d => (d.Id, Path.GetFileName(d.Location.SourceTree!.FilePath))));
+        // --all reports everything.
+        var all = await AnalyzeCompilation(analyzers, config, compilation, compilationEndOnly: false);
+        Assert.Equal([("TST001", "B.cs"), ("TST003", "A.cs")],
+            all.Select(d => (d.Id, Path.GetFileName(d.Location.SourceTree!.FilePath))).Order());
+    }
+
+    [Fact]
+    public async Task KeepsADiagnosticReportedTwiceAndAThrowingAnalyzerOnce()
+    {
+        var (compilation, config) = Project("", ("A.cs", "class Lonely { void M() { } }"));
+        var diagnostics = await AnalyzeCompilation([new UnusedClassAnalyzer(reportTwice: true), new ThrowingAnalyzer()], config, compilation, compilationEndOnly: false);
+
+        // csc prints a diagnostic an analyzer reports twice twice.
+        Assert.Equal(["AD0001", "TST003", "TST003"], diagnostics.Select(d => d.Id).Order());
+    }
+
+    [Fact]
+    public async Task RunsNoWholeCompilationAnalysisWithoutACompilationEndRule()
+    {
+        var (compilation, config) = Project("", ("A.cs", "class A { void Bad() { } }"));
+        var analyzers = new ProjectAnalyzers([new BadMethodAnalyzer()], config.Options());
+
+        Assert.False(analyzers.CanReportAtCompilationEnd);
+        Assert.Empty(await analyzers.AnalyzeCompilationAsync(compilation, [], compilationEndOnly: true, TestContext.Current.CancellationToken));
+    }
+
     /// <summary>A project of these files in the temporary directory, with this .editorconfig, as csc compiles it.</summary>
     (CSharpCompilation, ProjectConfig) Project(string editorConfig, params (string Name, string Source)[] files)
     {
@@ -179,6 +217,48 @@ public sealed class ProjectAnalyzersTests : IDisposable
         var result = await new ProjectAnalyzers([.. analyzers], config.Options())
             .AnalyzeAsync(compilation, trees, [], TestContext.Current.CancellationToken);
         return [.. result.Diagnostics.Where(d => d.Severity >= DiagnosticSeverity.Warning)];
+    }
+
+    async Task<ImmutableArray<Diagnostic>> AnalyzeCompilation(DiagnosticAnalyzer[] analyzers, ProjectConfig config, Compilation compilation, bool compilationEndOnly)
+    {
+        var diagnostics = await new ProjectAnalyzers([.. analyzers], config.Options())
+            .AnalyzeCompilationAsync(compilation, [], compilationEndOnly, TestContext.Current.CancellationToken);
+        return [.. diagnostics.Where(d => d.Severity >= DiagnosticSeverity.Warning)];
+    }
+
+    /// <summary>
+    /// Reports, at compilation end, every class no code in the compilation names: a whole-compilation rule, like
+    /// CA1812 (internal classes never instantiated).
+    /// </summary>
+    [DiagnosticAnalyzer(LanguageNames.CSharp)]
+    sealed class UnusedClassAnalyzer(bool reportTwice = false) : DiagnosticAnalyzer
+    {
+        static readonly DiagnosticDescriptor Rule = new("TST003", "Unused class", "Class '{0}' is never used", "Test", DiagnosticSeverity.Warning,
+            isEnabledByDefault: true, customTags: [WellKnownDiagnosticTags.CompilationEnd]);
+
+        public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => [Rule];
+
+        public override void Initialize(AnalysisContext context)
+        {
+            context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
+            context.EnableConcurrentExecution();
+            context.RegisterCompilationStartAction(start =>
+            {
+                var declared = new System.Collections.Concurrent.ConcurrentBag<INamedTypeSymbol>();
+                var named = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>();
+                start.RegisterSymbolAction(c => declared.Add((INamedTypeSymbol)c.Symbol), SymbolKind.NamedType);
+                start.RegisterSyntaxNodeAction(c => named[((IdentifierNameSyntax)c.Node).Identifier.ValueText] = true, SyntaxKind.IdentifierName);
+                start.RegisterCompilationEndAction(end =>
+                {
+                    foreach (var type in declared.Where(t => !named.ContainsKey(t.Name)))
+                    {
+                        end.ReportDiagnostic(Diagnostic.Create(Rule, type.Locations[0], type.Name));
+                        if (reportTwice)
+                            end.ReportDiagnostic(Diagnostic.Create(Rule, type.Locations[0], type.Name));
+                    }
+                });
+            });
+        }
     }
 
     /// <summary>Reports every method named Bad: a syntax node action, which runs in the semantic pass.</summary>

@@ -56,6 +56,7 @@ In a directory with one `.sln` or `.slnx` (or below one):
 
 ```text
 blaze-cs build                  like dotnet build
+blaze-cs build --all            build, then run every analyzer on every project and report all their warnings
 blaze-cs test                   build, then run the test projects whose inputs changed
 blaze-cs test --all             build, then run every test project
 blaze-cs run [dotnet run args]  build, then dotnet run --no-build
@@ -75,7 +76,8 @@ After you rebuild blaze-cs, the next command stops the daemon of the old build a
 saying so. The daemon's log is `.blaze-cs/daemon.log` next to the solution, capped at 1 MiB.
 
 A few seconds after a command, when no other has started, the daemon runs a full collection that gives
-the memory the build used back to the OS; a command that arrives meanwhile waits only for that
+the memory the build used back to the OS. It waits for the idle work before it (the first load's warm-up,
+then the background analysis of compilation-end rules), so it gives back what that grew too; a command that arrives meanwhile waits only for that
 collection (tens to hundreds of milliseconds). Each one logs a line of its own:
 
 ```
@@ -150,6 +152,19 @@ its own:
   where they now are. Analyzers that look across a type's members (CA2213 or IDISP002, from a type's
   symbol-end action) or at the whole file analyze the whole file again, as Visual Studio does for them.
   Analyzers never change the emitted bytes.
+- **Compilation-end rules in the background.** Rules that need the whole project (an internal class never
+  instantiated, unused members and the like; the analyzers mark them `CompilationEnd`) can't run on single
+  files. A second after a command, with no other command started, the daemon runs them on each project
+  compiled since they last reported on it (by the daemon, or by a fallback `dotnet build`, which prints
+  errors only), one project at a time. The next `build` or `test` shows what they found after its own
+  output, under a line naming the projects and when the run finished:
+  ```text
+  blaze-cs: background analysis (compilation-end rules) of Lib (net10.0), Lib (net8.0), finished at 16:17:51 in 25 ms: 2 warning(s)
+  ```
+  A command never waits for it: it cancels the run as it arrives, and the projects the run didn't finish
+  run at the next idle, as do projects the command changed, whose results it drops. `blaze-cs build --all`
+  runs every analyzer on every project's whole compilation at once and reports all their warnings, under
+  a `blaze-cs: full analysis` line.
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
   or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
   project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
@@ -174,9 +189,11 @@ its own:
   on the whole file, which on a large file with many analyzers takes longer than the compile (jellyfin's
   3,100-line `BaseItem.cs`: that build takes 0.15 to 0.4 s longer; later body edits in it add 5 to 40 ms).
   An analyzer that reports in another file than the one it analyzes (a partial type's other part) is
-  reported only when that file is analyzed. Analyzers that report at
-  compilation end (unused members, unused parameters and the like) don't run, and diagnostic suppressors
-  don't silence compiler warnings.
+  reported only when that file is analyzed. Compilation-end rules
+  (unused members, unused parameters and the like) come from the background analysis, on the command
+  after it finished, or from `blaze-cs build --all`, which reports every analyzer's warnings (the
+  compiler's still only for the projects it compiles). Diagnostic suppressors don't silence compiler
+  warnings.
   Warnings-as-errors, and rules set to `error`, are reported as warnings and don't fail the build. Run
   `dotnet build` or CI for every warning.
 - **Skipped dependents' PDBs:** a dependent the API diff skipped keeps its DLL. Its code is identical, but
