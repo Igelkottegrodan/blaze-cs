@@ -28,6 +28,12 @@ namespace BlazeCs;
 /// </remarks>
 sealed class CompilerServer : IDisposable
 {
+    /// <summary>
+    /// The process a shutdown answer names when no process will exit: no pid Linux, macOS or Windows gives
+    /// (Windows' are multiples of 4), so a client finds it not running and waits for nothing.
+    /// </summary>
+    const int NoProcess = int.MaxValue;
+
     /// <summary>BLAZE_CS_COMPILER_SERVER=0 in the environment the daemon starts in turns the pipe off.</summary>
     public static bool Enabled => Environment.GetEnvironmentVariable("BLAZE_CS_COMPILER_SERVER") != "0";
 
@@ -200,7 +206,8 @@ sealed class CompilerServer : IDisposable
         if (answer is not ServerResponse.Shutdown { ServerProcessId: var pid })
             return Describe(answer);
         Process? server = null;
-        try { server = Process.GetProcessById(pid); }
+        // Another daemon answers with NoProcess once it has stopped listening (see Handle).
+        try { server = pid is > 0 and not NoProcess ? Process.GetProcessById(pid) : null; }
         catch (ArgumentException) { } // gone already
         using (server)
         {
@@ -338,12 +345,15 @@ sealed class CompilerServer : IDisposable
                 }
                 if (request.IsShutdown)
                 {
-                    // `dotnet build-server shutdown`, or another daemon taking the pipe: that waits until the
-                    // mutex goes. The VBCSCompiler compiles were passed to goes too.
+                    // `dotnet build-server shutdown`, or another daemon taking the pipe. The daemon gives the pipe up
+                    // first, and the VBCSCompiler compiles were passed to goes too. The answer names no running
+                    // process: the client waits for the one it names to exit, Roslyn up to SDK 10.0.1xx with no
+                    // other way out (RunServerShutdownRequestAsync), and the daemon keeps running. Not 0 (or -1):
+                    // on Unix, kill(0, 0) succeeds, so .NET takes process 0 as running and waits on it forever.
                     Log("shutdown request (dotnet build-server shutdown, or another daemon): giving the pipe up until the next blaze-cs command");
-                    new ServerResponse.Shutdown(Environment.ProcessId).Write(client);
                     Release();
                     ShutDownPrivateServer();
+                    new ServerResponse.Shutdown(NoProcess).Write(client);
                     return;
                 }
 
@@ -472,9 +482,16 @@ sealed class CompilerServer : IDisposable
             using var pipe = new NamedPipeClientStream(".", PipePath(pipeName), PipeDirection.InOut, PipeOptions.CurrentUserOnly);
             pipe.Connect(timeout);
             request.Write(pipe);
-            return ServerResponse.Read(pipe);
+            // A shutdown is answered at once; a server that doesn't is given up on.
+            var answer = Task.Run(() => ServerResponse.Read(pipe));
+            if (!answer.Wait(TimeSpan.FromSeconds(10)))
+            {
+                pipe.Dispose(); // ends the read
+                return new ServerResponse.Rejected("no answer within 10 s");
+            }
+            return answer.Result;
         }
-        catch (Exception e) when (e is IOException or InvalidDataException or EndOfStreamException or UnauthorizedAccessException or TimeoutException)
+        catch (Exception e) when (e is IOException or InvalidDataException or EndOfStreamException or UnauthorizedAccessException or TimeoutException or AggregateException)
         {
             return new ServerResponse.Rejected($"no answer: {e.Message}");
         }

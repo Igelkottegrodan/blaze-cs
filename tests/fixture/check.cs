@@ -784,11 +784,11 @@ string SdkDirectory()
 // next dotnet build starts the SDK's server again. Ends with a daemon running, warmed up.
 void PipeHandedOver(string pipe)
 {
-    // As VBCSCompiler does, the daemon answers the request with its process id, then stops serving the pipe;
-    // the command waits for that and exits 0.
+    // The daemon stops serving the pipe, then answers with a process id no system gives: the command waits
+    // for that process to exit (SDK 10.0.1xx's with no timeout of its own), finds it gone and exits 0.
     var mark = LogMark();
     var daemon = Daemons().Last().Pid;
-    var (shutdown, shutdownExit) = RunWithExit("dotnet", "build-server shutdown --vbcscompiler", check: false);
+    var (shutdown, shutdownExit) = RunWithExit("dotnet", "build-server shutdown --vbcscompiler", check: false, timeout: TimeSpan.FromMinutes(1));
     if (shutdownExit != 0 || Held(pipe) || PipeAnswers(pipe) || !Running(daemon)
         || !LogSince(mark).Contains("compiler server: shutdown request") || !LogSince(mark).Contains($"compiler server: gave up {pipe}"))
         Fail($"dotnet build-server shutdown: expected it to succeed and the daemon to give the pipe up and keep running, got exit code {shutdownExit}:\n{shutdown}\n{LogSince(mark)}");
@@ -1570,7 +1570,8 @@ void HostsStopWithTheDaemon()
     IdleHosts("after a new daemon started");
     var daemon = Process.GetProcessById(Daemons().Last().Pid);
     daemon.Kill();
-    daemon.WaitForExit();
+    if (!daemon.WaitForExit(TimeSpan.FromSeconds(30)))
+        Fail($"the killed daemon {daemon.Id} still ran after 30 s");
     NoHostsLeft("the daemon being killed");
 }
 
@@ -1960,15 +1961,25 @@ Dictionary<string, byte[]> Outputs() =>
 string Run(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null) =>
     RunWithExit(file, arguments, check, environment).Output;
 
-(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null)
+(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null, TimeSpan? timeout = null)
 {
     var start = new ProcessStartInfo(file, arguments) { WorkingDirectory = work, RedirectStandardOutput = true, RedirectStandardError = true };
     foreach (var (name, value) in environment ?? [])
         start.Environment[name] = value;
     using var process = Process.Start(start)!;
+    var stdout = process.StandardOutput.ReadToEndAsync();
     var stderr = process.StandardError.ReadToEndAsync();
-    var output = process.StandardOutput.ReadToEnd() + stderr.Result;
-    process.WaitForExit();
+    // No step waits forever: one that hangs (a client waiting on a server that never answers) fails the check.
+    var limit = timeout ?? CommandTimeout();
+    if (!process.WaitForExit(limit))
+    {
+        try { process.Kill(entireProcessTree: true); }
+        catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+        var partial = (stdout.Wait(TimeSpan.FromSeconds(10)) ? stdout.Result : "") + (stderr.Wait(TimeSpan.FromSeconds(10)) ? stderr.Result : "");
+        Fail($"{file} {arguments} still ran after {limit}; killed it:\n{partial}");
+    }
+    // A process it started (a daemon, an MSBuild node) may hold the output open: what came by then is enough.
+    var output = (stdout.Wait(TimeSpan.FromSeconds(30)) ? stdout.Result : "") + (stderr.Wait(TimeSpan.FromSeconds(30)) ? stderr.Result : "");
     if (file == blaze && arguments.StartsWith("test", StringComparison.Ordinal))
     {
         hotReloadedBefore = hotReloaded;
@@ -1978,6 +1989,9 @@ string Run(string file, string arguments, bool check = true, Dictionary<string, 
         Fail($"{file} {arguments} exited {process.ExitCode}:\n{output}");
     return (output, process.ExitCode);
 }
+
+// The longest any one command of the check may take (a cold first load on a slow CI machine takes about a minute).
+static TimeSpan CommandTimeout() => TimeSpan.FromMinutes(10);
 
 static void CopyFixture(string from, string to)
 {
