@@ -35,6 +35,7 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task build
+      - run: task test
       - shell: bash
         # The fixture copy (and its daemon log) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
         # Windows goes through the script task check:windows runs there, so CI covers it too.
