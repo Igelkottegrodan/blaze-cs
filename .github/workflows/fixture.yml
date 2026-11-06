@@ -36,6 +36,19 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task build
       - run: task test
+      - run: task pack
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blaze-cs-tool-${{ matrix.os }}-${{ matrix.sdk }}
+          path: artifacts/packages/*.nupkg
+      - name: Install the packed tool
+        shell: bash
+        # The fixture check below runs this installed copy, not the build in artifacts/bin (BLAZE_CS).
+        run: |
+          dotnet tool install blaze-cs --tool-path "$RUNNER_TEMP/blaze-cs-tool" --add-source artifacts/packages
+          exe=blaze-cs
+          if [ "$RUNNER_OS" = Windows ]; then exe=blaze-cs.exe; fi
+          echo "BLAZE_CS=$RUNNER_TEMP/blaze-cs-tool/$exe" >> "$GITHUB_ENV"
       - shell: bash
         # The fixture copy (and its daemon logs) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
         # Windows goes through the script task check:windows runs there, so CI covers it too.

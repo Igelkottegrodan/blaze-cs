@@ -2,13 +2,16 @@
 # check-windows.ps1 <dotnet directory> <sdk version>...
 param([string]$Dotnet)
 
+# BLAZE_CS (an absolute path, as the check runs from the fixture) selects an installed tool instead of the build here.
 # This SDK first on PATH: for blaze-cs.cmd, and for the dotnet the daemon runs.
 $env:PATH = "$Dotnet;$env:PATH"
 $env:DOTNET_ROOT = $Dotnet
 Set-Location (Split-Path $PSScriptRoot)
 
-dotnet build BlazeCs.slnx -nologo -v:q
-if ($LASTEXITCODE) { exit 1 }
+if (-not $env:BLAZE_CS) {
+    dotnet build BlazeCs.slnx -nologo -v:q
+    if ($LASTEXITCODE) { exit 1 }
+}
 $status = 0
 foreach ($sdk in $args) {
     "== Windows, SDK $sdk"

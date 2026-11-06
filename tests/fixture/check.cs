@@ -6,7 +6,8 @@
 // may differ only in debug identity (PeIdentity), and only in a project blaze-cs skipped: its PDB still
 // records the old MVID of the reference that changed. After a fallback, nothing may differ.
 //
-// usage: task check   (or: dotnet run tests/fixture/check.cs, after `dotnet build BlazeCs.slnx`)
+// usage: task check   (or: dotnet run tests/fixture/check.cs, after `dotnet build BlazeCs.slnx`;
+// or BLAZE_CS=<installed blaze-cs> dotnet run tests/fixture/check.cs, after `task pack` and `dotnet tool install`)
 using System.Diagnostics;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
@@ -16,7 +17,10 @@ var fixture = Path.GetDirectoryName(Path.GetFullPath(AppContext.GetData("EntryPo
 var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
 var otherBuild = work + "-other-build";
-var blaze = Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
+// BLAZE_CS=<path> runs that blaze-cs command, such as an installed tool's, instead of the launcher built here.
+var blaze = Environment.GetEnvironmentVariable("BLAZE_CS") is { Length: > 0 } given
+    ? given
+    : Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
 
 // BLAZE_CS_SDK=<exact version> checks against another SDK than the repo's pin, such as a .NET 11 one or the
 // oldest supported .NET 10 (rollForward is off: a newer installed SDK must not stand in for it).
