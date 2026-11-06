@@ -77,6 +77,10 @@ Case[] cases =
         [], "build", "Components/Badge.razor.css changed, running dotnet build"),
     new("deleted razor file", () => File.Delete(Path.Combine(work, "Components/Farewell.razor")),
         [], "build", "Components: Farewell.razor was deleted; running dotnet build"),
+    // A project file edit goes through dotnet build, but csc's arguments don't change: every unit stays
+    // warm, and none needs a compile to be trusted, since MSBuild left each assembly as the daemon knew it.
+    new("project file edit", () => Replace("Lib/Lib.csproj", "</Project>", "  <!-- edited -->\n</Project>"),
+        [], "build", "Lib/Lib.csproj changed, running dotnet build", AllKept: true),
 ];
 
 if (Directory.Exists(work))
@@ -95,11 +99,11 @@ var passed = false;
 try
 {
     Run(blaze, "build"); // starts the daemon: a real dotnet build, then a warm-up compile
-    foreach (var (name, edit, expected, command, fallback) in cases)
+    foreach (var (name, edit, expected, command, fallback, allKept) in cases)
     {
         edit();
         var output = Run(blaze, command);
-        var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback);
+        var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback, allKept);
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
         if (command == "test")
@@ -177,16 +181,25 @@ HashSet<string> Rebuilt(string output)
 }
 
 // A case that must go through dotnet build: blaze-cs logs why, and then reloads with every assembly
-// identical to that build's. The projects MSBuild compiled aren't reported, so the set is empty.
-HashSet<string> FellBack(string name, string output, string fallback)
+// identical to that build's. The projects MSBuild compiled aren't reported, so the set is empty. With
+// allKept, the reload must also keep every unit warm and compile none to verify it.
+HashSet<string> FellBack(string name, string output, string fallback, bool allKept)
 {
     // Its message names paths with this OS's separator.
     if (!output.Contains($"blaze-cs: {fallback.Replace('/', Path.DirectorySeparatorChar)}"))
         Fail($"{name}: expected blaze-cs to log \"{fallback}\":\n{output}");
     // The last warm-up: one that finds stale cached arguments reloads with fresh ones.
-    var warmUp = Regex.Matches(output, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical", RegexOptions.Multiline).LastOrDefault();
+    var warmUp = Regex.Matches(output, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical.*", RegexOptions.Multiline).LastOrDefault();
     if (warmUp is null || warmUp.Groups[1].Value != warmUp.Groups[2].Value)
         Fail($"{name}: expected blaze-cs to reload with every assembly identical to dotnet build's:\n{output}");
+    if (allKept)
+    {
+        var loaded = Regex.Matches(output, @"^blaze-cs: loaded (\d+) projects .*", RegexOptions.Multiline).LastOrDefault();
+        var kept = Regex.Match(loaded?.Value ?? "", @"(\d+) kept warm").Groups[1].Value;
+        var compiled = Regex.Match(warmUp.Value, @"\((\d+) compiled\)").Groups[1].Value;
+        if (loaded is null || kept != loaded.Groups[1].Value || compiled != "0")
+            Fail($"{name}: expected blaze-cs to keep every project warm and compile none of them again:\n{output}");
+    }
     return [];
 }
 
@@ -273,4 +286,4 @@ static void Fail(string message) => throw new CheckFailed(message);
 
 sealed class CheckFailed(string message) : Exception(message);
 
-sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null);
+sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null, bool AllKept = false);

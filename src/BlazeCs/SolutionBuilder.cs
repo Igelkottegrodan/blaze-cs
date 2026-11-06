@@ -50,7 +50,9 @@ sealed class SolutionBuilder
 
     /// <summary>
     /// Runs `dotnet build` and loads what it did. csc only logs its arguments when it runs, so with no
-    /// cached arguments the first build compiles everything; later ones are incremental.
+    /// cached arguments the first build compiles everything; later ones are incremental. A unit already
+    /// held whose arguments didn't change stays as it is, with its parsed sources and generator caches;
+    /// only the others are built from the arguments, and every unit takes the images the build wrote.
     /// </summary>
     /// <param name="fresh">Ignore the cached arguments and compile everything.</param>
     public bool Load(Action<string> log, bool fresh = false)
@@ -63,6 +65,7 @@ sealed class SolutionBuilder
 
         var stopwatch = Stopwatch.StartNew();
         var info = BuildLog.Read(binlog, _sdkDirectory);
+        var read = stopwatch.ElapsedMilliseconds;
         var units = cached.ToDictionary(u => u.AssemblyPath, PathComparer.Instance);
         foreach (var unit in info.Units)
             units[unit.AssemblyPath] = unit;
@@ -84,10 +87,19 @@ sealed class SolutionBuilder
             foreach (var path in Closure(unit.AssemblyPath).Concat(unit.ReferenceAssemblyPath is { } r ? Closure(r) : []))
                 _imagePaths[path] = image;
         }
-        _images = new(PathComparer.Instance);
 
+        // The images as the build left them. One with the same bytes keeps its object, and with it the
+        // MetadataReferences the units compiled against it hold, so those units see no reference change.
+        _images = units.Values.AsParallel()
+            .Select(unit => unit.ReferenceAssemblyPath ?? unit.AssemblyPath)
+            .Select(path => (Path: path, Image: Image.Read(path, _images.GetValueOrDefault(path))))
+            .ToDictionary(i => i.Path, i => i.Image, PathComparer.Instance);
+
+        var held = _units.ToDictionary(c => c.Unit.AssemblyPath, PathComparer.Instance);
         var compilers = units.Values.AsParallel()
-            .Select(unit => new ProjectCompiler(unit, ResolveReference, _generators))
+            .Select(unit => held.TryGetValue(unit.AssemblyPath, out var kept) && kept.Matches(unit)
+                ? kept
+                : new ProjectCompiler(unit, ResolveReference, _generators))
             .ToList();
         var byImage = compilers.ToDictionary(c => c.ImagePath, PathComparer.Instance);
         _producers = _imagePaths.ToDictionary(p => p.Key, p => byImage[p.Value], PathComparer.Instance);
@@ -103,9 +115,25 @@ sealed class SolutionBuilder
             .OfType<ProjectCompiler>()
             .ToHashSet();
         _msbuildInputs = MSBuildInputs();
+        foreach (var gone in _surfaces.Keys.Concat(_lastDuration.Keys).Except(compilers).ToList())
+        {
+            _surfaces.TryRemove(gone, out _);
+            _lastDuration.TryRemove(gone, out _);
+        }
 
-        log($"blaze-cs: loaded {_units.Count} projects in {stopwatch.ElapsedMilliseconds} ms");
-        var mismatched = WarmUp(log);
+        // A kept unit needs no compile to be trusted while its assembly on disk is still the bytes the
+        // daemon last emitted for it: whatever the build did, the unit reproduces that file. One whose
+        // inputs, references or file changed compiles and is compared, like a new unit.
+        var kept = held.Values.Intersect(compilers).ToHashSet();
+        bool NeedsCompile(ProjectCompiler unit) =>
+            !kept.Contains(unit)
+            || (unit.Realign() | unit.RefreshReferences()) // both run; each brings the unit up to date
+            || !(_published.TryGetValue(unit.AssemblyPath, out var last) && Holds(unit.AssemblyPath, last.Bytes));
+        var verify = _units.AsParallel().Where(NeedsCompile).ToList();
+
+        log($"blaze-cs: loaded {_units.Count} projects in {stopwatch.ElapsedMilliseconds} ms (build log {read} ms"
+            + (kept.Count > 0 ? $"; {kept.Count} kept warm)" : ")"));
+        var mismatched = WarmUp(log, verify);
 
         // A unit this build didn't compile keeps the arguments csc last ran with under the daemon. If a
         // build outside it (an IDE's, `dotnet build`) compiled the project since, with other sources, they
@@ -120,15 +148,16 @@ sealed class SolutionBuilder
     }
 
     /// <summary>
-    /// Compiles every unit once into memory: JITs the compiler, fills the generator caches, and checks
-    /// that the daemon's output is byte-for-byte what `dotnet build` just wrote.
+    /// Compiles these units once into memory: JITs the compiler, fills the generator caches, and checks
+    /// that the daemon's output is byte-for-byte what `dotnet build` just wrote. The other units are
+    /// kept warm and already known to match.
     /// </summary>
     /// <returns>The units whose output differs.</returns>
-    List<ProjectCompiler> WarmUp(Action<string> log)
+    List<ProjectCompiler> WarmUp(Action<string> log, IReadOnlyCollection<ProjectCompiler> units)
     {
         var stopwatch = Stopwatch.StartNew();
         var mismatches = new ConcurrentDictionary<ProjectCompiler, string>();
-        Parallel.ForEach(_units, unit =>
+        Parallel.ForEach(units, unit =>
         {
             var prepared = unit.Prepare();
             // The baselines the first edit is compared against.
@@ -139,10 +168,11 @@ sealed class SolutionBuilder
             var (output, diagnostics) = unit.Emit(prepared);
             if (output is null)
                 mismatches[unit] = $"{unit.Unit.Name}: {diagnostics.First(d => d.Severity == DiagnosticSeverity.Error)}";
-            else if (!output.Assembly.AsSpan().SequenceEqual(File.ReadAllBytes(unit.AssemblyPath)))
+            else if (!Holds(unit.AssemblyPath, output.Assembly))
                 mismatches[unit] = $"{unit.Unit.Name}: emitted assembly differs from {unit.AssemblyPath}";
         });
-        log($"blaze-cs: warmed up in {stopwatch.ElapsedMilliseconds} ms; {_units.Count - mismatches.Count}/{_units.Count} assemblies identical to dotnet build");
+        log($"blaze-cs: warmed up in {stopwatch.ElapsedMilliseconds} ms; {_units.Count - mismatches.Count}/{_units.Count} assemblies identical to dotnet build"
+            + (units.Count < _units.Count ? $" ({units.Count} compiled)" : ""));
         foreach (var mismatch in mismatches.Values.Order())
             log($"blaze-cs: warning: {mismatch}");
         return [.. mismatches.Keys];
@@ -393,31 +423,40 @@ sealed class SolutionBuilder
         return true;
     }
 
-    /// <summary>
-    /// Writes an output and its copies, unless it already holds these bytes. What the daemon last wrote
-    /// is remembered with the file's stamp, so the disk is only read when something else wrote it since.
-    /// </summary>
+    /// <summary>Writes an output and its copies, unless it already holds these bytes.</summary>
     void Write(string path, byte[] bytes)
     {
-        var info = new FileInfo(path);
-        var unchanged = _published.TryGetValue(path, out var last) && last.Length == info.Length
-            && last.Modified == (info.Exists ? info.LastWriteTimeUtc : default)
-                ? last.Bytes.AsSpan().SequenceEqual(bytes)
-                : info.Exists && File.ReadAllBytes(path).AsSpan().SequenceEqual(bytes);
-        if (!unchanged)
+        if (Holds(path, bytes))
+            return;
+        Parallel.ForEach(Closure(path), target =>
         {
-            Parallel.ForEach(Closure(path), target =>
-            {
-                // Replace rather than overwrite: a running test host may have the old file mapped.
-                var temporary = target + ".blaze-cs.tmp";
-                File.WriteAllBytes(temporary, bytes);
-                File.Move(temporary, target, overwrite: true);
-            });
-            info.Refresh();
-        }
+            // Replace rather than overwrite: a running test host may have the old file mapped.
+            var temporary = target + ".blaze-cs.tmp";
+            File.WriteAllBytes(temporary, bytes);
+            File.Move(temporary, target, overwrite: true);
+        });
+        var info = new FileInfo(path);
         _published[path] = new Published(bytes, info.Length, info.LastWriteTimeUtc);
     }
 
+    /// <summary>
+    /// Whether a file holds these bytes. The disk is only read when something else wrote the file since
+    /// the daemon last wrote or verified it; if it holds them, that is remembered with the file's stamp.
+    /// </summary>
+    bool Holds(string path, byte[] bytes)
+    {
+        var info = new FileInfo(path);
+        if (!info.Exists)
+            return false;
+        if (_published.TryGetValue(path, out var last) && last.Length == info.Length && last.Modified == info.LastWriteTimeUtc)
+            return last.Bytes.AsSpan().SequenceEqual(bytes);
+        if (info.Length != bytes.Length || !File.ReadAllBytes(path).AsSpan().SequenceEqual(bytes))
+            return false;
+        _published[path] = new Published(bytes, info.Length, info.LastWriteTimeUtc);
+        return true;
+    }
+
+    /// <summary>What the daemon last wrote to or verified in each file, with the file's stamp as of then.</summary>
     readonly ConcurrentDictionary<string, Published> _published = new(PathComparer.Instance);
 
     sealed record Published(byte[] Bytes, long Length, DateTime Modified);
@@ -469,6 +508,13 @@ sealed class SolutionBuilder
         public byte[] Bytes => bytes;
         public MetadataReference Reference(MetadataReferenceProperties properties, string path) =>
             _references.GetOrAdd(properties, p => MetadataReference.CreateFromImage(bytes, p, filePath: path));
+
+        /// <summary>The image on disk: <paramref name="current"/> itself if it still holds the same bytes.</summary>
+        public static Image Read(string path, Image? current)
+        {
+            var bytes = File.ReadAllBytes(path);
+            return current is not null && current.Bytes.AsSpan().SequenceEqual(bytes) ? current : new Image(bytes);
+        }
     }
 
     /// <summary>Every unit that compiles against one of these, directly or not, and the units themselves.</summary>
