@@ -113,7 +113,9 @@ its own:
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
   or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
   project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
-  Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon.
+  Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon. After the real
+  build, every project whose compiler arguments didn't change stays compiled in memory; only the others
+  are loaded again, and only projects whose assembly that build changed are compiled once to check it.
 
 ## Good to know
 
