@@ -74,6 +74,16 @@ The daemon exits on its own after two hours without a command, and the next comm
 After you rebuild blaze-cs, the next command stops the daemon of the old build and starts one of the new,
 saying so. The daemon's log is `.blaze-cs/daemon.log` next to the solution, capped at 1 MiB.
 
+A few seconds after a command, when no other has started, the daemon runs a full collection that gives
+the memory the build used back to the OS; a command that arrives meanwhile waits only for that
+collection (tens to hundreds of milliseconds). Each one logs a line of its own:
+
+```
+2026-11-06T15:35:02.0047935+01:00 blaze-cs: idle collection took 27 ms; heap 64 MB, committed 64 MB, working set 320 MB (was 400 MB)
+```
+
+`heap` is what the collection left, which after a full compacting collection is the daemon's live data.
+
 ## How fast
 
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.
@@ -166,7 +176,8 @@ its own:
   `dotnet build`, not in the daemon's builds. Run `dotnet build` after changing what they read.
 - **Test inputs are assemblies:** a test project's other files (data files copied to its output,
   environment variables, anything it reads at run time) don't make it run again; use `blaze-cs test --all`.
-- **It trades memory for speed:** the daemon holds a few GB (about 2.3 GB for jellyfin).
+- **It trades memory for speed:** on jellyfin the daemon peaks at about 1.3 GB during builds and falls
+  back to about 0.75 GB a few seconds after each.
 
 ## Contributing
 

@@ -170,6 +170,7 @@ try
         }
         Verify(name, rebuilt, fallback);
     }
+    IdleCollected();
     PreparedHostsSeeNewBytes();
     ProjectRemovedAndRestored();
     HostCannotLoad();
@@ -233,6 +234,23 @@ bool Running(int pid)
     {
         return false;
     }
+}
+
+// A few seconds after a command the daemon collects, off the command's path, and logs when it ran, what it
+// took and the heap it left, in the line IdleCollector.CollectAndLog documents. The cases' verifies
+// usually leave it idle long enough already.
+void IdleCollected()
+{
+    MatchCollection Collections() => Regex.Matches(ReadLog("daemon.log"),
+        @"^\S+ blaze-cs: idle collection took (\d+) ms; heap (\d+) MB, committed (\d+) MB, working set (\d+) MB \(was (\d+) MB\)\r?$", RegexOptions.Multiline);
+    var waiting = Stopwatch.StartNew();
+    while (Collections().Count == 0 && waiting.Elapsed < TimeSpan.FromSeconds(30))
+        Thread.Sleep(100);
+    var collections = Collections();
+    if (collections.Count == 0)
+        Fail($"idle collection: expected the daemon to log a collection within 30 s of the last command:\n{ReadLog("daemon.log")}");
+    var last = collections[^1].Groups;
+    Console.WriteLine($"ok  idle collection: {collections.Count} logged, the last took {last[1].Value} ms and left a {last[2].Value} MB heap");
 }
 
 // A client from another build of blaze-cs stops the daemon the cases used and starts its own, with a notice;

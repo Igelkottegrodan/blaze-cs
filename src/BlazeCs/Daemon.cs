@@ -41,6 +41,7 @@ static class Daemon
 
         var builder = new SolutionBuilder(solutionPath, sdkDirectory);
         using var tests = new TestRunner(builder);
+        var collector = new IdleCollector(IdleCollector.DefaultDelay, IdleCollector.CollectAndLog);
         var loaded = false;
 
         while (true)
@@ -56,6 +57,7 @@ static class Daemon
                     return 0;
                 }
             }
+            collector.Busy();
             using var client = accepted;
             using var stream = new NetworkStream(client);
             using var reader = new StreamReader(stream);
@@ -128,6 +130,7 @@ static class Daemon
 
             try { writer.WriteLine($"{DaemonClient.ExitPrefix}{exitCode}"); }
             catch (IOException) { }
+            collector.Idle(builder.WarmingUp);
         }
     }
 }
