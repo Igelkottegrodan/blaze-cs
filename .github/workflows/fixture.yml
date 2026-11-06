@@ -28,7 +28,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task build
       - shell: bash
-        # The fixture copy (and its daemon log) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
+        # The fixture copy (and its daemon logs) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
         # Windows goes through the script task check:windows runs there, so CI covers it too.
         run: |
           export TMP="$RUNNER_TEMP" TMPDIR="$RUNNER_TEMP"
@@ -44,5 +44,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daemon-log-${{ matrix.os }}-${{ matrix.sdk }}
-          path: ${{ runner.temp }}/blaze-cs-fixture/.blaze-cs/daemon.log
+          path: ${{ runner.temp }}/blaze-cs-fixture/.blaze-cs/daemon*.log
           if-no-files-found: ignore

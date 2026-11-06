@@ -49,6 +49,10 @@ The first command starts a daemon for that solution and runs a real `dotnet buil
 as one. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
 affect, and `blaze-cs test` runs the affected test projects in test hosts that are already started.
 
+The daemon exits on its own after two hours without a command, and the next command starts a new one.
+After you rebuild blaze-cs, the next command stops the daemon of the old build and starts one of the new,
+saying so. The daemon's log is `.blaze-cs/daemon.log` next to the solution, capped at 1 MiB.
+
 ## How fast
 
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.

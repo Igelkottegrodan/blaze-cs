@@ -49,42 +49,100 @@ static class Program
     [MethodImpl(MethodImplOptions.NoInlining)]
     static int RunDaemon(string solutionPath)
     {
-        // Before anything JIT-compiles a method that mentions a Roslyn type.
-        var sdkDirectory = SdkRoslyn.Install(Path.GetDirectoryName(solutionPath)!);
-        return Daemon.Run(solutionPath, SocketPath(solutionPath), sdkDirectory);
+        // The daemon logs to a capped file of its own; what the launcher redirects to StartLog is only
+        // what comes before this or around it, such as a runtime that can't start.
+        var log = new DaemonLog(DaemonLogPath(solutionPath));
+        Console.SetOut(log);
+        Console.SetError(log);
+        try
+        {
+            // Before anything JIT-compiles a method that mentions a Roslyn type.
+            var sdkDirectory = SdkRoslyn.Install(Path.GetDirectoryName(solutionPath)!);
+            return Daemon.Run(solutionPath, SocketPath(solutionPath), sdkDirectory);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"{DateTime.Now:O} {e}");
+            return 1;
+        }
     }
 
     static int Send(string solutionPath, string command)
     {
         var socketPath = SocketPath(solutionPath);
-        var connected = Connect(socketPath);
-        // Only a new daemon picks an SDK, so warm commands skip the extra `dotnet --version`.
-        if (connected is null && command != "stop" && SdkRoslyn.Unsupported(Path.GetDirectoryName(solutionPath)!) is { } problem)
+        var socket = Connect(socketPath);
+        for (var restarted = false; ; restarted = true)
         {
-            Console.Error.WriteLine($"blaze-cs: {problem}");
-            return 1;
-        }
-        using var socket = connected ?? StartDaemon(solutionPath, socketPath);
-        if (socket is null)
-        {
-            if (command == "stop")
-                return 0;
-            Console.Error.WriteLine($"blaze-cs: the daemon did not start; see {DaemonLog(solutionPath)}");
-            return 1;
-        }
+            if (socket is null)
+            {
+                if (command == "stop")
+                    return 0;
+                // Only a new daemon picks an SDK, so warm commands skip the extra `dotnet --version`.
+                if (SdkRoslyn.Unsupported(Path.GetDirectoryName(solutionPath)!) is { } problem)
+                {
+                    Console.Error.WriteLine($"blaze-cs: {problem}");
+                    return 1;
+                }
+                socket = StartDaemon(solutionPath, socketPath);
+                if (socket is null)
+                {
+                    Console.Error.WriteLine($"blaze-cs: the daemon did not start; see {DaemonLogPath(solutionPath)} and {StartLogPath(solutionPath)}");
+                    return 1;
+                }
+            }
 
+            using (socket)
+            {
+                var exitCode = Exchange(socket, command, out var otherBuild);
+                if (otherBuild is not { } daemonProcess)
+                    return exitCode;
+                if (restarted)
+                {
+                    Console.Error.WriteLine("blaze-cs: the new daemon is from another build too");
+                    return 1;
+                }
+                Console.Error.WriteLine("blaze-cs: the running daemon is from another build of blaze-cs; restarting it");
+                WaitForExit(daemonProcess);
+            }
+            socket = null;
+        }
+    }
+
+    /// <summary>
+    /// Sends the command and relays the output. A daemon of another build answers with its process id
+    /// instead, and exits.
+    /// </summary>
+    static int Exchange(Socket socket, string command, out int? otherBuildProcess)
+    {
+        otherBuildProcess = null;
         using var stream = new NetworkStream(socket);
         using var writer = new StreamWriter(stream) { AutoFlush = true };
         using var reader = new StreamReader(stream);
-        writer.WriteLine(JsonSerializer.Serialize(new Request(command)));
+        writer.WriteLine(JsonSerializer.Serialize(new Request(command, Daemon.Build)));
         while (reader.ReadLine() is { } line)
         {
             if (line.StartsWith(Daemon.ExitPrefix, StringComparison.Ordinal))
                 return int.Parse(line[Daemon.ExitPrefix.Length..]);
+            if (line.StartsWith(Daemon.RestartPrefix, StringComparison.Ordinal))
+            {
+                otherBuildProcess = int.Parse(line[Daemon.RestartPrefix.Length..]);
+                return 0;
+            }
             Console.WriteLine(line);
         }
         Console.Error.WriteLine("blaze-cs: lost the daemon mid-command");
         return 1;
+    }
+
+    /// <summary>So the new daemon doesn't start beside one still shutting down.</summary>
+    static void WaitForExit(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            process.WaitForExit(TimeSpan.FromSeconds(30));
+        }
+        catch (ArgumentException) { } // already gone
     }
 
     static Socket? Connect(string socketPath)
@@ -107,8 +165,9 @@ static class Program
     static Socket? StartDaemon(string solutionPath, string socketPath)
     {
         File.Delete(socketPath);
-        var log = DaemonLog(solutionPath);
+        var log = StartLogPath(solutionPath);
         Directory.CreateDirectory(Path.GetDirectoryName(log)!);
+        DeleteWhenReleased(log);
 
         // The daemon lives for many builds of a large heap: server GC, and the JIT straight to optimized
         // code for hot compiler paths. Measured on jellyfin, a body edit's compile went from ~1 s to ~0.3 s.
@@ -168,8 +227,32 @@ static class Program
         }
     }
 
-    static string DaemonLog(string solutionPath) =>
+    static string DaemonLogPath(string solutionPath) =>
         Path.Combine(Path.GetDirectoryName(solutionPath)!, ".blaze-cs", "daemon.log");
+
+    /// <summary>What the launcher redirects the daemon's own stdout and stderr to; see DaemonLog.</summary>
+    static string StartLogPath(string solutionPath) =>
+        Path.Combine(Path.GetDirectoryName(solutionPath)!, ".blaze-cs", "daemon-start.log");
+
+    /// <summary>
+    /// On Windows the launcher of a daemon that just exited can hold the file for a moment longer, and the
+    /// next launcher can't open it meanwhile.
+    /// </summary>
+    static void DeleteWhenReleased(string path)
+    {
+        for (var attempt = 0; attempt < 50; attempt++)
+        {
+            try
+            {
+                File.Delete(path);
+                return;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                Thread.Sleep(100);
+            }
+        }
+    }
 
     /// <summary>Per solution, under the runtime directory: socket paths must stay short.</summary>
     static string SocketPath(string solutionPath)
@@ -196,4 +279,4 @@ static class Program
     }
 }
 
-sealed record Request(string Command);
+sealed record Request(string Command, Guid Build);
