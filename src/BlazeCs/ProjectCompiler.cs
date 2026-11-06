@@ -186,6 +186,7 @@ sealed class ProjectCompiler
                 _sources.Remove(file.Path);
                 _order.Remove(file.Path);
                 _unanalyzed.Remove(file.Path);
+                _analyzers?.Forget(file.Path);
                 filesAddedOrRemoved = true;
                 continue;
             }
@@ -309,6 +310,7 @@ sealed class ProjectCompiler
         foreach (var extra in _sources.Keys.Except(order, PathComparer.Instance).ToList())
         {
             _sources.Remove(extra);
+            _analyzers?.Forget(extra);
             changed = true;
         }
         if (changed || !order.SequenceEqual(_order, PathComparer.Instance))
@@ -389,7 +391,9 @@ sealed class ProjectCompiler
             referenceAssembly,
             cancellationToken: cancellationToken);
 
-        var diagnostics = prepared.Diagnostics.AddRange(result.Diagnostics);
+        // csc warns, every build, about the analyzers it failed to load or create: loading them finds out.
+        _ = Analyzers;
+        var diagnostics = prepared.Diagnostics.AddRange(_analyzerCache.LoadFailures(AnalyzerPaths, compilation.Options)).AddRange(result.Diagnostics);
         if (!result.Success)
             return (null, diagnostics);
         return (new EmitOutput(assembly.ToArray(), pdb?.ToArray(), documentation?.ToArray(), referenceAssembly?.ToArray()), diagnostics);
@@ -399,8 +403,30 @@ sealed class ProjectCompiler
     public ProjectAnalyzers Analyzers => LazyInitializer.EnsureInitialized(ref _analyzers,
         () => new ProjectAnalyzers(_analyzerCache.Analyzers(AnalyzerPaths, suppressorsOnly: _args.SkipAnalyzers), _config.Options()));
 
-    /// <summary>The analysis of the sources this compile is the first to see, running; see <see cref="Analyzed"/>.</summary>
-    public sealed record Analysis(IReadOnlyList<SyntaxTree> Trees, Task<(ImmutableArray<Diagnostic> Diagnostics, TimeSpan Time)> Result);
+    /// <summary>
+    /// The analysis of the sources this compile is the first to see, running: <see cref="Analyzed"/> once the
+    /// compile is written, <see cref="Analysis.Abandon"/> if it never is.
+    /// </summary>
+    public sealed class Analysis
+    {
+        readonly CancellationTokenSource _abandoned;
+
+        public Analysis(IReadOnlyList<SyntaxTree> trees, Func<CancellationToken, Task<AnalysisResult>> run, CancellationToken cancellationToken)
+        {
+            Trees = trees;
+            _abandoned = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            Result = Task.Run(() => run(_abandoned.Token), _abandoned.Token);
+        }
+
+        public IReadOnlyList<SyntaxTree> Trees { get; }
+        public Task<AnalysisResult> Result { get; }
+
+        /// <summary>The compile failed or was blocked: nobody reports this analysis, so it stops.</summary>
+        public void Abandon() => _abandoned.Cancel();
+    }
+
+    /// <summary>What an analysis found, how long it took, and the files' analyses to commit (none if it failed).</summary>
+    public sealed record AnalysisResult(ImmutableArray<Diagnostic> Diagnostics, TimeSpan Time, ImmutableArray<ProjectAnalyzers.FileAnalysis>? Files);
 
     /// <summary>
     /// Starts the analyzers on the prepared compilation's sources that changed since the last written
@@ -416,32 +442,41 @@ sealed class ProjectCompiler
             return null;
         var analyzers = Analyzers;
         ImmutableArray<AdditionalText> additionalFiles = [.. _additionalTexts.Values];
-        return new Analysis(trees, Task.Run(async () =>
+        return new Analysis(trees, async token =>
         {
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                var diagnostics = await analyzers.AnalyzeAsync(prepared.Compilation, trees, additionalFiles, cancellationToken).ConfigureAwait(false);
-                return (diagnostics, System.Diagnostics.Stopwatch.GetElapsedTime(started));
+                var result = await analyzers.AnalyzeAsync(prepared.Compilation, trees, additionalFiles, token).ConfigureAwait(false);
+                return new AnalysisResult(result.Diagnostics, System.Diagnostics.Stopwatch.GetElapsedTime(started), result.Files);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
                 Console.WriteLine($"{DateTime.Now:O} {Unit.Name}: analyzers failed: {e}");
                 ImmutableArray<Diagnostic> failed = [Diagnostic.Create("BLAZE002", "blaze-cs", $"analyzers failed, so this build reports none of their warnings: {e.Message} (details in .blaze-cs/daemon.log)",
                     DiagnosticSeverity.Warning, DiagnosticSeverity.Warning, isEnabledByDefault: true, warningLevel: 1)];
-                return (failed, System.Diagnostics.Stopwatch.GetElapsedTime(started));
+                return new AnalysisResult(failed, System.Diagnostics.Stopwatch.GetElapsedTime(started), Files: null);
             }
-        }, cancellationToken));
+        }, cancellationToken);
     }
 
-    /// <summary>The build wrote this compile's outputs and reported its analysis: its trees are analyzed.</summary>
-    public void Analyzed(Analysis analysis)
+    /// <summary>
+    /// The build wrote this compile's outputs: waits for its analysis and returns it. Its files' analyses are
+    /// the baselines of the next now, and its trees analyzed, unless it failed: then the next build analyzes
+    /// them again.
+    /// </summary>
+    public AnalysisResult Analyzed(Analysis analysis)
     {
+        var result = analysis.Result.GetAwaiter().GetResult();
+        if (result.Files is not { } files)
+            return result;
+        Analyzers.Commit(files);
         foreach (var tree in analysis.Trees)
         {
             if (_sources.TryGetValue(tree.FilePath, out var source) && source.Tree == tree)
                 _unanalyzed.Remove(tree.FilePath);
         }
+        return result;
     }
 
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<SyntaxTree, HashSet<string>> IdentifierCache = new();

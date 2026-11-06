@@ -494,6 +494,20 @@ sealed class SolutionBuilder
             // build it while the emit runs. So do the analyzers, on the files this compile is the first to see.
             var surface = builder._dependents[unit].Count > 0 ? Task.Run(() => new ApiSurface(prepared.Compilation)) : null;
             var analysis = unit.Analyze(prepared);
+            try
+            {
+                Compiled(unit, change, prepared, surface, analysis, started);
+            }
+            finally
+            {
+                // A compile that failed, was blocked or wasn't written reports no analysis; the next one does.
+                analysis?.Abandon();
+            }
+        }
+
+        /// <summary>Emits the prepared compile and writes it, then reports its analysis with it.</summary>
+        void Compiled(ProjectCompiler unit, ApiChange? change, ProjectCompiler.Prepared prepared, Task<ApiSurface>? surface, ProjectCompiler.Analysis? analysis, long started)
+        {
             var (emitted, diagnostics) = unit.Emit(prepared);
             var compiled = Stopwatch.GetElapsedTime(started);
             builder._lastDuration[unit] = compiled;
@@ -559,10 +573,9 @@ sealed class SolutionBuilder
             // with the next build that writes them. Dependents are on their way already.
             if (analysis is not null)
             {
-                var (found, time) = analysis.Result.GetAwaiter().GetResult();
+                var (found, time, _) = unit.Analyzed(analysis);
                 AnalyzerDiagnostics.AddOrUpdate(unit, found, (_, earlier) => earlier.AddRange(found));
                 AnalyzerTimes.AddOrUpdate(unit, (time, analysis.Trees.Count), (_, earlier) => (earlier.Time + time, earlier.Files + analysis.Trees.Count));
-                unit.Analyzed(analysis);
             }
         }
 
