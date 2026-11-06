@@ -666,6 +666,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                             if (SessionDelay > TimeSpan.Zero)
                                 Thread.Sleep(SessionDelay);
                             var session = HotReloadSession.Start(Engine!, modules, sources);
+                            // Read now, so the first update's selection reads only what the edit changed.
+                            TestSelection.Prepare(modules.Select(module => module.Loaded));
                             Console.WriteLine($"{DateTime.Now:O} hot reload: {host} has its session");
                             return session;
                         }

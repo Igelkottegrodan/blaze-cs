@@ -134,6 +134,19 @@ static class TestSelection
     static Selection Everything(string reason) => new(null, reason);
 
     /// <summary>
+    /// Reads assemblies ahead of a selection, which then reads again only those that changed since: about 2 s
+    /// for jellyfin's 26, against about 10 ms for a selection over them once read.
+    /// </summary>
+    public static void Prepare(IEnumerable<string> assemblies)
+    {
+        foreach (var assembly in assemblies)
+        {
+            try { Read(assembly); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or BadImageFormatException or InvalidOperationException) { } // the selection says so
+        }
+    }
+
+    /// <summary>
     /// Why code may reach an updated type without naming it, or null: judged on the type that declares it if
     /// the compiler generated it, and never on an exempt type.
     /// </summary>
