@@ -25,6 +25,14 @@ static class Daemon
         listener.Bind(new UnixDomainSocketEndPoint(socketPath));
         listener.Listen(16);
         Console.WriteLine($"{DateTime.Now:O} serving {solutionPath} on {socketPath} (pid {Environment.ProcessId}, exits after {IdleTimeout.TotalSeconds:F0} s idle)");
+        // Before any reply that ends this daemon: once the client has its answer it may start a daemon that
+        // binds the same path, and disposing the listener after that deletes the file by its path too,
+        // leaving that daemon unreachable (the next command starts another beside it).
+        void CloseSocket()
+        {
+            listener.Dispose();
+            File.Delete(socketPath);
+        }
 
         // Projects compile in parallel and Roslyn parallelizes inside each one; both block on the
         // shared thread pool, which otherwise adds threads one at a time while cores sit idle.
@@ -44,7 +52,7 @@ static class Daemon
                 catch (OperationCanceledException)
                 {
                     Console.WriteLine($"{DateTime.Now:O} no command for {IdleTimeout.TotalSeconds:F0} s; exiting");
-                    File.Delete(socketPath);
+                    CloseSocket();
                     return 0;
                 }
             }
@@ -66,11 +74,10 @@ static class Daemon
             int exitCode;
             try
             {
-                // The socket goes before the reply: once the client has its answer it may start a daemon that
-                // binds the same path, and a later delete would remove that daemon's socket.
+                // The socket goes before the reply (see CloseSocket).
                 if (request?.Command == "stop")
                 {
-                    File.Delete(socketPath);
+                    CloseSocket();
                     Log("blaze-cs: daemon stopped");
                     writer.WriteLine($"{DaemonClient.ExitPrefix}0");
                     return 0;
@@ -79,7 +86,7 @@ static class Daemon
                 if (request?.Build != Build)
                 {
                     Console.WriteLine($"{DateTime.Now:O} a client of another build sent {request?.Command}; exiting");
-                    File.Delete(socketPath);
+                    CloseSocket();
                     writer.WriteLine($"{DaemonClient.RestartPrefix}{Environment.ProcessId}");
                     return 0;
                 }

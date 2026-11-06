@@ -48,6 +48,8 @@ sealed class ProjectCompiler
     /// <summary>What dependents compile against: the reference assembly when there is one.</summary>
     public string ImagePath => ReferenceAssemblyPath ?? AssemblyPath;
     public IEnumerable<CommandLineReference> References => _args.MetadataReferences;
+    /// <summary>The references as the compilation has them: what other code compiled against this unit's references uses.</summary>
+    public IEnumerable<MetadataReference> MetadataReferences => _compilation.References;
     public IEnumerable<string> AnalyzerPaths => _args.AnalyzerReferences.Select(a => a.FilePath);
     /// <summary>Config files whose change means csc's arguments are stale (handled by a real build).</summary>
     public IEnumerable<string> ConfigPaths => _args.AnalyzerConfigPaths;

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Xml.Linq;
 
 namespace BlazeCs.TestHost;
@@ -10,25 +11,30 @@ namespace BlazeCs.TestHost;
 /// <summary>
 /// A single-use test host. The daemon starts it ahead of time, so the runtime is already up when a run
 /// needs it; it reads one request line from stdin, runs that test assembly in-process, writes
-/// the result as the last line and exits. Stdin closing at any point means the daemon is gone (it stopped
-/// or died), and the host exits at once, running tests or not. Test output goes to stdout. Exiting keeps every run's statics,
+/// the result as the last line and exits. Started for one test project (its framework, assembly and a
+/// warm-up assembly as arguments), it gets that project's run ready while it waits (see Prepare). Stdin
+/// closing at any point means the daemon is gone (it stopped or died), and the host exits: at once while
+/// it runs tests, and after preparing while it waits. Test output goes to stdout. Exiting keeps every run's statics,
 /// threads and console redirections apart, and lets the tests load into an ordinary (non-collectible)
 /// context, where precompiled code is used: measured on the fixture, about twice as fast as a collectible one.
 /// </summary>
-static class Program
+static partial class Program
 {
     const string ResultPrefix = "\u0001result:";
 
-    static void Main()
+    static void Main(string[] args)
     {
         var protocol = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+        // Started for a test project: <framework> <assembly> [--run-settings=<file>] [--warm-up=<assembly>].
+        string? Option(string name) => args.FirstOrDefault(a => a.StartsWith(name, StringComparison.Ordinal))?[name.Length..];
+        var prepared = args is [var framework, var assembly, ..] ? Prepare(framework, assembly, Option("--run-settings="), Option("--warm-up=")) : null;
         // End of input means the daemon stopped (or died) without needing this host.
         if (Console.ReadLine() is not { } request)
             return;
         WatchDaemon();
-        var result = Run(JsonSerializer.Deserialize<Request>(request)!);
+        var result = Run(JsonSerializer.Deserialize(request, ProtocolJson.Default.Request)!, prepared);
         Console.Out.Flush();
-        protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result));
+        protocol.WriteLine(ResultPrefix + JsonSerializer.Serialize(result, ProtocolJson.Default.Result));
     }
 
     /// <summary>
@@ -43,7 +49,75 @@ static class Program
         Process.GetCurrentProcess().Kill();
     }) { IsBackground = true }.Start();
 
-    static Result Run(Request request)
+    /// <summary>
+    /// Gets a test project's run ready before the daemon asks for it: creates the project's load context, loads
+    /// into it every NuGet package its deps.json lists (the test framework, runner and adapters among them),
+    /// and rehearses the framework on the warm-up assembly, a few tests the daemon compiled against the
+    /// project's references, so the framework's own code is compiled before the project's tests need it.
+    /// The project's outputs stay unloaded: an edit may rebuild them, so the run loads them as the build left
+    /// them. Whatever fails here leaves less ready, and the run still uses this context: a second one would
+    /// load every package again, and the proxies made for the first one's interfaces would stand in for the
+    /// second's (DispatchProxy finds the interfaces' assemblies by name).
+    /// </summary>
+    static TestContext? Prepare(string framework, string assemblyPath, string? runSettings, string? warmUp)
+    {
+        var (output, error) = (Console.Out, Console.Error);
+        TestContext? context = null;
+        try
+        {
+            // Its environment variables are set before the framework starts, as vstest sets them on its testhost.
+            var settings = Settings.Read(runSettings);
+            var directory = EnterDirectory(assemblyPath);
+            context = new TestContext(assemblyPath);
+            _ = context.EnterContextualReflection(); // as for the run: the rehearsal loads by name too
+            foreach (var package in PackageAssemblies(assemblyPath))
+            {
+                try { _ = context.LoadFromAssemblyName(package); }
+                catch (Exception e) when (e is IOException or BadImageFormatException) { } // a run that needs it fails on it
+            }
+            if (warmUp is not null)
+            {
+                // Its results and output go nowhere: stdout carries the run's.
+                Console.SetOut(TextWriter.Null);
+                Console.SetError(TextWriter.Null);
+                _ = Runner(framework, context, context.LoadFromAssemblyPath(warmUp), directory, TextWriter.Null, settings)();
+            }
+        }
+        catch (Exception) { }
+        finally
+        {
+            Console.SetOut(output);
+            Console.SetError(error);
+        }
+        return context;
+    }
+
+    /// <summary>The runtime assemblies of the NuGet packages a test project's deps.json lists.</summary>
+    static List<AssemblyName> PackageAssemblies(string assemblyPath)
+    {
+        using var deps = JsonDocument.Parse(File.ReadAllBytes(Path.ChangeExtension(assemblyPath, ".deps.json")));
+        var root = deps.RootElement;
+        var libraries = root.GetProperty("libraries");
+        var target = root.GetProperty("targets").GetProperty(root.GetProperty("runtimeTarget").GetProperty("name").GetString()!);
+        return [.. target.EnumerateObject()
+            .Where(library => libraries.GetProperty(library.Name).GetProperty("type").GetString() == "package")
+            .SelectMany(library => library.Value.TryGetProperty("runtime", out var runtime) ? runtime.EnumerateObject() : [])
+            .Select(asset => new AssemblyName(Path.GetFileNameWithoutExtension(asset.Name)))];
+    }
+
+    /// <summary>
+    /// Tests find files relative to their output directory, as under `dotnet test`: through the current
+    /// directory, or AppContext.BaseDirectory (WebApplicationFactory looks for deps.json there). Returns it.
+    /// </summary>
+    static string EnterDirectory(string assemblyPath)
+    {
+        var directory = Path.GetDirectoryName(assemblyPath)!;
+        Environment.CurrentDirectory = directory;
+        AppContext.SetData("APP_CONTEXT_BASE_DIRECTORY", directory + Path.DirectorySeparatorChar);
+        return directory;
+    }
+
+    static Result Run(Request request, TestContext? prepared)
     {
         var (output, error) = (Console.Out, Console.Error);
         var assemblyPath = request.Assembly;
@@ -51,12 +125,8 @@ static class Program
         try
         {
             var settings = Settings.Read(request.RunSettings);
-            // Tests find files relative to their output directory, as under `dotnet test`: through the
-            // current directory, or AppContext.BaseDirectory (WebApplicationFactory looks for deps.json there).
-            var directory = Path.GetDirectoryName(assemblyPath)!;
-            Environment.CurrentDirectory = directory;
-            AppContext.SetData("APP_CONTEXT_BASE_DIRECTORY", directory + Path.DirectorySeparatorChar);
-            var context = new TestContext(assemblyPath);
+            var directory = EnterDirectory(assemblyPath);
+            var context = prepared?.AssemblyPath == assemblyPath ? prepared : new TestContext(assemblyPath);
             _ = context.EnterContextualReflection(); // for the rest of this process
             var assembly = context.LoadFromAssemblyPath(assemblyPath);
             // A reference this host can't load (an assembly built for a newer runtime) would surface as an
@@ -69,16 +139,7 @@ static class Program
                     return new Result(0, 0, 0, 0, $"the test host (.NET {Environment.Version}) can't load {reference.FullName}: {e.Message}", null);
                 }
             }
-            run = request.Framework switch
-            {
-                "xunit3" => XunitV3(context, assembly, output),
-                "xunit2" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyPath(XunitV2Adapter(directory))
-                    .GetType("Xunit.Runner.VisualStudio.VsTestRunner", throwOnError: true)!),
-                "nunit" => NUnit(context, assembly, output, settings),
-                "mstest" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyName(new AssemblyName("MSTest.TestAdapter"))
-                    .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!),
-                _ => throw new NotSupportedException($"no runner for {request.Framework}"),
-            };
+            run = Runner(request.Framework, context, assembly, directory, output, settings);
         }
         catch (Exception e)
         {
@@ -102,6 +163,21 @@ static class Program
             Console.SetError(error);
         }
     }
+
+    /// <summary>
+    /// A framework's runner for one test assembly, ready to run. The directory is the test project's output
+    /// directory, where xUnit v2's adapter is.
+    /// </summary>
+    static Func<Result> Runner(string framework, AssemblyLoadContext context, Assembly assembly, string directory, TextWriter output, Settings settings) => framework switch
+    {
+        "xunit3" => XunitV3(context, assembly, output),
+        "xunit2" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyPath(XunitV2Adapter(directory))
+            .GetType("Xunit.Runner.VisualStudio.VsTestRunner", throwOnError: true)!),
+        "nunit" => NUnit(context, assembly, output, settings),
+        "mstest" => VSTest(context, assembly, output, settings, context.LoadFromAssemblyName(new AssemblyName("MSTest.TestAdapter"))
+            .GetType("Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.MSTestExecutor", throwOnError: true)!),
+        _ => throw new NotSupportedException($"no runner for {framework}"),
+    };
 
     /// <summary>
     /// xUnit's in-process runner, which takes the test assembly explicitly: the assembly's own Main would
@@ -271,9 +347,14 @@ static class Program
     static Exception Unwrap(Exception e) => e is TargetInvocationException { InnerException: { } inner } ? inner : e;
 
     /// <summary>What to run: a framework (xunit3, xunit2, nunit, mstest), an assembly, and the .runsettings that applies, if any.</summary>
-    sealed record Request(string Framework, string Assembly, string? RunSettings);
+    internal sealed record Request(string Framework, string Assembly, string? RunSettings);
 
-    sealed record Result(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
+    internal sealed record Result(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
+
+    /// <summary>The request and result, serialized by generated code: it needs much less compiled at run time than reflection.</summary>
+    [JsonSerializable(typeof(Request))]
+    [JsonSerializable(typeof(Result))]
+    sealed partial class ProtocolJson : JsonSerializerContext;
 
     /// <summary>
     /// A .runsettings, of which the daemon only sends ones the host applies in full: RunConfiguration's
@@ -321,6 +402,8 @@ static class Program
     sealed class TestContext(string assemblyPath) : AssemblyLoadContext($"tests:{assemblyPath}")
     {
         readonly AssemblyDependencyResolver _resolver = new(assemblyPath);
+
+        public string AssemblyPath => assemblyPath;
 
         protected override Assembly? Load(AssemblyName name) =>
             _resolver.ResolveAssemblyToPath(name) is { } path ? LoadFromAssemblyPath(path) : null;
