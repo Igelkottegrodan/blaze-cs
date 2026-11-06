@@ -179,9 +179,9 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
 | `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
 | `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile, each project's `RunSettingsFilePath` |
-| `src/BlazeCs.TestHost` | the single-use test host (xUnit v2 and v3, NUnit, MSTest) |
+| `src/BlazeCs.TestHost` | the test host (xUnit v2 and v3, NUnit, MSTest), and its protocol with the daemon (`Protocol.cs`): one run, then, started with `DOTNET_MODIFIABLE_ASSEMBLIES=debug`, metadata deltas applied and the tests run again in the same process (the daemon sends none yet) |
 | `scripts/` | benchmark edits, timing, and output verification |
-| `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, and what counts as a dependent naming an identifier |
+| `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, what counts as a dependent naming an identifier, and the test host applying a delta (with `tests/TestHostKits`, each test framework's packages) |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
 | `docs/brand/outrun/` | the header above and `gen.cs`, which draws it (`dotnet run docs/brand/outrun/gen.cs`) |
 
