@@ -332,6 +332,8 @@ Live managed objects by subsystem (`dumpheap -stat`, grouped by type name):
 The symbol graph (symbols, binders, caches: about 100 MB with their dictionaries) is rebuilt on
 every `Emit` anyway (see "where its time goes" above); holding it between edits buys nothing but
 costs nothing in time. The parse (green trees, 79 MB) is what makes the next edit cheap.
+(Measured later, with the idle collection: the daemon holds only about 5 MB of it between edits.
+See "Dropping the post-emit symbol graph" below.)
 
 ### GC settings tried
 
@@ -373,18 +375,95 @@ budget across 31 heaps), not data. Non-GC memory is the remainder, about 270 MB.
    every output the daemon wrote: 18 MB of assemblies and PDBs plus 6 MB of reference assemblies
    on jellyfin, 30 to 40 MB with documentation files. `Image.Bytes` must stay: the
    `MetadataReference`s read from it.
-4. **Drop the post-emit symbol graph.** Replace `_compilation` with a fresh
-   `CSharpCompilation.Create` over the same trees and references after each emit; the next emit
-   rebinds references (ReferenceManager) and rebuilds symbols, which it does anyway. Frees about
-   100 MB. Needs a timing check: reference binding for a project with hundreds of references is
-   tens of milliseconds, and the metadata symbol sharing between compilations
-   (`AssemblyMetadata`'s cached symbols) may be lost. Try only after 1 to 3.
+4. **Drop the post-emit symbol graph: measured, frees nothing (issue #83).** Replacing
+   `_compilation` with a fresh `CSharpCompilation.Create` after each emit left the idle heap where
+   it was. The section below has the numbers and the reason. Not worth trying again.
 5. **Not worth it:** dropping the parse trees (Roslyn's IDE does this with recoverable trees that
    reparse on demand; 79 MB against a reparse of 19 MB of source on every edit), and GC heap
    count or gen0 size tuning (measured: no gain or worse).
 
 Not measured here: the pre-started test hosts are separate processes with their own RSS, and
 the daemon's RSS during a large `blaze-cs test --all`.
+
+### Dropping the post-emit symbol graph (measured, reverted)
+
+Issue #83, 2026-11-06, on top of the idle collection (PR #98). The change: right after
+`ProjectCompiler.Emit`, replace `_compilation` with
+`CSharpCompilation.Create(name, _compilation.SyntaxTrees, _compilation.References, _compilation.Options)`.
+The old compilation would then be garbage until the next edit. A `Clone()` variant was also tried:
+it keeps the bound reference manager and the declaration table and drops only the source symbols.
+The rule was to keep the change only if a body edit got less than 10 ms slower, and only if idle
+RSS fell by at least 60 MB. **It frees nothing, so it was reverted.**
+
+**Idle memory.** The heap that #98's idle collection logs was the same for all three builds:
+358 to 364 MB for the baseline, 362 to 367 MB for `Clone()`, 357 to 369 MB for `Create`. A heap
+dump at idle after five body edits (`dotnet-dump collect --type Heap`, `dumpheap -stat`) showed why:
+
+| At idle, after the idle collection | Baseline | Fresh `Create` after emit |
+|---|---:|---:|
+| Heap (all objects) | 381 MB | 377 MB |
+| `CSharpCompilation` objects | 41 | 81 |
+| `SourceAssemblySymbol` | 41 | 40 |
+| Source symbols (`Symbols.Source*`, attribute data) | 3.7 MB | 3.6 MB |
+| Binders and bound nodes | 1.0 MB | 1.0 MB |
+| Metadata (PE) symbols | 24.8 MB | 23.0 MB |
+| Constructed and substituted symbols, type maps | 26.9 MB | 26.1 MB |
+| Symbol dictionaries | 6.2 MB | 6.1 MB |
+
+- **Emit never binds `_compilation`.** 40 of jellyfin's 41 projects run source generators (the
+  SDK's own: Regex, LibraryImport, System.Text.Json and others). `Prepare` passes `_compilation`
+  through the generator driver and emits the compilation the driver returns. Nothing keeps that
+  one after the build, so the idle collection already frees its symbols and binders. The "about
+  100 MB" above was a heap dump taken before #98, when no collection had run since the warm-up.
+- **The generator driver keeps the old compilation anyway.** `GeneratorDriver` stores the last
+  compilation it ran on in its state table, so with `Create` the 40 old compilations stay alive
+  next to 40 fresh ones (81 in all). Roslyn has no public API to drop it.
+- **What is left is the metadata symbol graph,** about 58 MB of PE, constructed and substituted
+  symbols and their dictionaries. Every edit reuses it: `ReplaceSyntaxTree` shares the bound
+  reference manager, and `AssemblyMetadata` shares its PE assembly symbols between compilations.
+  Even dropping all of it would free less than the 60 MB the ticket asks for. The next edit would
+  also pay to rebuild it (see below).
+
+**What the next edit pays.** These numbers were measured in the daemon on `MediaBrowser.Controller`
+(325 references, 389 trees), with temporary instrumentation that was not committed:
+
+| Step | Time |
+|---|---:|
+| Bind references, fresh `Create` (`compilation.Assembly`) | 1.6 to 2.4 ms |
+| Bind references, `Clone()` or the reused manager | < 0.01 ms |
+| Merge declarations, fresh `Create` (`SourceModule.GlobalNamespace.GetMembers()`) | 0.2 ms |
+| Emit with metadata symbols shared vs. rebuilt (fresh `MetadataReference`s for the same files), paired, 52 pairs | median +48 ms (315 vs. 369 ms) |
+| Opening those 325 references again | 11.6 ms median |
+
+So `Create` costs the edited project about 2 ms of reference binding. Note that
+`Compilation.References` binds too, because it includes `#r` directive references, so
+`RefreshReferences` pays it before `Prepare`. The cost would be about 50 ms if the metadata
+symbols were dropped as well. That is the part that would actually free memory, and dropping it
+fails the 10 ms rule by a wide margin.
+
+**Steady edits.** `scripts/steady.sh`'s method: daemon restarted, 15 edits back to back, median
+daemon build time of the last 10, then the idle collection's heap and working set. The baseline was
+#98's branch (`670bf92`). The change was the `Create` variant. Each build ran from a snapshot of its
+`artifacts/bin`, in 6 alternating rounds (ABBA order), every run under `bench/.measure.lock`.
+**Other agents were compiling throughout:** load average 16 to 54 on 32 cores.
+
+| Round | Body: base | Body: change | Signature: base | Signature: change | Idle heap, body: base / change | Idle working set, body: base / change |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 370 ms | 344 ms | 1672 ms | 1209 ms | 381 / 370 MB | 766 / 727 MB |
+| 2 | 388 ms | 483 ms | 897 ms | 1928 ms | 371 / 389 MB | 708 / 737 MB |
+| 3 | 334 ms | 335 ms | 633 ms | 764 ms | 383 / 373 MB | 806 / 829 MB |
+| 4 | 529 ms | 561 ms | 990 ms | 820 ms | 379 / 408 MB | 755 / 754 MB |
+| 5 | 695 ms | 554 ms | 861 ms | 741 ms | 394 / 372 MB | 836 / 804 MB |
+| 6 | 512 ms | 539 ms | 573 ms | 875 ms | 370 / 386 MB | 792 / 811 MB |
+| **median** | **450 ms** | **511 ms** | **879 ms** | **848 ms** | **380 / 380 MB** | **779 / 779 MB** |
+
+After the signature runs, the idle heap was 370 MB (base) and 366 MB (change), and the working set
+was 803 and 782 MB. Paired differences (change minus base) had a median of +14 ms for body edits
+(range −141 to +95) and +6 ms for signature edits (range −463 to +1031). Between rounds, the same
+build moves by more than 300 ms (body) and 1300 ms (signature), so on this machine these runs
+cannot show whether the change is above or below 10 ms. The in-process measurement above can: about
+2 ms for `Create`, and about 50 ms for the variant that would free the metadata symbols. Either way
+the idle memory doesn't move, so the change was reverted.
 
 ## Numbers used
 
