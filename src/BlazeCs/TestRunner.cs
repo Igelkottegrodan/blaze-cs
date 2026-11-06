@@ -238,7 +238,9 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
         var passed = result.Error is null && result.Failed == 0;
         if (result.Error is not null)
             output.Add($"blaze-cs: {name}: {result.Error}");
-        output.Add($"{(passed ? "Passed!" : "Failed!")}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
+        // As `dotnet test` labels it: a run that only skipped tests is "Skipped!".
+        var label = !passed ? "Failed!" : result is { Passed: 0, Skipped: > 0 } ? "Skipped!" : "Passed!";
+        output.Add($"{label}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
             + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}");
         lock (_hostConfigs)
             output.ForEach(log);

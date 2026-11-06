@@ -112,7 +112,8 @@ static class Program
                 var report = XDocument.Load(reportPath).Root!.Element("assembly")
                     ?? throw new InvalidOperationException("xUnit wrote no results");
                 int Count(string name) => int.Parse(report.Attribute(name)?.Value ?? "0");
-                return new Result(Count("total"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null);
+                // Its total includes explicit tests that weren't asked for, which `dotnet test` leaves out.
+                return new Result(Count("total") - Count("not-run"), Count("passed"), Count("failed") + Count("errors"), Count("skipped"), null, null);
             }
             finally
             {
