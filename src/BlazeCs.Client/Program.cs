@@ -13,7 +13,8 @@ static class Program
 {
     static int Main(string[] args)
     {
-        if (args is not [("build" or "test" or "stop") and var command, ..])
+        // Only a bare command: options (such as `test --all`) and their parsing stay in the CLI.
+        if (args is not [("build" or "test" or "stop") and var command])
             return RunCli(args);
 
         var solutionPath = DaemonClient.FindSolution(Environment.CurrentDirectory);
