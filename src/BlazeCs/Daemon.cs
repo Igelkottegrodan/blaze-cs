@@ -92,8 +92,8 @@ static class Daemon
                     loaded = builder.Load(Log);
                 exitCode = !loaded ? 1 : request?.Command switch
                 {
-                    "build" => builder.Build(Log).Success ? 0 : 1,
-                    "test" => builder.Build(Log) is { Success: true } result ? tests.Run(result.Changed, Log) : 1,
+                    "build" => builder.Build(Log) ? 0 : 1,
+                    "test" => builder.Build(Log) ? tests.Run(request is { All: true }, Log) : 1,
                     _ => 2,
                 };
             }

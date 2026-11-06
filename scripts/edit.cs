@@ -5,7 +5,8 @@
 //   body       change a string literal inside BaseItem's image lookup (no public API change)
 //   signature  rename AddGenre's parameter, back and forth (public API change: every dependent recompiles)
 //   file       add, then on the next call remove, a small internal class in a new file
-//   test       change a comment in a Jellyfin.Controller.Tests test file (only that test project rebuilds)
+//   test       change a test case's data in Jellyfin.Controller.Tests (only that test project rebuilds and runs;
+//              a comment edit would leave its code unchanged, so `blaze-cs test` would not run it)
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -53,9 +54,13 @@ switch (kind)
     }
     case "test":
     {
+        // Any fetcher name but "ServerDisabled" is enabled for a MusicArtist, so the test still passes.
         var testFile = Path.Combine(root, "tests/Jellyfin.Controller.Tests/BaseItemManagerTests.cs");
-        var text = Regex.Replace(Read(testFile), @"\n\n// blaze-cs benchmark edit \d+\n$", "\n");
-        Write(testFile, text + $"\n// blaze-cs benchmark edit {n}\n"); // StyleCop wants the blank line
+        var pattern = new Regex(@"\[InlineData\(typeof\(MusicArtist\), ""Enabled[^""]*"", true\)\]");
+        var text = Read(testFile);
+        if (pattern.Matches(text).Count != 2)
+            throw new InvalidOperationException("expected two MusicArtist \"Enabled\" test cases");
+        Write(testFile, pattern.Replace(text, $"[InlineData(typeof(MusicArtist), \"Enabled (edit {n})\", true)]", 1));
         break;
     }
     default:
