@@ -299,8 +299,13 @@ void NoHostsLeft(string cause)
 }
 
 // This fixture copy's test host processes: blaze-cs-testhost.dll from this repo's build of blaze-cs.
-List<(int Pid, string Command)> TestHostProcesses() =>
-    [.. Processes().Where(p => p.Command.Contains("blaze-cs-testhost.dll") && p.Command.Contains(root))];
+// This fixture's hosts, wherever blaze-cs runs from (the clone or an installed tool): each runs on a
+// runtimeconfig.json named after the daemon that started it.
+List<(int Pid, string Command)> TestHostProcesses()
+{
+    var daemons = Daemons().Select(d => $"blaze-cs-testhost-{d.Pid}-").ToList();
+    return [.. Processes().Where(p => p.Command.Contains("blaze-cs-testhost") && daemons.Any(p.Command.Contains))];
+}
 
 IEnumerable<(int Pid, string Command)> Processes()
 {
