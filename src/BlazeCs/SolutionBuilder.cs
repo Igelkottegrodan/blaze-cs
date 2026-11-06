@@ -273,7 +273,7 @@ sealed class SolutionBuilder
     public bool Build(Action<string> log)
     {
         if (!Settle(log))
-            return new BuildResult(false, []);
+            return false;
         var stopwatch = Stopwatch.StartNew();
         if (ChangedMSBuildInput() is { } input)
         {
