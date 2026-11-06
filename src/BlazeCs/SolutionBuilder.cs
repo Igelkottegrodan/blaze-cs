@@ -144,6 +144,11 @@ sealed class SolutionBuilder
             log($"blaze-cs: {stale.Unit.Name}: its cached compiler arguments are stale; running dotnet build --no-incremental");
             return Load(log, fresh: true);
         }
+
+        // The build log's tree and the images just read are garbage now, hundreds of MB per load. The
+        // server GC on many cores lets that pile up over several loads (jellyfin: 1.7 GB to 3.1 GB RSS)
+        // before it collects; collected here, during a step MSBuild already made slow, it costs ~0.1 s.
+        GC.Collect();
         return true;
     }
 
