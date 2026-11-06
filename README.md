@@ -54,17 +54,20 @@ affect, and `blaze-cs test` runs the affected test projects in test hosts that a
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.
 Each edit is in `MediaBrowser.Controller`, a project in the middle of the dependency graph:
 
-| Edit | `dotnet build` | `dotnet build -p:RunAnalyzers=false` | `blaze-cs build` |
+| Edit | `dotnet build` | `dotnet build -p:RunAnalyzers=false` | `blaze-cs build` | Speed increase |
+|---|---:|---:|---:|---:|
+| Method body | 3.01 s | 2.37 s | **0.34 s** | **+597%** |
+| Public signature (rename a parameter) | 10.30 s | 3.84 s | **0.64 s** | **+500%** |
+| New file | 10.63 s | 3.90 s | **0.46 s** | **+748%** |
+
+blaze-cs doesn't run analyzers, so the fair comparison is the middle column, and the speed increase is
+against it: 6 to 8.5× faster. Against plain `dotnet build` it is +785%, +1509% and +2211%.
+
+| Test loop | `dotnet test` | `blaze-cs test` | Speed increase |
 |---|---:|---:|---:|
-| Method body | 3.01 s | 2.37 s | **0.34 s** |
-| Public signature (rename a parameter) | 10.30 s | 3.84 s | **0.64 s** |
-| New file | 10.63 s | 3.90 s | **0.46 s** |
+| Edit a test file, rerun its project (219 tests) | 4.54 s | **0.68 s** | **+568%** |
 
-blaze-cs doesn't run analyzers, so the fair comparison is the middle column: 6 to 8.5× faster.
-
-| Test loop | `dotnet test` | `blaze-cs test` |
-|---|---:|---:|
-| Edit a test file, rerun its project (219 tests) | 4.54 s | **0.68 s** |
+Speed increase is how much more work fits in the same time: `(old time / new time − 1) × 100`.
 
 To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timings) and
 `task verify -- body|signature|file` (compares output with `dotnet build --no-incremental`).
