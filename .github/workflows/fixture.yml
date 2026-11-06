@@ -15,20 +15,29 @@ jobs:
         # The SDK the fixture solution is built and compared with; blaze-cs itself always builds on global.json's.
         sdk: ['10.0.100', '10.0.x', '11.0.x']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ matrix.sdk }}
           dotnet-quality: preview
-      - uses: arduino/setup-task@v2
+      # One packages folder for blaze-cs and the fixture copy (restored from the temp dir), so both hit the cache.
+      - shell: bash
+        run: echo "NUGET_PACKAGES=$RUNNER_TEMP/nuget-packages" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/nuget-packages
+          key: nuget-${{ runner.os }}-${{ matrix.sdk }}-${{ hashFiles('global.json', '**/*.csproj', '**/*.props') }}
+          restore-keys: nuget-${{ runner.os }}-${{ matrix.sdk }}-
+      - uses: arduino/setup-task@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task build
+      - run: task test
       - shell: bash
-        # The fixture copy (and its daemon log) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
+        # The fixture copy (and its daemon logs) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
         # Windows goes through the script task check:windows runs there, so CI covers it too.
         run: |
           export TMP="$RUNNER_TEMP" TMPDIR="$RUNNER_TEMP"
@@ -41,8 +50,8 @@ jobs:
         env:
           SDK: ${{ matrix.sdk }}
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: daemon-log-${{ matrix.os }}-${{ matrix.sdk }}
-          path: ${{ runner.temp }}/blaze-cs-fixture/.blaze-cs/daemon.log
+          path: ${{ runner.temp }}/blaze-cs-fixture/.blaze-cs/daemon*.log
           if-no-files-found: ignore

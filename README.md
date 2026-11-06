@@ -50,6 +50,10 @@ The first command starts a daemon for that solution and runs a real `dotnet buil
 as one. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
 affect, and `blaze-cs test` runs the affected test projects in test hosts that are already started.
 
+The daemon exits on its own after two hours without a command, and the next command starts a new one.
+After you rebuild blaze-cs, the next command stops the daemon of the old build and starts one of the new,
+saying so. The daemon's log is `.blaze-cs/daemon.log` next to the solution, capped at 1 MiB.
+
 ## How fast
 
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.
@@ -115,8 +119,8 @@ its own:
 
 ## Contributing
 
-`task check` runs the fixture check (`tests/fixture/check.cs`). In devbox on WSL, `task check:windows`
-also runs it on native Windows, for SDK 10 and 11: it installs them into `%LOCALAPPDATA%\blaze-cs\dotnet`
+`task test` runs the unit tests (`tests/BlazeCs.Tests`). `task check` runs the fixture check
+(`tests/fixture/check.cs`). In devbox on WSL, `task check:windows` also runs the fixture check on native Windows, for SDK 10 and 11: it installs them into `%LOCALAPPDATA%\blaze-cs\dotnet`
 on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 
 | Path | What |
@@ -124,6 +128,7 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
 | `src/BlazeCs.TestHost` | the single-use test host (xUnit v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |
+| `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, and what counts as a dependent naming an identifier |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
 | `docs/brand/outrun/` | the header above and `gen.cs`, which draws it (`dotnet run docs/brand/outrun/gen.cs`) |
 

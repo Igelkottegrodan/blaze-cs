@@ -30,7 +30,8 @@ sealed class ApiSurface
 
     /// <param name="Name">The name source code uses to reach the member.</param>
     /// <param name="Implicit">Reachable without its name appearing in source (see <see cref="ImplicitNames"/>).</param>
-    sealed record MemberFacts(string Name, string Description, bool Implicit);
+    /// <param name="Extension">An extension member: reachable through its receiver without its type's name.</param>
+    sealed record MemberFacts(string Name, string Description, bool Implicit, bool Extension);
 
     /// <summary>Members C# calls without the caller writing their names: patterns, query syntax, operators.</summary>
     static readonly HashSet<string> ImplicitNames =
@@ -86,8 +87,11 @@ sealed class ApiSurface
         if (type.DeclaredAccessibility == Accessibility.Private || type.IsImplicitlyDeclared && type.Name.Length == 0)
             return;
 
-        var key = type.ToDisplayString(Format) + "`" + type.Arity;
+        // The key names the type; everything else about it (kind, modifiers, constraints, variance, a
+        // delegate's signature) is in the description.
+        var key = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + "`" + type.Arity;
         var description = new StringBuilder()
+            .Append(type.ToDisplayString(Format)).Append(' ')
             .Append(type.TypeKind).Append(' ').Append(type.DeclaredAccessibility)
             .Append(type.IsStatic ? " static" : "").Append(type.IsAbstract ? " abstract" : "").Append(type.IsSealed ? " sealed" : "")
             .Append(type.IsRecord ? " record" : "").Append(type.IsRefLikeType ? " ref" : "").Append(type.IsReadOnly ? " readonly" : "")
@@ -122,12 +126,14 @@ sealed class ApiSurface
             var memberKey = key + MemberSeparator + member.Kind + " " + member.MetadataName + Signature(member);
             var memberDescription = member.ToDisplayString(Format) + Attributes(member.GetAttributes()) + Details(member);
             var name = member is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor } ? type.Name : member.Name;
-            // Interface and abstract members bind in implementers, which name only the type.
+            // Interface and abstract members bind in implementers, which name only the type; required
+            // members bind at every object creation, which needn't name them (`Take(new())`).
             var isImplicit = inInterface || member.IsAbstract
                 || ImplicitNames.Contains(member.Name)
                 || member is IMethodSymbol { MethodKind: not (MethodKind.Ordinary or MethodKind.ReducedExtension) }
-                || member is IPropertySymbol { IsIndexer: true };
-            _members[memberKey] = new MemberFacts(name, memberDescription, isImplicit);
+                || member is IPropertySymbol { IsIndexer: true } or IPropertySymbol { IsRequired: true } or IFieldSymbol { IsRequired: true };
+            var isExtension = type.IsExtension || member is IMethodSymbol { IsExtensionMethod: true };
+            _members[memberKey] = new MemberFacts(name, memberDescription, isImplicit, isExtension);
         }
     }
 
@@ -153,7 +159,11 @@ sealed class ApiSurface
     static string Attributes(IEnumerable<AttributeData> attributes) =>
         string.Concat(attributes.Select(a => " [" + a + "]").Order(StringComparer.Ordinal));
 
-    /// <summary>Which dependents a change from <paramref name="before"/> to this surface can affect.</summary>
+    /// <summary>
+    /// Which dependents a change from <paramref name="before"/> to this surface can affect, once the image
+    /// dependents compile against has changed. The image bytes are the ground truth: if they changed but
+    /// the surface shows nothing, something it doesn't model changed and every dependent recompiles.
+    /// </summary>
     public ApiChange ChangeFrom(ApiSurface before)
     {
         if (_assembly != before._assembly)
@@ -179,6 +189,9 @@ sealed class ApiSurface
                 continue;
             }
             var name = (now ?? then)!.Name;
+            // An extension block has no name; its members are listed below.
+            if (name.Length == 0)
+                continue;
             names.Add(name);
             if (name.EndsWith("Attribute", StringComparison.Ordinal))
                 names.Add(name[..^"Attribute".Length]);
@@ -190,14 +203,15 @@ sealed class ApiSurface
             var then = before._members.GetValueOrDefault(key);
             if (now?.Description == then?.Description)
                 continue;
-            // Members of an added or removed type are reached through the type's name, already listed.
+            // Members of an added or removed type are reached through the type's name, already listed,
+            // except extension members, which bind on their receiver.
             var typeKey = key[..key.IndexOf(MemberSeparator)];
-            if (!(_types.ContainsKey(typeKey) && before._types.ContainsKey(typeKey)))
+            if (!(_types.ContainsKey(typeKey) && before._types.ContainsKey(typeKey)) && !(now ?? then)!.Extension)
                 continue;
             if (now?.Implicit == true || then?.Implicit == true)
                 return ApiChange.All;
             names.Add((now ?? then)!.Name);
         }
-        return new ApiChange(false, names.ToImmutable());
+        return names.Count == 0 ? ApiChange.All : new ApiChange(false, names.ToImmutable());
     }
 }

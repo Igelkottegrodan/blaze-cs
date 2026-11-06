@@ -8,11 +8,14 @@
 //
 // usage: task check   (or: dotnet run tests/fixture/check.cs, after `dotnet build BlazeCs.slnx`)
 using System.Diagnostics;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Text.RegularExpressions;
 
 var fixture = Path.GetDirectoryName(Path.GetFullPath(AppContext.GetData("EntryPointFilePath") as string ?? "tests/fixture/check.cs"))!;
 var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
+var otherBuild = work + "-other-build";
 var blaze = Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
 
 // BLAZE_CS_SDK=<exact version> checks against another SDK than the repo's pin, such as a .NET 11 one or the
@@ -108,6 +111,7 @@ try
         Verify(name, rebuilt, fallback);
     }
     HostCannotLoad();
+    DaemonLifecycle();
     passed = true;
 }
 catch (CheckFailed failure)
@@ -118,15 +122,95 @@ catch (CheckFailed failure)
 finally
 {
     Run(blaze, "stop", check: false);
-    var log = Path.Combine(work, ".blaze-cs", "daemon.log");
-    if (!passed && File.Exists(log))
+    if (Directory.Exists(otherBuild))
+        Directory.Delete(otherBuild, recursive: true);
+    if (!passed)
     {
-        // Shared for writing: on Windows the daemon's launcher may still hold it.
-        var text = new StreamReader(new FileStream(log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)).ReadToEnd();
-        Console.Error.WriteLine($"daemon log ({log}):\n{text[^Math.Min(4000, text.Length)..]}");
+        foreach (var name in new[] { "daemon.log", "daemon-start.log" })
+        {
+            var text = ReadLog(name);
+            if (text.Length > 0)
+                Console.Error.WriteLine($"{name} ({Path.Combine(work, ".blaze-cs", name)}):\n{text[^Math.Min(4000, text.Length)..]}");
+        }
     }
 }
 return 0;
+
+// Shared for writing and deleting: the daemon has its log open as it runs, and on Windows its launcher may
+// still hold daemon-start.log.
+string ReadLog(string name)
+{
+    var path = Path.Combine(work, ".blaze-cs", name);
+    if (!File.Exists(path))
+        return "";
+    using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+    return reader.ReadToEnd();
+}
+
+// The daemons that have started, oldest first, from the log line each writes.
+List<(int Pid, string Socket)> Daemons() =>
+    [.. Regex.Matches(ReadLog("daemon.log"), @"^\S+ serving .* on (.+) \(pid (\d+), exits after \d+ s idle\)", RegexOptions.Multiline)
+        .Select(m => (int.Parse(m.Groups[2].Value), m.Groups[1].Value))];
+
+bool Running(int pid)
+{
+    try
+    {
+        using var process = Process.GetProcessById(pid);
+        return !process.HasExited;
+    }
+    catch (ArgumentException)
+    {
+        return false;
+    }
+}
+
+// A client from another build of blaze-cs stops the daemon the cases used and starts its own, with a notice;
+// that daemon, started with a short idle limit, exits on its own and removes its socket; and the next
+// command, from this repo's build again, starts a daemon without a word about it.
+void DaemonLifecycle()
+{
+    var first = Daemons().Last();
+    // A copy of the build whose assembly has another MVID, which is its identity.
+    CopyDirectory(Path.Combine(root, "artifacts", "bin"), otherBuild);
+    var assembly = Path.Combine(otherBuild, "blaze-cs.dll");
+    var bytes = File.ReadAllBytes(assembly);
+    using (var pe = new PEReader(new MemoryStream(bytes)))
+    {
+        var metadata = pe.GetMetadataReader();
+        bytes[bytes.AsSpan().IndexOf(metadata.GetGuid(metadata.GetModuleDefinition().Mvid).ToByteArray().AsSpan())] ^= 0xFF;
+    }
+    File.WriteAllBytes(assembly, bytes);
+
+    var output = Run("dotnet", $"\"{assembly}\" build", environment: new() { ["BLAZE_CS_IDLE_SECONDS"] = "5" });
+    var daemons = Daemons();
+    if (!output.Contains("blaze-cs: the running daemon is from another build") || daemons.Count != 2 || daemons[0] != first)
+        Fail($"daemon handshake: expected a notice and a second daemon after the first ({first.Pid}), got {daemons.Count} daemons:\n{output}");
+    if (Running(first.Pid))
+        Fail($"daemon handshake: expected daemon {first.Pid}, from another build, to have exited before the command ran:\n{output}");
+
+    var idle = daemons[1];
+    var waiting = Stopwatch.StartNew();
+    while (Running(idle.Pid) && waiting.Elapsed < TimeSpan.FromSeconds(60))
+        Thread.Sleep(100);
+    if (Running(idle.Pid) || File.Exists(idle.Socket) || !ReadLog("daemon.log").Contains("no command for 5 s; exiting"))
+        Fail($"idle exit: expected daemon {idle.Pid} to log that it was idle for 5 s, exit and remove {idle.Socket} within 60 s:\n{ReadLog("daemon.log")}");
+
+    output = Run(blaze, "build");
+    daemons = Daemons();
+    if (output.Contains("another build") || daemons.Count != 3 || !Running(daemons[2].Pid) || !Regex.IsMatch(output, "^blaze-cs: up to date", RegexOptions.Multiline))
+        Fail($"after an idle exit: expected the next command to start a daemon without a notice and build, got {daemons.Count} daemons:\n{output}");
+    Console.WriteLine($"ok  daemon lifecycle: another build restarted daemon {first.Pid} as {idle.Pid}, which exited on its own after 5 s idle; the next command started {daemons[2].Pid}");
+}
+
+static void CopyDirectory(string from, string to)
+{
+    Directory.CreateDirectory(to);
+    foreach (var file in Directory.EnumerateFiles(from))
+        File.Copy(file, Path.Combine(to, Path.GetFileName(file)));
+    foreach (var directory in Directory.EnumerateDirectories(from))
+        CopyDirectory(directory, Path.Combine(to, Path.GetFileName(directory)));
+}
 
 // A test assembly the warm host can't load (here, a missing reference) fails the run within seconds, naming
 // the assembly and the cause, and the daemon still serves the next run.
@@ -244,11 +328,14 @@ Dictionary<string, byte[]> Outputs() =>
             && (path.EndsWith(".dll", StringComparison.Ordinal) || parts.Contains("scopedcss") && path.EndsWith(".css", StringComparison.Ordinal)))
         .ToDictionary(path => path, path => File.ReadAllBytes(Path.Combine(work, path)));
 
-string Run(string file, string arguments, bool check = true) => RunWithExit(file, arguments, check).Output;
+string Run(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null) =>
+    RunWithExit(file, arguments, check, environment).Output;
 
-(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true)
+(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null)
 {
     var start = new ProcessStartInfo(file, arguments) { WorkingDirectory = work, RedirectStandardOutput = true, RedirectStandardError = true };
+    foreach (var (name, value) in environment ?? [])
+        start.Environment[name] = value;
     using var process = Process.Start(start)!;
     var stderr = process.StandardError.ReadToEndAsync();
     var output = process.StandardOutput.ReadToEnd() + stderr.Result;

@@ -34,6 +34,11 @@ static partial class BuildLog
         if (!build.Succeeded)
             throw new InvalidOperationException($"The build in {binlogPath} failed");
 
+        // What belongs to the SDK is compared by real path: in a dotnet root assembled from symlinks (nix,
+        // or one combining two SDKs) `dotnet --list-sdks` names the link, while MSBuild loads its targets
+        // from where the link points.
+        var realPaths = new Dictionary<string, string>(PathComparer.Instance);
+        var dotnetRoot = Path.GetDirectoryName(Path.GetDirectoryName(RealPath(sdkDirectory, realPaths)))!;
         var units = new List<CompileUnit>();
         var copies = new List<(string, string)>();
         foreach (var project in build.FindChildrenRecursive<Project>())
@@ -58,7 +63,7 @@ static partial class BuildLog
             var name = Path.GetFileNameWithoutExtension(project.ProjectFile)
                 + (string.IsNullOrEmpty(project.TargetFramework) ? "" : $" ({project.TargetFramework})");
             var unit = new CompileUnit(name, project.ProjectFile, projectDirectory, CompilerArguments(commandLine), null);
-            units.Add(unit with { SlowPathReason = SlowPathReason(targets, unit.AssemblyPath, sdkDirectory) });
+            units.Add(unit with { SlowPathReason = SlowPathReason(targets, unit.AssemblyPath, dotnetRoot, realPaths) });
         }
         return new BuildLogInfo(units, copies);
     }
@@ -75,13 +80,13 @@ static partial class BuildLog
     /// A task outside the SDK that runs after CoreCompile and is handed the freshly compiled assembly
     /// is a post-compile rewrite (Fody, XAML compilers). SDK targets only read it.
     /// </summary>
-    static string? SlowPathReason(List<Target> targets, string output, string sdkDirectory)
+    static string? SlowPathReason(List<Target> targets, string output, string dotnetRoot, Dictionary<string, string> realPaths)
     {
-        var dotnetRoot = Path.GetFullPath(Path.Combine(sdkDirectory, "..", ".."));
         var afterCompile = targets.SkipWhile(t => t.Name != "CoreCompile").Skip(1);
         foreach (var target in afterCompile)
         {
-            if (target.SourceFilePath is { } file && Path.GetFullPath(file).StartsWith(dotnetRoot, PathComparer.Comparison))
+            if (target.SourceFilePath is { } file
+                && RealPath(file, realPaths).StartsWith(dotnetRoot + Path.DirectorySeparatorChar, PathComparer.Comparison))
                 continue;
             foreach (var task in target.Children.OfType<MSBuildTask>())
             {
@@ -92,6 +97,22 @@ static partial class BuildLog
             }
         }
         return null;
+    }
+
+    /// <summary>The full path with every symlink in it resolved, as realpath(3) does; memoized in
+    /// <paramref name="resolved"/>.</summary>
+    static string RealPath(string path, Dictionary<string, string> resolved)
+    {
+        path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        if (resolved.TryGetValue(path, out var real))
+            return real;
+        // A root (`/`, `C:\`) is never a link, and Windows can't open a drive root as a file.
+        if (Path.GetDirectoryName(path) is not { } parent)
+            return resolved[path] = path;
+        real = Path.Join(RealPath(parent, resolved), Path.GetFileName(path));
+        if (new FileInfo(real).ResolveLinkTarget(returnFinalTarget: true) is { } target)
+            real = RealPath(target.FullName, resolved);
+        return resolved[path] = real;
     }
 
     static IEnumerable<(string, string)> CopiesOf(MSBuildTask task, string projectDirectory)

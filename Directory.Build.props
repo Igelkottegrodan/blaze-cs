@@ -6,5 +6,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- The CLI starts the test host from its own directory, so both land in one place. -->
     <OutDir>$(MSBuildThisFileDirectory)artifacts/bin/</OutDir>
+    <!-- The Roslyn the daemon is compiled against, and the one its unit tests run on. -->
+    <RoslynVersion>5.9.0</RoslynVersion>
   </PropertyGroup>
 </Project>
