@@ -98,11 +98,29 @@ static class SdkRoslyn
 
 /// <summary>
 /// Loads analyzer assemblies (generators) one load context per directory, so each package keeps its
-/// own dependencies, while Roslyn itself and the framework stay shared with the daemon.
+/// own dependencies, while Roslyn itself and the framework stay shared with the daemon. Each assembly
+/// loads from a copy under the shadow directory: Windows locks a loaded file, and a generator project in
+/// the solution must stay buildable while the daemon holds its generator.
 /// </summary>
 sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
 {
-    readonly Dictionary<string, DirectoryContext> _contexts = new(StringComparer.Ordinal);
+    readonly Dictionary<string, DirectoryContext> _contexts = new(PathComparer.Instance);
+    readonly string _shadowDirectory;
+
+    /// <param name="shadowRoot">Shared by daemons of one solution; each copies into its own subdirectory
+    /// and removes the ones earlier daemons left.</param>
+    public AnalyzerLoader(string shadowRoot)
+    {
+        if (Directory.Exists(shadowRoot))
+        {
+            foreach (var stale in Directory.EnumerateDirectories(shadowRoot))
+            {
+                try { Directory.Delete(stale, recursive: true); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { } // still loaded by a daemon on its way out
+            }
+        }
+        _shadowDirectory = Path.Combine(shadowRoot, Environment.ProcessId.ToString());
+    }
 
     public void AddDependencyLocation(string fullPath) { }
 
@@ -113,9 +131,9 @@ sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
         lock (_contexts)
         {
             if (!_contexts.TryGetValue(directory, out context))
-                _contexts[directory] = context = new DirectoryContext(directory);
+                _contexts[directory] = context = new DirectoryContext(directory, Path.Combine(_shadowDirectory, _contexts.Count.ToString()));
         }
-        return context.LoadFromAssemblyPath(fullPath);
+        return context.LoadCopy(fullPath);
     }
 
     static readonly HashSet<string> FrameworkAssemblies = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
@@ -123,8 +141,22 @@ sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
         .Select(Path.GetFileNameWithoutExtension)
         .ToHashSet(StringComparer.OrdinalIgnoreCase)!;
 
-    sealed class DirectoryContext(string directory) : AssemblyLoadContext($"analyzers:{directory}")
+    sealed class DirectoryContext(string directory, string shadow) : AssemblyLoadContext($"analyzers:{directory}")
     {
+        public Assembly LoadCopy(string path)
+        {
+            var copy = Path.Combine(shadow, Path.GetFileName(path));
+            lock (this)
+            {
+                if (!File.Exists(copy))
+                {
+                    Directory.CreateDirectory(shadow);
+                    File.Copy(path, copy);
+                }
+            }
+            return LoadFromAssemblyPath(copy);
+        }
+
         protected override Assembly? Load(AssemblyName name)
         {
             // The compiler and the framework are shared: generators must see the same ISourceGenerator
@@ -134,7 +166,7 @@ sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
                 return null;
 
             var candidate = Path.Combine(directory, name.Name + ".dll");
-            return File.Exists(candidate) ? LoadFromAssemblyPath(candidate) : null;
+            return File.Exists(candidate) ? LoadCopy(candidate) : null;
         }
     }
 }

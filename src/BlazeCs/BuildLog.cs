@@ -81,12 +81,12 @@ static partial class BuildLog
         var afterCompile = targets.SkipWhile(t => t.Name != "CoreCompile").Skip(1);
         foreach (var target in afterCompile)
         {
-            if (target.SourceFilePath is { } file && Path.GetFullPath(file).StartsWith(dotnetRoot, StringComparison.Ordinal))
+            if (target.SourceFilePath is { } file && Path.GetFullPath(file).StartsWith(dotnetRoot, PathComparer.Comparison))
                 continue;
             foreach (var task in target.Children.OfType<MSBuildTask>())
             {
                 var mentionsAssembly = task.FindChildrenRecursive<BaseNode>()
-                    .Any(n => n.ToString() is { } text && text.Contains(output, StringComparison.Ordinal));
+                    .Any(n => n.ToString() is { } text && text.Contains(output, PathComparer.Comparison));
                 if (mentionsAssembly)
                     return $"target {target.Name} ({task.Name}) rewrites the assembly after compile";
             }
