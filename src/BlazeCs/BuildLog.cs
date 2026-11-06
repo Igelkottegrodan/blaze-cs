@@ -106,7 +106,10 @@ static partial class BuildLog
         path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         if (resolved.TryGetValue(path, out var real))
             return real;
-        real = Path.GetDirectoryName(path) is { } parent ? Path.Join(RealPath(parent, resolved), Path.GetFileName(path)) : path;
+        // A root (`/`, `C:\`) is never a link, and Windows can't open a drive root as a file.
+        if (Path.GetDirectoryName(path) is not { } parent)
+            return resolved[path] = path;
+        real = Path.Join(RealPath(parent, resolved), Path.GetFileName(path));
         if (new FileInfo(real).ResolveLinkTarget(returnFinalTarget: true) is { } target)
             real = RealPath(target.FullName, resolved);
         return resolved[path] = real;
