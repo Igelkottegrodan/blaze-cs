@@ -186,6 +186,9 @@ sealed class SolutionBuilder
     /// <summary>The first load's warm-up, which runs on after the command that started the daemon returns.</summary>
     Task<WarmedUp>? _warmUp;
 
+    /// <summary>The warm-up still running after the command that started it returned, if any.</summary>
+    public Task? WarmingUp => _warmUp;
+
     /// <summary>A warm-up's report, and whether it found cached arguments stale.</summary>
     sealed record WarmedUp(List<string> Lines, bool Stale);
 

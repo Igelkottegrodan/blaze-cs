@@ -565,7 +565,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 start.ArgumentList.Add($"--warm-up={warmUp}");
         }
         // Tests run with the runtime's defaults, as under `dotnet test`, not the daemon's tuning.
-        foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
+        foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_GCConserveMemory", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
             start.Environment.Remove(variable);
         // A host exits when its stdin closes, so the daemon dying any way takes every host with it.
         return Process.Start(start)!;
