@@ -269,7 +269,7 @@ sealed partial class SolutionBuilder
 
     /// <summary>Whether a unit's assembly on disk is the one its sources compile to, as the daemon last wrote or verified it.</summary>
     public bool Reproduces(ProjectCompiler unit) =>
-        _published.TryGetValue(unit.AssemblyPath, out var last) && Holds(unit.AssemblyPath, last.Bytes);
+        _published.HoldsLast(unit.AssemblyPath);
 
     /// <summary>The load that warm-up called for, run by each command until it succeeds, as the first load is.</summary>
     Func<Action<string>, bool>? _reload;

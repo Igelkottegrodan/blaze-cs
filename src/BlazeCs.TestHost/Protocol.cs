@@ -15,7 +15,8 @@ namespace BlazeCs;
 //      MetadataUpdater.ApplyUpdate, then runs the same test assembly again with a new runner (so the
 //      framework discovers its tests anew) and reports a result, back to 2. An update without deltas runs
 //      the tests again as they are. A delta it can't apply ends it: that result has Unsupported and
-//      CannotHotReload set, and ran nothing.
+//      CannotHotReload set, and ran nothing. An assembly loaded from a baseline has the baseline's
+//      Assembly.Location (the daemon's copy), not the path the tests would have loaded it from.
 //    - Exit (TestHostExit): the host exits.
 //    Otherwise CannotHotReload says why, and the host exits after that one run, as hosts always did.
 // A line the host can't read, or a message out of turn, gets a result with Error and CannotHotReload set

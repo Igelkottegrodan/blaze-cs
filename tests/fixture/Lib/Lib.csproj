@@ -6,6 +6,11 @@
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
   </PropertyGroup>
 
+  <!-- Read by Salutation.Greeting. -->
+  <ItemGroup>
+    <EmbeddedResource Include="greeting.txt" />
+  </ItemGroup>
+
   <!-- Lists Greeter.cs a second time, as a target that adds a generated file again would: csc compiles it
        once (warning CS2002), and so must blaze-cs. -->
   <Target Name="AddGreeterAgain" BeforeTargets="CoreCompile">

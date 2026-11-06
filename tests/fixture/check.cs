@@ -251,6 +251,7 @@ try
     }
     PreparedHostsSeeNewBytes();
     HotReloadBodyEdit();
+    HotReloadFallsBack();
     ProjectRemovedAndRestored();
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
@@ -1099,6 +1100,75 @@ void HotReloadBodyEdit()
     Console.WriteLine($"ok  hot reload: a Lib body edit and its undo reached the hosts that stayed up ({string.Join(", ", reloadedInto.Order())}) as deltas, in the same processes; the failures matched dotnet test's");
 }
 
+// Edits a delta can't carry don't hot reload: each host that stayed up for a Debug test project ends, the
+// project runs in a new host, and the failures match dotnet test's (a host that took the edit as a delta would
+// still pass, on the old value).
+// - A static field's initializer: the engine has a delta (the type initializer's body), but the initializer
+//   already ran in the host, so the engine asks for a restart (RestartWhenChangesHaveNoEffect).
+// - An embedded resource, with a body edit in the same assembly: the engine has a delta for the body, which
+//   doesn't carry the resource.
+void HotReloadFallsBack()
+{
+    if (HotReloadUnavailableBecause() is not null)
+        return;
+    const string staticInit = "Mark = \"!\"", body = "Twice(int amount) => amount + amount";
+    var shouted = false; // four steps: each toggles it, and it ends as it was
+    FallsBack("static initializer edit", () => Replace("Lib/Salutation.cs", staticInit, "Mark = \"?\""), fails: true, reason: null);
+    FallsBack("static initializer edit undone", () => Replace("Lib/Salutation.cs", "Mark = \"?\"", staticInit), fails: false, reason: null);
+    const string resourced = "Lib (net10.0)'s resources changed, which a delta doesn't carry";
+    FallsBack("resource and body edit", () =>
+    {
+        File.WriteAllText(Path.Combine(work, "Lib/greeting.txt"), "Howdy\n");
+        Replace("Lib/Greeter.cs", body, "Twice(int amount) => amount << 1");
+    }, fails: true, reason: resourced);
+    FallsBack("resource and body edit undone", () =>
+    {
+        File.WriteAllText(Path.Combine(work, "Lib/greeting.txt"), "Hello\n");
+        Replace("Lib/Greeter.cs", "Twice(int amount) => amount << 1", body);
+    }, fails: false, reason: resourced);
+    Console.WriteLine("ok  hot reload fallback: a static initializer edit, and a resource edit with a body edit, ran in new hosts; the failures matched dotnet test's");
+
+    void FallsBack(string name, Action edit, bool fails, string? reason)
+    {
+        // The step before ran its projects in new hosts, mostly spares, which don't stay up. A body edit in Lib
+        // runs them in the hosts prepared for them meanwhile, which stay up, and hot reloads into the ones that
+        // did stay up. (Not `test --all`: with nothing changed, it ends the hosts that stayed up. Before an
+        // undo, Tests still fails.)
+        IdleHosts($"before {name}, before a body edit");
+        shouted = !shouted;
+        if (shouted)
+            Replace("Lib/Greeter.cs", "who.ToUpperInvariant()", "who.ToUpperInvariant().ToString()");
+        else
+            Replace("Lib/Greeter.cs", "who.ToUpperInvariant().ToString()", "who.ToUpperInvariant()");
+        Run(blaze, "test", check: false);
+        IdleHosts($"before {name}");
+        var live = LiveHosts().Where(host => libTests.Contains(host.Value)).ToDictionary();
+        if (live.Count == 0)
+            Fail($"{name}: expected hosts staying up for some of {string.Join(", ", libTests)}:\n{ReadLog("daemon.log")}");
+        var logged = ReadLog("daemon.log").Length;
+        edit();
+        var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+        if (!Rebuilt(output).SetEquals(lib) || output.Contains("hot reloaded"))
+            Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", lib)} and hot reload nothing:\n{output}");
+        var log = ReadLog("daemon.log")[logged..];
+        foreach (var (pid, project) in live)
+        {
+            var ended = Regex.Match(log, $@"hot reload: test host {pid} \({project}\.dll\) ends, and {project}\.dll runs in a new host: (.+?)\r?$", RegexOptions.Multiline);
+            if (!ended.Success || (reason is null ? ended.Groups[1].Value.StartsWith("nothing", StringComparison.Ordinal) : ended.Groups[1].Value != reason))
+                Fail($"{name}: expected host {pid} ({project}) to end{(reason is null ? "" : $" because {reason}")}:\n{log}");
+        }
+        if (fails)
+        {
+            if (exitCode == 0)
+                Fail($"{name}: expected Tests to fail:\n{output}");
+            SameAsDotnetTest(name, output, libTests);
+        }
+        else
+            RanTests(name, output, libTests);
+        Verify(name, [.. lib], null);
+    }
+}
+
 // Each project's summary and failed tests in a blaze-cs run, as `dotnet test --no-build` reports them.
 void SameAsDotnetTest(string name, string output, string[] projects)
 {
@@ -1172,6 +1242,8 @@ void HotReloadUnavailable()
     {
         Run(blaze, "stop", check: false);
         Directory.Delete(empty);
+        if (File.ReadAllText(Path.Combine(work, "Lib/Greeter.cs")).Contains("Twice(int amount) => amount * 2"))
+            Replace("Lib/Greeter.cs", "Twice(int amount) => amount * 2", "Twice(int amount) => amount + amount");
     }
 }
 
@@ -1347,25 +1419,27 @@ void HostCannotLoad()
     Console.WriteLine($"ok  host that can't load an assembly: failed in {failedIn.TotalSeconds:F1} s; the next run passed");
 }
 
-// A test project whose tests failed runs again on the next `test`, though nothing changed since: in the host that
-// stays up for it, which took the edit, without an update.
+// A test project whose tests failed runs again on the next `test`, though nothing changed since: in a new host,
+// not the one that stayed up for it, whose statics the first run left (TestRunner.Plan).
 void FailedRunsAgain()
 {
-    Replace("Tests/WelcomeTests.cs", "\"Hello\"", "\"Goodbye\"");
+    Replace("Tests/WelcomeTests.cs", "StartsWith(\"Hello\"", "StartsWith(\"Goodbye\"");
     try
     {
         for (var run = 1; run <= 2; run++)
         {
+            var logged = ReadLog("daemon.log").Length;
             var (output, exitCode) = RunWithExit(blaze, "test", check: false);
             if (exitCode == 0 || !Regex.IsMatch(output, @"^\s*Failed!\s+- Failed:\s+1, .* - Tests\.dll\b", RegexOptions.Multiline)
                 || run == 2 && (Rebuilt(output).Count != 0
-                    || HotReloadUnavailableBecause() is null && !Regex.IsMatch(output, @"^blaze-cs: Tests\.dll: ran again in its test host \(pid \d+\)", RegexOptions.Multiline)))
-                Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? ", in its test host, and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
+                    || output.Contains("ran again") || output.Contains("hot reloaded")
+                    || HotReloadUnavailableBecause() is null && !ReadLog("daemon.log")[logged..].Contains("(Tests.dll) ends, and Tests.dll runs in a new host: nothing its tests run with changed")))
+                Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? ", in a new host, and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
         }
     }
     finally
     {
-        Replace("Tests/WelcomeTests.cs", "\"Goodbye\"", "\"Hello\"");
+        Replace("Tests/WelcomeTests.cs", "StartsWith(\"Goodbye\"", "StartsWith(\"Hello\"");
     }
     RanTests("test after a failed run", Run(blaze, "test"), ["Tests"]);
     Console.WriteLine("ok  failed test project: ran again with unchanged inputs, and passed once fixed");
@@ -1585,8 +1659,9 @@ void RanTests(string name, string output, string[] expected, string[]? among = n
             Fail($"{name}: {project}: expected {TestCount(project)} tests passed and no others, got {summary}:\n{output}");
 }
 
-// Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings.
-static int TestCount(string project) => project switch { "ComponentTests" => 2, "Tests11" => 1, "NUnitTests" or "MSTestTests" => 4, _ => 3 };
+// Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings;
+// Tests also has Exclaims and ReadsGreeting (HotReloadFallsBack).
+static int TestCount(string project) => project switch { "Tests" => 5, "ComponentTests" => 2, "Tests11" => 1, "NUnitTests" or "MSTestTests" => 4, _ => 3 };
 
 // Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources. After a fallback, MSBuild
 // built everything, so every output must be identical. Returns that build's output, with its warnings.

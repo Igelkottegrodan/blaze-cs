@@ -4,8 +4,10 @@
     <!-- Not artifacts/bin: that is the shipped daemon's directory, which must not carry a Roslyn of its own. -->
     <OutDir>$(MSBuildThisFileDirectory)../../artifacts/tests/</OutDir>
     <!-- The analyzers ProjectAnalyzersTests runs are test doubles, not shipped analyzers: the rules for
-         authoring an analyzer project (netstandard2.0, release tracking, extended rules) don't apply. -->
-    <NoWarn>$(NoWarn);RS1036;RS1041;RS2008</NoWarn>
+         authoring an analyzer project (netstandard2.0, release tracking, extended rules) don't apply, nor does
+         the one against referencing Workspaces (RS1038), which reaches this project through the daemon's hot
+         reload API: csc never loads them. -->
+    <NoWarn>$(NoWarn);RS1036;RS1038;RS1041;RS2008</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <!-- The daemon excludes Roslyn's runtime assets and loads the SDK's; the tests run on the exact

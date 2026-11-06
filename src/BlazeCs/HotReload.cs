@@ -5,6 +5,7 @@ using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
+using System.Security.Cryptography;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Host.Mef;
 using Microsoft.CodeAnalysis.Text;
@@ -47,6 +48,7 @@ sealed class HotReloadEngine
     readonly PropertyInfo _status, _projectUpdates, _transientDiagnostics, _persistentDiagnostics, _projectsToRestart, _projectsToRebuild;
     readonly FieldInfo _module, _project, _il, _metadata, _pdb, _updatedTypes;
     readonly Type _runningProject;
+    readonly PropertyInfo _restartWhenChangesHaveNoEffect;
     readonly Lazy<Workspace> _workspace;
 
     HotReloadEngine(Type service, Assembly hotReload)
@@ -90,6 +92,10 @@ sealed class HotReloadEngine
         _updatedTypes = Field("UpdatedTypes", typeof(ImmutableArray<int>));
         if (!_runningProject.IsValueType && _runningProject.GetConstructor(Type.EmptyTypes) is null)
             throw Missing("RunningProjectInfo()");
+        // Without it, an edit the runtime can apply but that changes nothing that runs again (a static field's
+        // initializer, whose constructor already ran) is reported ready, and the tests run with the old value.
+        _restartWhenChangesHaveNoEffect = _runningProject.GetProperty("RestartWhenChangesHaveNoEffect", Instance) is { CanWrite: true } restart
+            && restart.PropertyType == typeof(bool) ? restart : throw Missing("RunningProjectInfo.RestartWhenChangesHaveNoEffect");
 
         // Composing the engine's services (MEF) takes a while, so the first session does it, not the load.
         _workspace = new(() => new AdhocWorkspace(MefHostServices.Create(
@@ -195,12 +201,21 @@ sealed class HotReloadEngine
 
     internal void Start(object service, Solution solution) => Await(_start.Invoke(service, [solution, CancellationToken.None]));
 
-    internal EngineUpdates GetUpdates(object service, Solution solution, ProjectId running)
+    /// <summary>
+    /// The engine's updates for a solution whose given projects all run in the host: each asks for a restart
+    /// when an edit would have no effect on the code that already ran (RestartWhenChangesHaveNoEffect).
+    /// </summary>
+    internal EngineUpdates GetUpdates(object service, Solution solution, IEnumerable<ProjectId> running)
     {
         var runningProjects = typeof(ImmutableDictionary<,>).MakeGenericType(typeof(ProjectId), _runningProject);
-        var empty = runningProjects.GetField("Empty")!.GetValue(null);
+        var projects = runningProjects.GetField("Empty")!.GetValue(null);
         var add = runningProjects.GetMethod("Add", [typeof(ProjectId), _runningProject])!;
-        var projects = add.Invoke(empty, [running, Activator.CreateInstance(_runningProject)]);
+        foreach (var id in running)
+        {
+            var info = Activator.CreateInstance(_runningProject)!; // boxed, so setting the property sets it here
+            _restartWhenChangesHaveNoEffect.SetValue(info, true);
+            projects = add.Invoke(projects, [id, info]);
+        }
         var task = (Task)_getUpdates.Invoke(service, [solution, projects, CancellationToken.None])!;
         Await(task);
         var updates = task.GetType().GetProperty("Result")!.GetValue(task)!;
@@ -253,7 +268,8 @@ sealed record EngineDelta(Guid Module, ProjectId Project, byte[] Metadata, byte[
 /// project file (the engine ignores a project without one), the path the host loaded it from and its MVID, and where the engine reads the bytes the host loaded, which the
 /// build after an edit replaces on disk.
 /// </summary>
-sealed record LoadedModule(string Key, string Name, string ProjectFile, string Loaded, Guid Mvid, string Snapshot);
+/// <param name="Resources">A hash of the snapshot's manifest resources (<see cref="HotReloadSession.Resources(PEReader)"/>), which no delta changes.</param>
+sealed record LoadedModule(string Key, string Name, string ProjectFile, string Loaded, Guid Mvid, string Snapshot, string Resources);
 
 /// <summary>
 /// A hot reload session for one test host: a Workspaces solution of the modules the host has loaded, as the
@@ -266,7 +282,6 @@ sealed class HotReloadSession
     readonly HotReloadEngine _engine;
     readonly object _service;
     readonly Dictionary<string, Project> _projects = new(PathComparer.Instance);
-    readonly ProjectId _running;
     Solution _solution;
     Solution? _pending;
     Dictionary<string, Project>? _pendingProjects;
@@ -276,7 +291,7 @@ sealed class HotReloadSession
 
     public IReadOnlyList<LoadedModule> Modules { get; }
 
-    HotReloadSession(HotReloadEngine engine, IReadOnlyList<LoadedModule> modules, IReadOnlyDictionary<string, UnitSources> sources, string runningKey)
+    HotReloadSession(HotReloadEngine engine, IReadOnlyList<LoadedModule> modules, IReadOnlyDictionary<string, UnitSources> sources)
     {
         _engine = engine;
         Modules = modules;
@@ -292,14 +307,13 @@ sealed class HotReloadSession
                 .WithCompilationOutputInfo(default(CompilationOutputInfo).WithAssemblyPath(module.Snapshot)));
             _projects[module.Key] = project;
         }
-        _running = _projects[runningKey].Id;
         _service = engine.CreateService();
         engine.Start(_service, _solution);
     }
 
-    /// <summary>Starts a session over these modules, whose units' sources are as given; the running one is the test project's.</summary>
-    public static HotReloadSession Start(HotReloadEngine engine, IReadOnlyList<LoadedModule> modules, IReadOnlyDictionary<string, UnitSources> sources, string runningKey) =>
-        new(engine, modules, sources, runningKey);
+    /// <summary>Starts a session over these modules, whose units' sources are as given; every one of them runs in the host.</summary>
+    public static HotReloadSession Start(HotReloadEngine engine, IReadOnlyList<LoadedModule> modules, IReadOnlyDictionary<string, UnitSources> sources) =>
+        new(engine, modules, sources);
 
     static DocumentInfo Document(ProjectId project, Project owner, SyntaxTree tree)
     {
@@ -352,7 +366,7 @@ sealed class HotReloadSession
             projects[key] = project;
         }
         (_pending, _pendingProjects) = (solution, projects);
-        return (_engine.GetUpdates(_service, solution, _running), projects.ToDictionary(p => p.Value.Id, p => p.Key));
+        return (_engine.GetUpdates(_service, solution, projects.Values.Select(project => project.Id)), projects.ToDictionary(p => p.Value.Id, p => p.Key));
     }
 
     /// <summary>The host applied the last changes: they are what it runs now.</summary>
@@ -383,15 +397,17 @@ sealed class HotReloadSession
     /// assembly, and without checking it is the PDB of that build, so the copy's entry is pointed at its
     /// copied PDB: the PDB at the original path is the next build's.
     /// </summary>
-    public static (string Path, Guid Mvid) Snapshot(string loaded, string? pdb, string root)
+    public static (string Path, Guid Mvid, string Resources) Snapshot(string loaded, string? pdb, string root)
     {
         var bytes = File.ReadAllBytes(loaded);
         Guid mvid;
+        string resources;
         var codeViews = new List<(int Offset, int Length, string Path)>();
         using (var pe = new PEReader(ImmutableArray.Create(bytes)))
         {
             var metadata = pe.GetMetadataReader();
             mvid = metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
+            resources = Resources(pe);
             foreach (var entry in pe.ReadDebugDirectory().Where(entry => entry.Type == DebugDirectoryEntryType.CodeView))
             {
                 // "RSDS", the PDB id (16 bytes) and age (4), then the path, UTF-8 and zero-terminated.
@@ -404,7 +420,7 @@ sealed class HotReloadSession
         lock (Snapshots)
         {
             if (!Snapshots.Add(snapshot))
-                return (snapshot, mvid);
+                return (snapshot, mvid, resources);
             Directory.CreateDirectory(directory);
             foreach (var (offset, length, original) in codeViews)
             {
@@ -422,7 +438,34 @@ sealed class HotReloadSession
             }
             File.WriteAllBytes(snapshot, bytes);
         }
-        return (snapshot, mvid);
+        return (snapshot, mvid, resources);
+    }
+
+    /// <summary>
+    /// A hash of an assembly's manifest resources: each one's name and attributes, and an embedded one's bytes. A
+    /// delta carries none, so an edit that changes them can't hot reload.
+    /// </summary>
+    public static string Resources(PEReader pe)
+    {
+        var metadata = pe.GetMetadataReader();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var handle in metadata.ManifestResources)
+        {
+            var resource = metadata.GetManifestResource(handle);
+            hash.AppendData(System.Text.Encoding.UTF8.GetBytes($"{metadata.GetString(resource.Name)}\0{(int)resource.Attributes}\0{resource.Implementation.Kind}\0"));
+            if (!resource.Implementation.IsNil)
+                continue; // in another file or assembly, which the inputs hash on their own
+            var block = pe.GetSectionData(pe.PEHeaders.CorHeader!.ResourcesDirectory.RelativeVirtualAddress + (int)resource.Offset).GetReader();
+            hash.AppendData(block.ReadBytes(block.ReadInt32()));
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    /// <summary>The hash of <see cref="Resources(PEReader)"/> for an assembly file.</summary>
+    public static string Resources(string assembly)
+    {
+        using var pe = new PEReader(File.OpenRead(assembly));
+        return Resources(pe);
     }
 
     static readonly HashSet<string> Snapshots = new(PathComparer.Instance);

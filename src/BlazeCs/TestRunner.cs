@@ -77,6 +77,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         /// <summary>Null until the solution's units hold what the host loaded (see SolutionBuilder.WhenSettled); its result is null if it didn't start.</summary>
         public Task<HotReloadSession?>? Session { get; set; }
         public string? Failure { get; set; }
+        /// <summary>Set by End, under a lock on the host: a session that hasn't started by then never does.</summary>
+        public bool Ended { get; set; }
     }
 
     // Live hosts by test assembly, one per test project at most, in place of its idle host.
@@ -360,19 +362,14 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 reason = result is null ? "the host exited" : result.Unsupported;
                 if (result is not null && reason is null)
                 {
-                    if (update.Deltas.Length == 0)
-                        output.Insert(0, $"blaze-cs: {name}: ran again in its test host (pid {pid})");
-                    else
-                    {
-                        session!.Commit();
-                        var modules = session.Modules.ToDictionary(module => module.Mvid);
-                        static string Types(TestHostDelta delta) => delta.UpdatedTypes?.Length is 1 ? "1 type" : $"{delta.UpdatedTypes?.Length ?? 0} types";
-                        var applied = string.Join(", ", update.Deltas.Select(delta => $"{modules[delta.Module].Name} ({Types(delta)})"));
-                        foreach (var delta in update.Deltas)
-                            Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) applied a delta to module {modules[delta.Module].Name} "
-                                + $"({delta.Module}): {Types(delta)} updated");
-                        output.Insert(0, $"blaze-cs: {name}: hot reloaded {applied} into its test host (pid {pid})");
-                    }
+                    session!.Commit();
+                    var modules = session.Modules.ToDictionary(module => module.Mvid);
+                    static string Types(TestHostDelta delta) => delta.UpdatedTypes?.Length is 1 ? "1 type" : $"{delta.UpdatedTypes?.Length ?? 0} types";
+                    var applied = string.Join(", ", update.Deltas.Select(delta => $"{modules[delta.Module].Name} ({Types(delta)})"));
+                    foreach (var delta in update.Deltas)
+                        Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) applied a delta to module {modules[delta.Module].Name} "
+                            + $"({delta.Module}): {Types(delta)} updated");
+                    output.Insert(0, $"blaze-cs: {name}: hot reloaded {applied} into its test host (pid {pid})");
                     if (result.CannotHotReload is null)
                     {
                         live.Inputs = inputs;
@@ -398,8 +395,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// Whether an edit hot reloads into a live host, and the update that carries it; otherwise why not. The
     /// one place that decides it: only when what changed since the host's last run is assemblies of the
     /// session's modules, and the engine has a delta for each of them, with nothing to restart or rebuild.
-    /// The engine only takes method body edits (HotReloadEngine.Capabilities). With nothing changed (`test
-    /// --all`, or a run that failed), the update is empty: the host runs the tests again as they are.
+    /// The engine only takes method body edits (HotReloadEngine.Capabilities), and asks for a restart when one
+    /// would have no effect (a static field's initializer). With nothing changed (`test --all`, or a run that
+    /// failed), the project runs in a new host: in the live one, its tests would see the statics they left.
+    /// Statics carry over between hot reloaded runs too (#129).
     /// </summary>
     (HotReloadSession? Session, TestHostUpdate? Update, string? Reason) Plan(LiveHost live, string inputs)
     {
@@ -413,7 +412,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return (null, null, "the set of files its tests run with changed");
         var changed = now.Where(input => before[input.Key] != input.Value).Select(input => input.Key).ToList();
         if (changed.Count == 0)
-            return (null, new TestHostUpdate([]), null);
+            return (null, null, "nothing its tests run with changed, and a new host starts their statics anew");
 
         // A session still starting is waited for.
         var session = live.Session?.GetAwaiter().GetResult();
@@ -422,6 +421,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var loaded = session.Modules.ToDictionary(module => module.Loaded, PathComparer.Instance);
         if (changed.FirstOrDefault(path => !loaded.ContainsKey(path)) is { } other)
             return (session, null, $"{Path.GetFileName(other)} changed");
+        if (changed.Select(path => loaded[path]).FirstOrDefault(module => HotReloadSession.Resources(module.Loaded) != module.Resources) is { } resourced)
+            return (session, null, $"{resourced.Name}'s resources changed, which a delta doesn't carry");
 
         var units = builder.Units.ToDictionary(u => u.Unit.AssemblyPath, PathComparer.Instance);
         var sources = new Dictionary<string, UnitSources>(PathComparer.Instance);
@@ -468,28 +469,35 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         // The host's modules are copied now, before an edit replaces them on disk; the engine's work runs in the background.
         builder.WhenSettled(() =>
         {
-            try
+            // A host ended in the meantime (Prestart, Dispose) gets no session, which nothing would end.
+            lock (live)
             {
-                var (modules, sources) = Capture(unit);
-                live.Session = Task.Run(() =>
+                if (live.Ended)
+                    return;
+                try
                 {
-                    try { return HotReloadSession.Start(Engine!, modules, sources, unit.Unit.AssemblyPath); }
-                    catch (Exception e)
+                    var (modules, sources) = Capture(unit);
+                    live.Session = Task.Run(() =>
                     {
-                        live.Failure = $"its session didn't start: {e.Message}";
-                        Console.WriteLine($"{DateTime.Now:O} hot reload: {e}");
-                        return null;
-                    }
-                });
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or BadImageFormatException)
-            {
-                live.Failure = e.Message;
-                live.Session = Task.FromResult<HotReloadSession?>(null);
+                        try { return HotReloadSession.Start(Engine!, modules, sources); }
+                        catch (Exception e)
+                        {
+                            live.Failure = $"its session didn't start: {e.Message}";
+                            Console.WriteLine($"{DateTime.Now:O} hot reload: {e}");
+                            return null;
+                        }
+                    });
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or BadImageFormatException)
+                {
+                    live.Failure = e.Message;
+                    live.Session = Task.FromResult<HotReloadSession?>(null);
+                }
             }
         });
         // Not settled: no session, so the next run doesn't wait for one.
-        live.Session ??= Task.FromResult<HotReloadSession?>(null);
+        lock (live)
+            live.Session ??= Task.FromResult<HotReloadSession?>(null);
     }
 
     /// <summary>
@@ -506,8 +514,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 continue;
             if (unit.Sources is not { } current || !builder.Reproduces(unit))
                 throw new InvalidOperationException($"{unit.Unit.Name}'s assembly on disk isn't what the daemon compiles from its sources");
-            var (snapshot, mvid) = HotReloadSession.Snapshot(path, unit.PdbPath, SnapshotRoot);
-            modules.Add(new LoadedModule(unit.Unit.AssemblyPath, unit.Unit.Name, unit.Unit.ProjectFile, path, mvid, snapshot));
+            var (snapshot, mvid, resources) = HotReloadSession.Snapshot(path, unit.PdbPath, SnapshotRoot);
+            modules.Add(new LoadedModule(unit.Unit.AssemblyPath, unit.Unit.Name, unit.Unit.ProjectFile, path, mvid, snapshot, resources));
             sources[unit.Unit.AssemblyPath] = current;
         }
         return (modules, sources);
@@ -516,8 +524,14 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// <summary>Ends a live host and its session.</summary>
     void End(LiveHost live)
     {
+        Task<HotReloadSession?>? session;
+        lock (live)
+        {
+            live.Ended = true;
+            session = live.Session;
+        }
         Stop(live.Process);
-        live.Session?.ContinueWith(started =>
+        session?.ContinueWith(started =>
         {
             try { started.Result?.End(); }
             catch (Exception e) { Console.WriteLine($"{DateTime.Now:O} hot reload: ending a session: {e.Message}"); }
