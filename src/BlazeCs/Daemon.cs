@@ -45,23 +45,22 @@ static class Daemon
                     collector.Idle(builder.Idling);
             }
         }
-        var pipeName = CompilerServer.PipeName(solutionPath);
         CompilerServer? server = null;
         if (CompilerServer.Enabled)
         {
-            // The Csc task sends the commit of the SDK's Roslyn, which the SDK's server (VBCSCompiler, beside the
-            // compiler the daemon loaded) compares with its own.
-            var bincore = Path.GetDirectoryName(typeof(Microsoft.CodeAnalysis.Compilation).Assembly.Location)!;
+            // The pipe and commit hash are those of the SDK's own server (VBCSCompiler, beside the compiler the
+            // daemon loaded), which the Csc task derives from that directory and sends with each compile. The task
+            // runs in MSBuild, which the dotnet host starts from the SDK's real path: through a symlinked SDK
+            // directory the daemon's path to it would name another pipe.
+            var bincore = BuildLog.RealPath(Path.GetDirectoryName(typeof(Microsoft.CodeAnalysis.Compilation).Assembly.Location)!, []);
             var compilerHash = CompilerServer.CommitHash(Path.Combine(bincore, "VBCSCompiler.dll")) ?? "";
-            server = CompilerServer.Start(pipeName, compilerHash, request =>
-                {
-                    Busy();
-                    try { return builder.Serve(request, compilerHash); }
-                    finally { Idle(); }
-                },
-                note => Console.WriteLine($"{DateTime.Now:O} compiler server: {note}"));
-            if (server is not null)
-                Console.WriteLine($"{DateTime.Now:O} compiler server on pipe {pipeName} (Roslyn {compilerHash}): dotnet build -p:SharedCompilationId={pipeName} compiles through this daemon");
+            server = new CompilerServer(bincore, compilerHash, Program.DotnetHost(), request =>
+            {
+                Busy();
+                try { return builder.Serve(request); }
+                finally { Idle(); }
+            });
+            Console.WriteLine($"{DateTime.Now:O} compiler server: pipe {server.Name} of {bincore}");
         }
         else
             Console.WriteLine($"{DateTime.Now:O} compiler server off (BLAZE_CS_COMPILER_SERVER=0)");
@@ -124,6 +123,9 @@ static class Daemon
             }
 
             int exitCode;
+            // Each command takes the pipe back if `dotnet build-server shutdown` or another daemon took it, and
+            // returns once it has it (or tried), so a dotnet build right after compiles through this daemon.
+            var taking = request is { Command: "build" or "test" } && request.Build == Build ? server?.Take() : null;
             // Released before the exit code goes out: a build that compiles through the pipe right after the
             // command returns must find the daemon free.
             var command = builder.Command();
@@ -154,8 +156,6 @@ static class Daemon
                     loaded = builder.Load(Log, warmUpLater: true);
                     if (loaded)
                         tests.Prestart();
-                    if (loaded && server is not null)
-                        Log($"blaze-cs: dotnet build -p:SharedCompilationId={pipeName} compiles through this daemon");
                     exitCode = !loaded ? 1 : request?.Command switch
                     {
                         // --all reports every analyzer's warnings, so it waits for the warm-up.
@@ -189,6 +189,7 @@ static class Daemon
             finally
             {
                 command.Dispose();
+                taking?.Wait(TimeSpan.FromSeconds(10));
             }
 
             try { writer.WriteLine($"{DaemonClient.ExitPrefix}{exitCode}"); }

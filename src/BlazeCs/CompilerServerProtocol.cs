@@ -244,6 +244,14 @@ static class ServerMessage
         stream.Flush();
     }
 
+    /// <summary>A whole message as it came, its length included: what a proxy passes on unread.</summary>
+    public static byte[] ReadMessage(Stream stream)
+    {
+        var length = ReadExactly(stream, 4);
+        var body = ReadExactly(stream, checked((int)BitConverter.ToUInt32(length)));
+        return [.. length, .. body];
+    }
+
     public static byte[] ReadExactly(Stream stream, int count)
     {
         var bytes = new byte[count];

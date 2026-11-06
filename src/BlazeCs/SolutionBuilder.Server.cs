@@ -36,14 +36,17 @@ sealed partial class SolutionBuilder
     /// <summary>
     /// Answers a compile request for a unit of this solution: refresh its sources from disk, emit, write the
     /// files csc would write, and return csc's exit code and diagnostics. Anything the daemon can't answer as
-    /// csc would is Rejected, and the task then runs csc itself. Logged to the daemon log.
+    /// csc would is Rejected, and csc compiles it (the SDK's server, which <see cref="CompilerServer"/> passes it
+    /// to). Null for a compile of another solution's project. Logged to the daemon log.
     /// </summary>
-    /// <param name="compilerHash">The commit of the SDK's Roslyn the daemon loaded.</param>
-    public ServerResponse Serve(ServerRequest request, string compilerHash)
+    public ServerResponse? Serve(ServerRequest request)
     {
+        if (request.CurrentDirectory is { Length: > 0 } directory && OutputPath(request.CommandLineArguments, directory) is { } output
+            && !Volatile.Read(ref _units).Any(u => PathComparer.Instance.Equals(u.AssemblyPath, output)) && Volatile.Read(ref _reload) is null)
+            return null;
         var started = Stopwatch.GetTimestamp();
         ServerResponse response;
-        try { response = Answer(request, compilerHash); }
+        try { response = Answer(request); }
         catch (Exception e)
         {
             Console.WriteLine($"{DateTime.Now:O} compiler server: {request.RequestId}: {e}");
@@ -58,12 +61,8 @@ sealed partial class SolutionBuilder
         return response;
     }
 
-    ServerResponse Answer(ServerRequest request, string compilerHash)
+    ServerResponse Answer(ServerRequest request)
     {
-        if (!string.Equals(request.CompilerHash, compilerHash, StringComparison.OrdinalIgnoreCase))
-            return Reject($"compiler hash {request.CompilerHash} is not that of the Roslyn this daemon loaded ({compilerHash})");
-        if (request.IsShutdown)
-            return Reject("this is a blaze-cs daemon; blaze-cs stop stops it");
         if (request.Language != RequestLanguage.CSharpCompile)
             return Reject("blaze-cs compiles C# only");
         if (request.CurrentDirectory is not { Length: > 0 } directory)
