@@ -298,6 +298,31 @@ and the SDK's `CheckForDuplicateItems` runs before it, so that check sees the it
 item again. The fixture's `Lib` does that, and the pass failed with `NETSDK1022`, which the real build doesn't
 raise.
 
+It also runs `BeforeBuild` after that check, as `BuildDependsOn` does, so a target hooked to it (one that adds a
+generated `Compile` item, say) runs in the pass. The pre-build event doesn't run: a project with a non-empty
+`PreBuildEvent`, or a target whose `BeforeTargets` or `AfterTargets` names `PreBuildEvent`, falls back with
+`Lib: it has a pre-build step`.
+
+What the implementation does beyond the tables below, from the review of its first version:
+
+- **The pass gives csc's arguments and nothing else.** So it only takes an edit that changes nothing else
+  (`ProjectFileEdit`). The daemon keeps each unit's project file text from its last build. It compares the
+  edited text with that, without comments and whitespace, and without the compiler properties
+  (`DefineConstants`, `Nullable`, `LangVersion`, `NoWarn` and the like) and compiler items (`Compile`,
+  `AdditionalFiles`, `Using`, without copy metadata) of the project's top-level groups. Anything else that
+  differs falls back, naming it: `Lib: the edit to Lib.csproj changes more than csc's input (<None
+  Update="data.txt">)`. That covers files the build copies, the runtimeconfig and deps.json
+  (`InvariantGlobalization`, `RollForward`), the apphost (`OutputType`), packages, references and every
+  target, a weaving one after `CoreCompile` included. A compiler property that the rest of the file reads (in a
+  condition or another property) falls back too. An import that reads one is the remaining gap.
+- **The restore check compares the projects restore reaches.** `GenerateRestoreGraphFile` also lists a project
+  only a `ReferenceOutputAssembly="false"` reference leads to (the fixture's `Generator`, from `Consumer`). The
+  spec restore writes leaves it out: restore follows each framework's `projectReferences`. Both specs are cut
+  to that closure, then compared as JSON (`RestoreSpec`).
+- **The XML cache is reset after every dotnet build.** That build may rewrite any file the collection parsed
+  (an import that made the edit fall back, restore's `obj/*.nuget.g.props`). Between builds, each pass reloads
+  the edited project files, and each import of a project it evaluated whose write time changed.
+
 The global properties are the real build's plus four:
 
 | Property | Why |
@@ -360,7 +385,7 @@ Each rule names what it catches, how the daemon detects it, and the one line it 
 
 | Rule | Detection | Logged reason (example) |
 |---|---|---|
-| Restore needed | Regenerate NuGet's restore spec in-process: target `GenerateRestoreGraphFile` with `RestoreGraphOutputPath` set to a file under `.blaze-cs/` and `RestoreRecursive=false`. Compare it byte for byte with `obj/<project>.nuget.dgspec.json`, which the last restore wrote. In the spike it was identical for an unchanged project (4 runs) and after a `DefineConstants` edit, and differed after a `PackageReference` was added (`+ "Humanizer.Core": {`). This is NuGet's own no-op check, so it covers central package versions, framework references, project references, sources and target frameworks without a list kept by hand. 222 to 391 ms warm per edited project | `MediaBrowser.Controller: restore inputs changed (its NuGet restore spec differs)` |
+| Restore needed | Regenerate NuGet's restore spec in-process: target `GenerateRestoreGraphFile` with `RestoreGraphOutputPath` set to a file under `.blaze-cs/` and `RestoreRecursive=false`. Compare it with `obj/<project>.nuget.dgspec.json` (the implementation compares the projects restore reaches, as JSON; see above), which the last restore wrote. In the spike it was identical for an unchanged project (4 runs) and after a `DefineConstants` edit, and differed after a `PackageReference` was added (`+ "Humanizer.Core": {`). This is NuGet's own no-op check, so it covers central package versions, framework references, project references, sources and target frameworks without a list kept by hand. 222 to 391 ms warm per edited project | `MediaBrowser.Controller: restore inputs changed (its NuGet restore spec differs)` |
 | Restore ran outside the daemon | The stamp of a reached unit's `obj/project.assets.json`, `.nuget.g.props` or `.nuget.g.targets` changed since the daemon last loaded | `Emby.Naming: its restore output changed` |
 | The pass needs a restore | The pass fails with `NETSDK1004` (no assets file), or with `NETSDK1005` or `NETSDK1047` (no target for the framework or runtime) | `<unit>: NETSDK1005: …` (the error's first line) |
 | A custom target produces inputs | The pass logger sees a task run in a target defined in a file inside the solution directory, restore output excepted. A target there that only orders SDK targets runs no task of its own and is fine: jellyfin's `_ProduceContentAssetsSkippedByClean` (`Directory.Build.targets`, `BeforeTargets="CoreCompile"`) ran in every pass and only depends on `RunProduceContentAssets`. The real build's logger records the same thing for targets before `CoreCompile`, so a unit known to have one falls back before any pass | `Lib: target GenerateVersion (Directory.Build.targets) runs a task before compile` |

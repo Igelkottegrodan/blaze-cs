@@ -33,6 +33,8 @@ sealed partial class SolutionBuilder
     Dictionary<string, Image> _images = new(PathComparer.Instance);
     HashSet<ProjectCompiler> _analyzerUnits = [];
     Dictionary<string, DateTime> _msbuildInputs = new(PathComparer.Instance);
+    /// <summary>The text of each unit's project file when <see cref="_msbuildInputs"/> was taken: what an edit is compared with.</summary>
+    Dictionary<string, string> _projectTexts = new(PathComparer.Instance);
     /// <summary>
     /// Units the last build left failed (null: compile) or blocked (the work they were blocked with): their
     /// outputs are stale until they run again.
@@ -87,6 +89,8 @@ sealed partial class SolutionBuilder
     public bool Load(Action<string> log, bool fresh = false, bool warmUpLater = false)
     {
         var cached = fresh ? [] : UnitsCache.Read();
+        // The build may rewrite any file the in-process MSBuild has parsed.
+        _msbuild?.Reset();
         var record = Path.Combine(_stateDirectory, "build.json");
         var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly {BuildLog.LoggerSwitch(record)}" + (cached.Count == 0 ? " --no-incremental" : "");
         if (RunDotnet(arguments, log, BuildLog.LoggerEnvironment) != 0)
@@ -164,6 +168,8 @@ sealed partial class SolutionBuilder
             pending.UnionWith(info.Units.Select(u => u.AssemblyPath));
         _wholeAnalysisPending = [.. compilers.Where(c => pending.Contains(c.AssemblyPath))];
         _msbuildInputs = MSBuildInputs();
+        _projectTexts = compilers.Select(c => c.Unit.ProjectFile).Distinct(PathComparer.Instance).Where(File.Exists)
+            .ToDictionary(path => path, File.ReadAllText, PathComparer.Instance);
         foreach (var gone in _surfaces.Keys.Concat(_lastDuration.Keys).Except(compilers).ToList())
         {
             _surfaces.TryRemove(gone, out _);
@@ -974,9 +980,10 @@ sealed partial class SolutionBuilder
     string? _msbuildUnavailable;
 
     /// <summary>
-    /// When every changed MSBuild input is the project file of held units, evaluates those units again in this
-    /// process and takes the compiler arguments the design-time pass gives them: a unit whose arguments
-    /// changed is replaced, the others stay as they are. Returns the units replaced, which must compile; or
+    /// When every changed MSBuild input is the project file of held units, and each edit changes only what csc
+    /// gets (<see cref="ProjectFileEdit"/>), evaluates those units again in this process and takes the compiler
+    /// arguments the design-time pass gives them: a unit whose arguments changed is replaced, the others stay
+    /// as they are. Returns the units replaced, which must compile; or
     /// null, with the reason logged, when the edit needs dotnet build.
     /// </summary>
     List<ProjectCompiler>? ReevaluateProjectFiles(Action<string> log, Dictionary<string, DateTime> inputs, List<string> changedInputs)
@@ -997,6 +1004,16 @@ sealed partial class SolutionBuilder
             // As before: "<file> changed, running dotnet build".
             log($"blaze-cs: {Path.GetRelativePath(_solutionDirectory, other)} changed, running dotnet build");
             return null;
+        }
+        // The pass gives csc's arguments and nothing else the build does.
+        var texts = new Dictionary<string, string>(PathComparer.Instance);
+        foreach (var path in edited.Order(StringComparer.Ordinal))
+        {
+            texts[path] = File.ReadAllText(path);
+            if (!_projectTexts.TryGetValue(path, out var before))
+                return FallBack($"{Path.GetFileNameWithoutExtension(path)}: its project file wasn't read at the last build");
+            if (ProjectFileEdit.MoreThanCompilerInput(before, texts[path]) is { } more)
+                return FallBack($"{Path.GetFileNameWithoutExtension(path)}: the edit to {Path.GetFileName(path)} changes more than csc's input ({more})");
         }
         if (_msbuildUnavailable is { } unavailable)
             return FallBack($"in-process MSBuild: {unavailable}");
@@ -1033,6 +1050,7 @@ sealed partial class SolutionBuilder
         var replaced = new Dictionary<ProjectCompiler, ProjectCompiler>();
         foreach (var held in reached)
         {
+            // Its SlowPathReason stays: what runs after CoreCompile comes from targets, which the edit didn't change.
             var unit = held.Unit with { Arguments = evaluated[held.Unit.Key].Arguments };
             if (!PathComparer.Instance.Equals(unit.AssemblyPath, held.Unit.AssemblyPath)
                 || !PathComparer.Instance.Equals(unit.ReferenceAssemblyPath ?? "", held.Unit.ReferenceAssemblyPath ?? ""))
@@ -1065,6 +1083,8 @@ sealed partial class SolutionBuilder
         }
         _runSettings = runSettings;
         _msbuildInputs = inputs;
+        foreach (var (path, text) in texts)
+            _projectTexts[path] = text;
         log($"blaze-cs: evaluated {string.Join(", ", edited.Select(path => Path.GetFileName(path)).Order())} in process in {stopwatch.ElapsedMilliseconds} ms"
             + (replaced.Count == 0 ? "; compiler arguments unchanged" : $"; new compiler arguments for {string.Join(", ", replaced.Values.Select(u => u.Unit.Name).Order())}"));
         return [.. replaced.Values];

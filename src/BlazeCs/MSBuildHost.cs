@@ -13,17 +13,20 @@ namespace BlazeCs;
 /// edited projects again and runs the design-time compile pass, which gives csc's new arguments without
 /// running csc or `dotnet build` (docs/research/msbuild-in-process.md). Every MSBuild type the daemon uses is
 /// in this class. Started on the first project file edit, and kept for the daemon's lifetime: its collection
-/// caches the parsed XML of every import, which makes later evaluations fast.
+/// caches the parsed XML of every import, which makes later evaluations fast. The cache never looks at the disk
+/// again on its own: each pass reloads the files it knows changed, and the daemon resets it after a dotnet
+/// build, which may have rewritten any of them (restore's obj/*.nuget.g.props, say).
 /// </summary>
 sealed class MSBuildHost
 {
     /// <summary>
-    /// The head of CoreBuildDependsOn, up to and including Compile, without the build events: Compile alone
-    /// skips PrepareResources, and with it every /resource: argument. First the check a real build runs before
-    /// BeforeBuild, with the SDK's checks that run before it (CheckForDuplicateItems): run first, they see the
-    /// items as evaluated, not those a target before CoreCompile adds.
+    /// The head of BuildDependsOn, up to and including Compile, without the pre-build event (a project with one
+    /// falls back): Compile alone skips PrepareResources, and with it every /resource: argument, and BeforeBuild,
+    /// with any target hooked to it. First the check a real build runs before BeforeBuild, with the SDK's checks
+    /// that run before it (CheckForDuplicateItems): run first, they see the items as evaluated, not those a
+    /// target before CoreCompile adds.
     /// </summary>
-    static readonly string[] CompileTargets = ["_CheckForInvalidConfigurationAndPlatform", "BuildOnlySettings", "PrepareForBuild", "ResolveReferences", "PrepareResources", "ResolveKeySource", "Compile"];
+    static readonly string[] CompileTargets = ["_CheckForInvalidConfigurationAndPlatform", "BeforeBuild", "BuildOnlySettings", "PrepareForBuild", "ResolveReferences", "PrepareResources", "ResolveKeySource", "Compile"];
 
     /// <summary>Added to the global properties of the unit's real build for the design-time pass.</summary>
     static readonly Dictionary<string, string> DesignTime = new()
@@ -38,7 +41,10 @@ sealed class MSBuildHost
         ["NonExistentFile"] = @"__NonExistentSubDir__\__NonExistentFile__",
     };
 
-    readonly ProjectCollection _collection = new();
+    ProjectCollection _collection = new();
+
+    /// <summary>Every file a pass evaluated, with its imports: a pass reloads those that changed since.</summary>
+    readonly HashSet<string> _evaluated = new(PathComparer.Instance);
     readonly string _restoreSpecDirectory;
 
     MSBuildHost(string stateDirectory)
@@ -58,6 +64,14 @@ sealed class MSBuildHost
     [MethodImpl(MethodImplOptions.NoInlining)]
     static MSBuildHost Create(string stateDirectory) => new(stateDirectory);
 
+    /// <summary>Drops every file the collection parsed: after a dotnet build, any of them may have changed.</summary>
+    public void Reset()
+    {
+        _collection.Dispose();
+        _collection = new();
+        _evaluated.Clear();
+    }
+
     /// <summary>One unit to evaluate again: its project file and the global properties its last real build had.</summary>
     public sealed record Request(string Key, string ProjectFile, IReadOnlyDictionary<string, string> GlobalProperties);
 
@@ -71,18 +85,33 @@ sealed class MSBuildHost
     /// </summary>
     public (Dictionary<string, Evaluated>? Units, string? Fallback) Pass(IReadOnlyList<Request> requests, IEnumerable<string> changedFiles)
     {
-        // The collection caches every file it parsed and never looks at the disk again on its own.
+        // The collection caches every file it parsed and never looks at the disk again on its own. A file it
+        // parsed through a reference is reloaded only if the daemon saw it change; every import of a project
+        // evaluated here, from wherever, also if its write time changed.
+        if (_evaluated.Any(file => !File.Exists(file)))
+            Reset();
         foreach (var file in changedFiles)
             ProjectRootElement.TryOpen(file, _collection)?.Reload(throwIfUnsavedChanges: false);
+        foreach (var file in _evaluated)
+        {
+            if (ProjectRootElement.TryOpen(file, _collection) is { } root
+                && root.LastWriteTimeWhenRead.ToUniversalTime() != File.GetLastWriteTimeUtc(file))
+                root.Reload(throwIfUnsavedChanges: false);
+        }
         // A new context per pass: one caches what it saw of the file system.
         var context = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared);
-        ProjectInstance Evaluate(string projectFile, IDictionary<string, string> globalProperties) =>
-            ProjectInstance.FromFile(projectFile, new ProjectOptions
+        ProjectInstance Evaluate(string projectFile, IDictionary<string, string> globalProperties)
+        {
+            var project = ProjectInstance.FromFile(projectFile, new ProjectOptions
             {
                 GlobalProperties = globalProperties,
                 ProjectCollection = _collection,
                 EvaluationContext = context,
             });
+            _evaluated.Add(project.FullPath);
+            _evaluated.UnionWith(project.ImportPaths);
+            return project;
+        }
 
         var errors = new FirstError();
         // A BuildManager of its own each time: the default one keeps the last build's project instances alive.
@@ -111,8 +140,16 @@ sealed class MSBuildHost
                 foreach (var (property, value) in DesignTime)
                     globalProperties[property] = value;
                 var project = Evaluate(request.ProjectFile, globalProperties);
-                var result = manager.BuildRequest(new BuildRequestData(project, CompileTargets, null, BuildRequestDataFlags.ProvideProjectStateAfterBuild));
                 var name = Path.GetFileNameWithoutExtension(request.ProjectFile);
+                // A real build runs it before ResolveReferences; the pass doesn't run what it may do. The SDK's own
+                // targets hooked to it (_BlockWinMDsOnUnsupportedTFMs) are no pre-build step.
+                var sdk = Path.TrimEndingDirectorySeparator(project.GetPropertyValue("MSBuildExtensionsPath")) + Path.DirectorySeparatorChar;
+                if (project.GetPropertyValue("PreBuildEvent").Trim().Length > 0
+                    || project.Targets.Values.Any(t => !t.FullPath.StartsWith(sdk, PathComparer.Comparison)
+                        && (t.BeforeTargets.Contains("PreBuildEvent", StringComparison.OrdinalIgnoreCase)
+                            || t.AfterTargets.Contains("PreBuildEvent", StringComparison.OrdinalIgnoreCase))))
+                    return (null, $"{name}: it has a pre-build step");
+                var result = manager.BuildRequest(new BuildRequestData(project, CompileTargets, null, BuildRequestDataFlags.ProvideProjectStateAfterBuild));
                 if (result.OverallResult != BuildResultCode.Success)
                     return (null, $"{name}: the design-time build failed: {errors.Text ?? result.Exception?.Message ?? "no error logged"}");
                 var state = result.ProjectStateAfterBuild ?? project;
@@ -132,9 +169,9 @@ sealed class MSBuildHost
     }
 
     /// <summary>
-    /// NuGet's own no-op check: the restore spec regenerated from the project now, compared byte for byte with
-    /// the one the last restore wrote to obj/. They differ when a package, a project reference, a target
-    /// framework, a source or anything else restore reads has changed.
+    /// NuGet's own no-op check: the restore spec regenerated from the project now, compared with the one the
+    /// last restore wrote to obj/ (<see cref="RestoreSpec.Same"/>). They differ when a package, a project
+    /// reference, a target framework, a source or anything else restore reads has changed.
     /// </summary>
     string? RestoreSpecChanged(BuildManager manager, Request request, Func<string, IDictionary<string, string>, ProjectInstance> evaluate, FirstError errors)
     {
@@ -153,7 +190,7 @@ sealed class MSBuildHost
         var result = manager.BuildRequest(new BuildRequestData(evaluate(request.ProjectFile, globalProperties), ["GenerateRestoreGraphFile"]));
         if (result.OverallResult != BuildResultCode.Success || !File.Exists(regenerated))
             return $"regenerating its NuGet restore spec failed: {errors.Text ?? result.Exception?.Message ?? "no error logged"}";
-        return File.ReadAllBytes(regenerated).AsSpan().SequenceEqual(File.ReadAllBytes(restored))
+        return RestoreSpec.Same(File.ReadAllText(restored), File.ReadAllText(regenerated))
             ? null
             : "restore inputs changed (its NuGet restore spec differs)";
     }

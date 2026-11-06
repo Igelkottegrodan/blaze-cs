@@ -140,7 +140,33 @@ Case[] cases =
     // A package needs a restore, which only dotnet build runs. (xunit.abstractions: XunitV2Tests restores it already.)
     new("project file package reference",
         () => Replace("Lib/Lib.csproj", "</Project>", "  <ItemGroup>\n    <PackageReference Include=\"xunit.abstractions\" Version=\"2.0.3\" />\n  </ItemGroup>\n</Project>"),
-        [], "build", "Lib: restore inputs changed (its NuGet restore spec differs); running dotnet build"),
+        [], "build", "Lib: the edit to Lib.csproj changes more than csc's input (<PackageReference Include=\"xunit.abstractions\">); running dotnet build"),
+    // An import goes through dotnet build. The in-process MSBuild has parsed Directory.Build.props before, and
+    // must not evaluate the next project file edit with the copy it cached: Lib's arguments would lose the define.
+    new("Directory.Build.props define",
+        () => Replace("Directory.Build.props", "<ImplicitUsings>enable</ImplicitUsings>",
+            "<ImplicitUsings>enable</ImplicitUsings>\n    <DefineConstants>$(DefineConstants);FIXTURE_DBP</DefineConstants>"),
+        [], "build", "Directory.Build.props changed, running dotnet build"),
+    new("project file edit after a fallback", () => Replace("Lib/Lib.csproj", "<!-- edited -->", "<!-- edited again -->"),
+        [], "build", Logged: "evaluated Lib.csproj in process in"),
+    // Consumer has a ReferenceOutputAssembly="false" reference (Generator), which restore's spec leaves out.
+    new("Consumer project file edit", () => Replace("Consumer/Consumer.csproj", "</Project>", "  <!-- edited -->\n</Project>"),
+        [], "build", Logged: "evaluated Consumer.csproj in process in"),
+    // The pass gives csc's arguments, not the files the build copies.
+    new("project file copy item",
+        () =>
+        {
+            File.WriteAllText(Path.Combine(work, "Lib/data.txt"), "copied next to Lib and its dependents\n");
+            Replace("Lib/Lib.csproj", "</Project>", "  <ItemGroup>\n    <None Update=\"data.txt\" CopyToOutputDirectory=\"PreserveNewest\" />\n  </ItemGroup>\n</Project>");
+        },
+        [], "build", "Lib: the edit to Lib.csproj changes more than csc's input (<None Update=\"data.txt\">); running dotnet build"),
+    new("pre-build step added",
+        () => Replace("Consumer/Consumer.csproj", "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>",
+            "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>\n    <PreBuildEvent>echo pre-build</PreBuildEvent>"),
+        [], "build", "Consumer: the edit to Consumer.csproj changes more than csc's input (<PreBuildEvent>); running dotnet build"),
+    // The pass doesn't run a pre-build step, which a real build runs even when nothing else changed.
+    new("project file edit with a pre-build step", () => Replace("Consumer/Consumer.csproj", "<!-- edited -->", "<!-- edited again -->"),
+        [], "build", "Consumer: it has a pre-build step; running dotnet build"),
 ];
 
 if (Directory.Exists(work))
