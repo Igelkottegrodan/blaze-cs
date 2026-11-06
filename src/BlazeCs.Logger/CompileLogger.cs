@@ -6,8 +6,9 @@ namespace BlazeCs.Logger;
 
 /// <summary>
 /// Records what the daemon needs from a `dotnet build` (a BuildRecord) into the file given as its
-/// parameter: `-logger:BlazeCs.Logger.CompileLogger,blaze-cs-logger.dll;build.json`. MSBuild forwards
-/// every node's events to it and calls it on one thread at a time.
+/// parameter: `-logger:BlazeCs.Logger.CompileLogger,blaze-cs-logger.dll;build.json`, with
+/// MSBUILDLOGTASKINPUTS=1 in the build's environment. MSBuild forwards every node's events to it and
+/// calls it on one thread at a time.
 /// </summary>
 public sealed partial class CompileLogger : ILogger
 {
@@ -26,9 +27,10 @@ public sealed partial class CompileLogger : ILogger
     {
         if (string.IsNullOrEmpty(Parameters))
             throw new LoggerException("blaze-cs-logger needs the file to write: -logger:<type>,<assembly>;<file>");
-        // Task inputs carry Csc's output path, CopyRefAssembly's paths, and what tasks after CoreCompile are handed.
-        if (eventSource is IEventSource3 withInputs)
-            withInputs.IncludeTaskInputs();
+        // Task inputs carry Csc's output path, CopyRefAssembly's paths, and what tasks after CoreCompile
+        // are handed. IEventSource3.IncludeTaskInputs doesn't turn them on for the build's nodes; this does.
+        if (Environment.GetEnvironmentVariable("MSBUILDLOGTASKINPUTS") != "1")
+            throw new LoggerException("blaze-cs-logger needs MSBUILDLOGTASKINPUTS=1");
 
         eventSource.ProjectStarted += (_, e) => _projects[ProjectKey(e.BuildEventContext)] = new Project(e);
         eventSource.ProjectFinished += (_, e) => ProjectFinished(e.BuildEventContext);

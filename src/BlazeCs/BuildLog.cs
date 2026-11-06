@@ -38,6 +38,14 @@ static class BuildLog
     public static string LoggerSwitch(string path) =>
         $"\"-logger:BlazeCs.Logger.CompileLogger,{Path.Combine(AppContext.BaseDirectory, "blaze-cs-logger.dll")};{path}\"";
 
+    /// <summary>
+    /// What that build's environment needs: MSBuild forwards task parameters (Csc's output path,
+    /// CopyRefAssembly's paths when it copies nothing) only with task input logging on, and a logger
+    /// can't turn that on for itself; only a binlog or this variable does.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> LoggerEnvironment { get; } =
+        new Dictionary<string, string> { ["MSBUILDLOGTASKINPUTS"] = "1" };
+
     public static BuildLogInfo Read(string path, string sdkDirectory)
     {
         var record = JsonSerializer.Deserialize<BuildRecord>(File.ReadAllText(path))

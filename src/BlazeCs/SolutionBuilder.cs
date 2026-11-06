@@ -62,7 +62,7 @@ sealed class SolutionBuilder
         var cached = fresh ? [] : UnitsCache.Read();
         var record = Path.Combine(_stateDirectory, "build.json");
         var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly {BuildLog.LoggerSwitch(record)}" + (cached.Count == 0 ? " --no-incremental" : "");
-        if (RunDotnet(arguments, log) != 0)
+        if (RunDotnet(arguments, log, BuildLog.LoggerEnvironment) != 0)
             return false;
         _retry = [];
 
@@ -713,7 +713,7 @@ sealed class SolutionBuilder
     }
 
     /// <summary>Runs the real `dotnet` with its output streamed to the client.</summary>
-    public int RunDotnet(string arguments, Action<string> log)
+    public int RunDotnet(string arguments, Action<string> log, IReadOnlyDictionary<string, string>? environment = null)
     {
         var start = new ProcessStartInfo("dotnet", arguments)
         {
@@ -722,6 +722,8 @@ sealed class SolutionBuilder
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        foreach (var (name, value) in environment ?? new Dictionary<string, string>())
+            start.Environment[name] = value;
         using var process = new Process { StartInfo = start };
         process.OutputDataReceived += (_, e) => { if (e.Data is not null) log(e.Data); };
         process.ErrorDataReceived += (_, e) => { if (e.Data is not null) log(e.Data); };
