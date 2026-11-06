@@ -124,6 +124,7 @@ var passed = false;
 try
 {
     Run(blaze, "build"); // starts the daemon: a real dotnet build, then a warm-up compile
+    var prestarted = PrestartedHosts();
     foreach (var (name, edit, expected, command, fallback, allKept, ran) in cases)
     {
         edit();
@@ -133,6 +134,8 @@ try
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
         if (command.StartsWith("test", StringComparison.Ordinal))
             RanTests(name, output, ran ?? expected);
+        if (name == "first test run")
+            TookEveryHost(prestarted);
         Verify(name, rebuilt, fallback);
     }
     HostCannotLoad();
@@ -141,6 +144,7 @@ try
     AllTestsSkipped();
     DaemonLifecycle();
     ParentFails();
+    HostsStopWithTheDaemon();
     passed = true;
 }
 catch (CheckFailed failure)
@@ -239,6 +243,74 @@ static void CopyDirectory(string from, string to)
         File.Copy(file, Path.Combine(to, Path.GetFileName(file)));
     foreach (var directory in Directory.EnumerateDirectories(from))
         CopyDirectory(directory, Path.Combine(to, Path.GetFileName(directory)));
+}
+
+// Hosts wait idle before any test command, one per test project that runs at once on each runtime: the five
+// net10.0 projects make the runner's four, and Tests11 has one more under SDK 11. Returns their processes.
+List<int> PrestartedHosts()
+{
+    var expected = hasNet11 ? 5 : 4;
+    var deadline = Stopwatch.StartNew();
+    List<(int Pid, string Command)> hosts;
+    while ((hosts = TestHostProcesses()).Count != expected && deadline.Elapsed < TimeSpan.FromSeconds(30))
+        Thread.Sleep(100);
+    // One runtimeconfig.json per runtime, named by the daemon's pid and the runtime's number.
+    var runtimes = hosts.Select(h => Regex.Match(h.Command, @"blaze-cs-testhost-\d+-\d+\.runtimeconfig\.json").Value).Distinct().Count();
+    if (hosts.Count != expected || runtimes != (hasNet11 ? 2 : 1))
+        Fail($"expected {expected} idle test hosts on {(hasNet11 ? 2 : 1)} runtime(s) before any test command, found {hosts.Count} on {runtimes}:\n{string.Join("\n", hosts.Select(h => h.Command))}");
+    Console.WriteLine($"ok  {hosts.Count} idle test hosts on {runtimes} runtime(s), started before any test command");
+    return [.. hosts.Select(h => h.Pid)];
+}
+
+// A run of every test project takes a waiting host for each runtime's projects, and the pool is full again after.
+void TookEveryHost(List<int> prestarted)
+{
+    var taken = prestarted.Where(pid => !Running(pid)).Count();
+    if (taken != prestarted.Count)
+        Fail($"expected the first test run to take all {prestarted.Count} pre-started hosts, {taken} are gone");
+    PrestartedHosts();
+    Console.WriteLine($"ok  the first test run took the {taken} pre-started hosts, and the pool refilled");
+}
+
+// Stopping the daemon takes its test hosts with it, and so does killing it: a host exits when the daemon's
+// end of its stdin closes.
+void HostsStopWithTheDaemon()
+{
+    PrestartedHosts();
+    Run(blaze, "stop");
+    NoHostsLeft("blaze-cs stop");
+    Run(blaze, "build"); // a new daemon, with new hosts
+    PrestartedHosts();
+    var daemon = Process.GetProcessById(Daemons().Last().Pid);
+    daemon.Kill();
+    daemon.WaitForExit();
+    NoHostsLeft("the daemon being killed");
+}
+
+void NoHostsLeft(string cause)
+{
+    var deadline = Stopwatch.StartNew();
+    List<(int Pid, string Command)> hosts;
+    while ((hosts = TestHostProcesses()).Count > 0 && deadline.Elapsed < TimeSpan.FromSeconds(30))
+        Thread.Sleep(100);
+    if (hosts.Count > 0)
+        Fail($"expected no test host processes after {cause}, found:\n{string.Join("\n", hosts.Select(h => h.Command))}");
+    Console.WriteLine($"ok  no test hosts left after {cause}");
+}
+
+// This fixture copy's test host processes: blaze-cs-testhost.dll from this repo's build of blaze-cs.
+List<(int Pid, string Command)> TestHostProcesses() =>
+    [.. Processes().Where(p => p.Command.Contains("blaze-cs-testhost.dll") && p.Command.Contains(root))];
+
+IEnumerable<(int Pid, string Command)> Processes()
+{
+    var (output, _) = OperatingSystem.IsWindows()
+        ? RunWithExit("powershell", "-NoProfile -Command \"Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + ' ' + $_.CommandLine }\"", check: false)
+        : RunWithExit("ps", "-eo pid=,args=", check: false);
+    return output.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => line.Split(' ', 2))
+        .Where(parts => parts.Length == 2 && int.TryParse(parts[0], out _))
+        .Select(parts => (int.Parse(parts[0]), parts[1]));
 }
 
 // A test assembly the warm host can't load (here, a missing reference) fails the run within seconds, naming

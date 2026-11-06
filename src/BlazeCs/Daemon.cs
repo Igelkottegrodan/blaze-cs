@@ -89,13 +89,20 @@ static class Daemon
 
                 // Loading runs the first `dotnet build`, so its output belongs to the first command.
                 if (!loaded)
+                {
                     loaded = builder.Load(Log);
+                    if (loaded)
+                        tests.Prestart();
+                }
                 exitCode = !loaded ? 1 : request?.Command switch
                 {
                     "build" => builder.Build(Log) ? 0 : 1,
                     "test" => builder.Build(Log) ? tests.Run(request is { All: true }, Log) : 1,
                     _ => 2,
                 };
+                // A build may have reloaded the solution, and a run took hosts.
+                if (loaded)
+                    tests.Prestart();
             }
             catch (Exception e)
             {
