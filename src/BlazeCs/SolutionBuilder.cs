@@ -30,6 +30,11 @@ sealed class SolutionBuilder
     Dictionary<string, Image> _images = new(PathComparer.Instance);
     HashSet<ProjectCompiler> _analyzerUnits = [];
     Dictionary<string, DateTime> _msbuildInputs = new(PathComparer.Instance);
+    /// <summary>
+    /// Units the last build left failed (null: compile) or blocked (the work they were blocked with): their
+    /// outputs are stale until they run again.
+    /// </summary>
+    Dictionary<ProjectCompiler, ApiChange?> _retry = [];
 
     public SolutionBuilder(string solutionPath, string sdkDirectory)
     {
@@ -59,6 +64,7 @@ sealed class SolutionBuilder
         var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly -bl:\"{binlog}\"" + (cached.Count == 0 ? " --no-incremental" : "");
         if (RunDotnet(arguments, log) != 0)
             return false;
+        _retry = [];
 
         var stopwatch = Stopwatch.StartNew();
         var info = BuildLog.Read(binlog, _sdkDirectory);
@@ -197,12 +203,18 @@ sealed class SolutionBuilder
             return Load(log);
         }
 
+        // What the last build left failed or blocked runs again with the work it had, so a build fails the
+        // same way until the cause is fixed, and writes the stale outputs once it is.
+        var work = new Dictionary<ProjectCompiler, ApiChange?>(_retry);
+        foreach (var unit in changed)
+            work[unit] = null;
+
         // Dataflow: every unit compiles as soon as its inputs are known, against the images its references
         // have at that moment, and runs once more if a reference's API changes mid-compile. A dependent of
         // an API change first checks whether it can be affected at all (ApiSurface) and skips if not.
         var run = new BuildRun(this);
-        foreach (var unit in changed.OrderByDescending(LastDuration))
-            run.Schedule(unit);
+        foreach (var (unit, change) in work.OrderByDescending(w => LastDuration(w.Key)))
+            run.Schedule(unit, change);
         run.Wait();
 
         var output = run.Diagnostics.SelectMany(r => r.Value
@@ -211,9 +223,14 @@ sealed class SolutionBuilder
         foreach (var line in output.Order())
             log(line);
         var rebuilt = run.Diagnostics.Keys.ToList();
-        if (!run.Failed.IsEmpty)
+        _retry = new(run.Blocked);
+        foreach (var unit in run.Failed.Keys)
+            _retry[unit] = null;
+        if (_retry.Count > 0)
         {
-            log($"blaze-cs: build failed in {stopwatch.ElapsedMilliseconds} ms ({run.Failed.Count} project(s) failed or blocked)");
+            if (run.Blocked.Count > 0)
+                log($"blaze-cs: blocked by a failed reference: {string.Join(", ", run.Blocked.Keys.Select(u => u.Unit.Name).Order())}");
+            log($"blaze-cs: build failed in {stopwatch.ElapsedMilliseconds} ms ({run.Failed.Count} project(s) failed, {run.Blocked.Count} blocked)");
             return false;
         }
         var times = run.Times;
@@ -248,7 +265,10 @@ sealed class SolutionBuilder
 
         public ConcurrentDictionary<ProjectCompiler, ImmutableArray<Diagnostic>> Diagnostics { get; } = new();
         public ConcurrentDictionary<ProjectCompiler, (TimeSpan Compile, TimeSpan Generators, TimeSpan Write)> Times { get; } = new();
+        /// <summary>Units whose compile or write failed; their diagnostics say why.</summary>
         public ConcurrentDictionary<ProjectCompiler, bool> Failed { get; } = new();
+        /// <summary>Units held back because a reference failed or is blocked, with their work, after the build.</summary>
+        public IReadOnlyDictionary<ProjectCompiler, ApiChange?> Blocked => _blocked;
         /// <summary>Dependents of an API change that were checked and compile to the same bytes.</summary>
         public ConcurrentDictionary<ProjectCompiler, bool> Unaffected { get; } = new();
         public int Compiles => _compiles;
@@ -341,10 +361,16 @@ sealed class SolutionBuilder
 
         void CompileOnce(ProjectCompiler unit, ApiChange? change)
         {
-            if (builder._dependencies[unit].Any(Failed.ContainsKey))
+            lock (_blocked)
             {
-                Failed[unit] = true;
-                return;
+                if (Blocks(unit))
+                {
+                    Block(unit, change);
+                    return;
+                }
+                // A unit whose last compile failed has no output to keep: whatever changed may fix it.
+                if (Failed.ContainsKey(unit))
+                    change = null;
             }
 
             var started = Stopwatch.GetTimestamp();
@@ -377,13 +403,21 @@ sealed class SolutionBuilder
             // it publishes nothing until they are, and if they fail it is blocked like a failed compile.
             foreach (var dependency in builder._dependencies[unit])
                 _written.GetValueOrDefault(dependency)?.Wait();
-            if (builder._dependencies[unit].Any(Failed.ContainsKey))
+            List<(ProjectCompiler Unit, ApiChange? Change)> unblocked;
+            lock (_blocked)
             {
-                Failed[unit] = true;
-                return;
+                if (Blocks(unit))
+                {
+                    Block(unit, change);
+                    return;
+                }
+                Diagnostics[unit] = diagnostics;
+                Failed.TryRemove(unit, out _);
+                // The dependents this unit held back run again, with the work they were blocked with.
+                unblocked = [.. builder._dependents[unit].Where(_blocked.ContainsKey).Select(d => (d, _blocked[d]))];
+                foreach (var (dependent, _) in unblocked)
+                    _blocked.Remove(dependent);
             }
-            Diagnostics[unit] = diagnostics;
-            Failed.TryRemove(unit, out _);
 
             // Dependents start on the new image and API change while this unit's files are written.
             // Pending before the image is published, so no dependent that sees the image misses the wait.
@@ -392,10 +426,17 @@ sealed class SolutionBuilder
             _written[unit] = written.Task;
             try
             {
-                var imageChanged = builder.PublishImage(unit, emitted);
-                if (imageChanged && surface is not null)
-                    ScheduleDependents(unit, builder.SurfaceChange(unit, surface.Result));
-                builder.Write(unit, emitted, imageChanged);
+                try
+                {
+                    if (builder.PublishImage(unit, emitted) && surface is not null)
+                        ScheduleDependents(unit, builder.SurfaceChange(unit, surface.Result));
+                }
+                finally
+                {
+                    foreach (var (dependent, blockedChange) in unblocked)
+                        Schedule(dependent, blockedChange);
+                }
+                builder.Write(unit, emitted);
             }
             catch
             {
@@ -411,6 +452,25 @@ sealed class SolutionBuilder
 
         /// <summary>Each unit's latest output writes, done once its files are on disk or have failed.</summary>
         readonly ConcurrentDictionary<ProjectCompiler, Task> _written = new();
+
+        /// <summary>
+        /// Units held back by a failed or blocked reference, with the work they had (null: compile). Changed
+        /// only under its own lock, like the moves out of <see cref="Failed"/>, so a unit that recovers sees
+        /// every dependent it blocked and runs it again.
+        /// </summary>
+        readonly Dictionary<ProjectCompiler, ApiChange?> _blocked = [];
+
+        bool Blocks(ProjectCompiler unit) => builder._dependencies[unit].Any(d => Failed.ContainsKey(d) || _blocked.ContainsKey(d));
+
+        void Block(ProjectCompiler unit, ApiChange? change)
+        {
+            if (_blocked.TryGetValue(unit, out var saved))
+                change = saved is null || change is null ? null : saved.Union(change);
+            _blocked[unit] = change;
+            Failed.TryRemove(unit, out _);
+            // Errors from a compile against a reference that has since failed say nothing about this unit.
+            Diagnostics.TryRemove(unit, out _);
+        }
 
         void ScheduleDependents(ProjectCompiler unit, ApiChange change)
         {
@@ -449,16 +509,16 @@ sealed class SolutionBuilder
         unit.ReferenceAssemblyPath is null ? output.Assembly : output.ReferenceAssembly!;
 
     /// <summary>Writes a unit's outputs where csc and MSBuild's copies would.</summary>
-    void Write(ProjectCompiler unit, EmitOutput output, bool imageChanged)
+    void Write(ProjectCompiler unit, EmitOutput output)
     {
         Write(unit.AssemblyPath, output.Assembly);
         if (unit.PdbPath is { } pdb && output.Pdb is { } pdbBytes)
             Write(pdb, pdbBytes);
         if (unit.DocumentationPath is { } documentation && output.Documentation is { } documentationBytes)
             Write(Path.GetFullPath(documentation, unit.Unit.ProjectDirectory), documentationBytes);
-        // Like MSBuild's CopyRefAssembly: an unchanged reference assembly is left untouched, so nothing
-        // that compiles against it looks out of date.
-        if (imageChanged && unit.ReferenceAssemblyPath is { } reference)
+        // Like MSBuild's CopyRefAssembly: an unchanged reference assembly is left untouched (Write skips a
+        // file that holds its bytes), so nothing that compiles against it looks out of date.
+        if (unit.ReferenceAssemblyPath is { } reference)
             Write(reference, ImageBytes(unit, output));
     }
 
@@ -467,13 +527,17 @@ sealed class SolutionBuilder
     {
         if (Holds(path, bytes))
             return;
-        Parallel.ForEach(Closure(path), target =>
+        void Replace(string target)
         {
             // Replace rather than overwrite: a running test host may have the old file mapped.
             var temporary = target + ".blaze-cs.tmp";
             File.WriteAllBytes(temporary, bytes);
             File.Move(temporary, target, overwrite: true);
-        });
+        }
+        // The path itself last: while it holds the bytes, so does every copy, and a write that failed
+        // partway is done again in full.
+        Parallel.ForEach(Closure(path).Skip(1), Replace);
+        Replace(path);
         var info = new FileInfo(path);
         _published[path] = new Published(bytes, info.Length, info.LastWriteTimeUtc);
     }

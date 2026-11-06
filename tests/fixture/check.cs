@@ -61,6 +61,23 @@ Case[] cases =
         () => Replace("Lib/Greeter.cs", "    public static int Twice",
             "    public static string Wave(string name) => \"Hi, \" + name;\n\n    public static int Twice"),
         [.. consumer, .. lib], "build"),
+    new("constant used by App",
+        () =>
+        {
+            Replace("Lib/Greeter.cs", "    public static int Twice", "    public const int Answer = 1;\n\n    public static int Twice");
+            File.AppendAllText(Path.Combine(work, "App/Program.cs"), "Console.WriteLine(Lib.Greeter.Answer);\n");
+        },
+        ["App", .. lib], "build"),
+    // One edit adds a member to Lib and uses it in Consumer, whose API doesn't change. Consumer may compile
+    // before Lib's new image is out, fail, and block App (which reads Lib's changed constant through it);
+    // once Consumer compiles against the new image, App must still run.
+    new("new member used by Consumer in the same edit",
+        () =>
+        {
+            Replace("Lib/Greeter.cs", "Answer = 1;", "Answer = 2;\n\n    public const string Probe = \"p\";");
+            Replace("Consumer/Welcome.cs", "=> Lib.Greeter.Greet(who);", "=> Lib.Greeter.Greet(who) + Lib.Greeter.Probe;");
+        },
+        ["App", .. consumer, .. lib], "build"),
     // A test run must also run exactly the test projects in Ran (by default, the rebuilt ones), list the others as
     // unchanged since their last run, and show every test passing (RanTests). Each test project runs the first time.
     new("first test run", () => { }, [], "test", Ran: allTests),
@@ -304,8 +321,9 @@ void RunSettingsTheHostDoesNotApply()
 }
 
 // An API change in Lib whose compile, or whose writes, fail: the build fails naming the cause, and Consumer,
-// though it may compile against Lib's new image while Lib's files are written, writes nothing. Once the
-// cause is gone, the next build brings every output back to what dotnet build makes.
+// though it may compile against Lib's new image while Lib's files are written, writes nothing. Until the
+// cause is gone, every build fails again; once it is, the next build, edit or not, brings every output back
+// to what dotnet build makes.
 void ParentFails()
 {
     const string greet = "Greet(string person) => \"Hello there, \" + person";
@@ -324,6 +342,10 @@ void ParentFails()
     var (output, exitCode) = RunWithExit(blaze, "build", check: false);
     if (exitCode == 0 || !output.Contains("error CS0103") || !output.Contains("blaze-cs: build failed"))
         Fail($"failing compile in Lib: expected the build to fail with CS0103, got exit {exitCode}:\n{output}");
+    // Like dotnet build, the next build fails again until the error is fixed.
+    (output, exitCode) = RunWithExit(blaze, "build", check: false);
+    if (exitCode == 0 || !output.Contains("error CS0103") || !output.Contains("blaze-cs: build failed"))
+        Fail($"failing compile in Lib, built again: expected the build to fail with CS0103 again, got exit {exitCode}:\n{output}");
     Unchanged("failing compile in Lib", consumer10, "net10.0");
     Unchanged("failing compile in Lib", consumer8, "net8.0");
     Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + person", greet);
@@ -345,9 +367,16 @@ void ParentFails()
     {
         obstacle.Delete();
     }
-    if (exitCode == 0 || !output.Contains("Lib.pdb.blaze-cs.tmp") || !output.Contains("blaze-cs: build failed"))
-        Fail($"failing write in Lib: expected the build to fail naming Lib.pdb.blaze-cs.tmp, got exit {exitCode}:\n{output}");
+    if (exitCode == 0 || !output.Contains("Lib.pdb.blaze-cs.tmp") || !output.Contains("blaze-cs: build failed")
+        || !Regex.IsMatch(output, @"^blaze-cs: blocked by a failed reference: .*Consumer \(net10\.0\)", RegexOptions.Multiline))
+        Fail($"failing write in Lib: expected the build to fail naming Lib.pdb.blaze-cs.tmp and blocked Consumer (net10.0), got exit {exitCode}:\n{output}");
     Unchanged("failing write in Lib", consumer10, "net10.0");
+    // With the obstacle gone, the next build writes Lib again and compiles the dependent it blocked.
+    string[] retried = ["Consumer (net10.0)", "Lib (net10.0)"];
+    rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(retried))
+        Fail($"failing write in Lib, built again: expected blaze-cs to rebuild {string.Join(", ", retried)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+    Verify("failing write in Lib, built again", rebuilt, null);
     Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + name", greet);
     string[] both = [.. consumer, .. lib];
     rebuilt = Rebuilt(Run(blaze, "build"));
