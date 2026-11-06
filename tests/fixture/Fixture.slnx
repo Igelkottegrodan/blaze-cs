@@ -4,6 +4,7 @@
   <Project Path="App/App.csproj" />
   <Project Path="Generator/Generator.csproj" />
   <Project Path="Tests/Tests.csproj" />
+  <Project Path="XunitV2Tests/XunitV2Tests.csproj" />
   <Project Path="NUnitTests/NUnitTests.csproj" />
   <Project Path="MSTestTests/MSTestTests.csproj" />
   <Project Path="Components/Components.csproj" />

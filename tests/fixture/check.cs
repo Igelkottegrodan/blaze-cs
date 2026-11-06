@@ -59,6 +59,8 @@ Case[] cases =
         [.. consumer, .. lib], "build"),
     // A test run must also show each rebuilt test project's tests passing (RanTests).
     new("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
+    new("xUnit v2 test edit", () => Replace("XunitV2Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["XunitV2Tests"], "test"),
+    // NUnitTests and MSTestTests have a .runsettings the host applies: a test checks its variable and parameter.
     new("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
     new("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
     .. (hasNet11 ? new Case[] { new Case("net11.0 test edit", () => Replace("Tests11/RuntimeTests.cs", "Edit = 0", "Edit = 1"), ["Tests11"], "test") } : []),
@@ -114,6 +116,7 @@ try
         Verify(name, rebuilt, fallback);
     }
     HostCannotLoad();
+    RunSettingsTheHostDoesNotApply();
     DaemonLifecycle();
     passed = true;
 }
@@ -242,6 +245,19 @@ void HostCannotLoad()
     Console.WriteLine($"ok  host that can't load an assembly: failed in {failedIn.TotalSeconds:F1} s; the next run passed");
 }
 
+// A .runsettings with anything beyond environment variables and test parameters sends its project to dotnet
+// test, which applies it; the tests still see the variable and parameter there.
+void RunSettingsTheHostDoesNotApply()
+{
+    Replace("NUnitTests/test.runsettings", "  <RunConfiguration>\n", "  <RunConfiguration>\n    <TreatNoTestsAsError>true</TreatNoTestsAsError>\n");
+    Replace("NUnitTests/WelcomeTests.cs", "\"tester\"", "\"settings\"");
+    var output = Run(blaze, "test");
+    if (!output.Contains("blaze-cs: NUnitTests has a .runsettings, which the test host doesn't apply; running dotnet test")
+        || !Regex.IsMatch(output, $@"^\s*Passed!\s+- Failed:\s+0, Passed:\s+{TestCount("NUnitTests")}, .* - NUnitTests\.dll", RegexOptions.Multiline))
+        Fail($"runsettings the host doesn't apply: expected NUnitTests to pass under dotnet test:\n{output}");
+    Console.WriteLine("ok  runsettings the host doesn't apply: dotnet test ran the project");
+}
+
 void Replace(string path, string old, string replacement)
 {
     var file = Path.Combine(work, path);
@@ -294,8 +310,8 @@ void RanTests(string name, string output, string[] expected)
         Fail($"{name}: {wrong.Project}: expected {TestCount(wrong.Project)} tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
 }
 
-// Each test project has its two tests and RunsOnTargetRuntime, except these.
-static int TestCount(string project) => project switch { "ComponentTests" => 2, "Tests11" => 1, _ => 3 };
+// Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings.
+static int TestCount(string project) => project switch { "ComponentTests" => 2, "Tests11" => 1, "NUnitTests" or "MSTestTests" => 4, _ => 3 };
 
 // Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources. After a fallback, MSBuild
 // built everything, so every output must be identical.
