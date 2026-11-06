@@ -292,7 +292,8 @@ void ProjectRemovedAndRestored()
     output = Run(blaze, "build");
     if (!Rebuilt(output).SetEquals([]) || Directory.Exists(Path.Combine(work, removed, "obj")))
         Fail($"edit in the removed project: expected blaze-cs to ignore it and write no {removed}/obj:\n{output}");
-    RanTests("test after a project was removed", Run(blaze, "test"), tests);
+    // The others' inputs didn't change, so none runs again (#35), and the removed one isn't listed at all.
+    RanTests("test after a project was removed", Run(blaze, "test"), [], among: tests);
 
     File.WriteAllText(solution, original);
     output = Run(blaze, "build");
@@ -499,14 +500,15 @@ static Dictionary<string, Summary> Summaries(string output) =>
 // The test projects a run reports: exactly the expected ones, once each, with all their tests passed and
 // counted as dotnet test counts them (explicit tests that weren't asked for aren't), and none through
 // dotnet test, since the warm host must run them on the runtime each one targets. Every other test
-// project is listed as unchanged since its last run.
-void RanTests(string name, string output, string[] expected)
+// project in the solution (`among`, by default all) is listed as unchanged since its last run.
+void RanTests(string name, string output, string[] expected, string[]? among = null)
 {
+    among ??= allTests;
     var unchanged = Regex.Match(output, @"^blaze-cs: unchanged since last run: (.+)$", RegexOptions.Multiline) is { Success: true } line
         ? line.Groups[1].Value.TrimEnd('\r').Split(", ").Select(project => project.Split(" (")[0]).ToList()
         : [];
-    if (!unchanged.Order().SequenceEqual(allTests.Except(expected).Order()))
-        Fail($"{name}: expected {string.Join(", ", allTests.Except(expected).Order())} listed as unchanged since last run, got {string.Join(", ", unchanged.Order())}:\n{output}");
+    if (!unchanged.Order().SequenceEqual(among.Except(expected).Order()))
+        Fail($"{name}: expected {string.Join(", ", among.Except(expected).Order())} listed as unchanged since last run, got {string.Join(", ", unchanged.Order())}:\n{output}");
     var summaries = Summaries(output);
     if (!summaries.Keys.Order().SequenceEqual(expected.Order()))
         Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Keys.Order())}:\n{output}");
