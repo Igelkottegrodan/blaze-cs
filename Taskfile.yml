@@ -27,6 +27,11 @@ tasks:
     cmds:
       - scripts/check-windows.sh
 
+  check:sdk11:
+    desc: Run the fixture check on SDK 11 with runtime 10 available, in a dotnet root assembled from devbox's SDKs
+    cmds:
+      - scripts/check-sdk11.sh
+
   bench:
     desc: Time each edit kind on bench/jellyfin (task bench -- [runs])
     deps: [build]
