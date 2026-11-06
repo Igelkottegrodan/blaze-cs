@@ -17,7 +17,7 @@
   <a href="#good-to-know">Good to know</a>
 </p>
 
-<p align="center"><b>Very experimental.</b> Tried on one real solution (<a href="https://github.com/jellyfin/jellyfin">jellyfin</a>), on Linux.<br>Keep <code>dotnet build</code> and your CI as the final word.</p>
+<p align="center"><b>Very experimental.</b> Tried on two real solutions (<a href="https://github.com/jellyfin/jellyfin">jellyfin</a> and <a href="https://github.com/bitwarden/server">bitwarden/server</a>), on Linux.<br>Keep <code>dotnet build</code> and your CI as the final word.</p>
 
 ## Install
 
@@ -86,7 +86,9 @@ against it: 6 to 8.5× faster. Against plain `dotnet build` it is +785%, +1509% 
 Speed increase is how much more work fits in the same time: `(old time / new time − 1) × 100`.
 
 To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timings) and
-`task verify -- body|signature|file` (compares output with `dotnet build --no-incremental`).
+`task verify -- body|signature|file` (compares output with `dotnet build --no-incremental`). For
+bitwarden/server, clone it into `bench/bitwarden` (its RustSdk project needs `cargo`) and run
+`task verify -- bitwarden <edit>`, with the edits listed in `scripts/edit-bitwarden.cs`.
 
 ## How it works
 
@@ -96,7 +98,8 @@ its own:
 - **Same output as `dotnet build`.** The daemon takes each project's exact compiler arguments from the
   binlog of that build and compiles with the Roslyn that ships with your SDK. It writes the same files
   to `obj/` and `bin/`, so your IDE, `dotnet run`, `dotnet test` and later `dotnet build`s keep working.
-  On jellyfin, every one of its 41 assemblies comes out byte-identical to `dotnet build`'s.
+  On jellyfin, every one of its 41 assemblies comes out byte-identical to `dotnet build`'s; on
+  bitwarden/server, 88 of its 89 (the 89th lists a source file twice, [#56](https://github.com/Igelkottegrodan/blaze-cs/issues/56)).
 - **Only what changed.** It recompiles the projects whose sources changed. When a project's public API
   changes, it diffs the API member by member and recompiles only the dependents that use a changed
   member (or whose source generators' output changes). Changes that code can reach without naming them
@@ -118,14 +121,23 @@ its own:
 - **Skipped dependents' PDBs:** a dependent the API diff skipped keeps its DLL. Its code is identical, but
   its PDB still records the old ID of the reference that changed, so its bytes differ from a fresh build
   until the next `dotnet build` recompiles it.
-- **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
-  by a real solution. .NET 11 (RC3) is covered by the fixture check
-  (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
-  Razor is covered only by the fixture check: a Razor class library of Blazor components (markup,
+- **Tested on:** two solutions. jellyfin: 41 projects, xUnit v3. bitwarden/server: 89 projects, an MVC
+  app with `.cshtml` views, 37 xUnit v2 and 4 xUnit v3 test projects; method body, signature, new file,
+  test and view edits all match `dotnet build --no-incremental` ([results](https://github.com/Igelkottegrodan/blaze-cs/issues/33#issuecomment-6680682555)).
+  Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not by a real solution.
+  .NET 11 (RC3) is covered by the fixture check (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
+  Blazor components (`.razor`) are covered only by the fixture check: a Razor class library (markup,
   `@code` API changes, `_Imports.razor`, new and deleted `.razor`, scoped CSS) and an xUnit project that
-  renders one. MVC views and Razor Pages (`.cshtml`), Blazor WebAssembly, other static web assets
-  (`wwwroot/`, `.razor.js`), and Razor, NUnit and MSTest on a real solution, and large graphs are
-  untested. The host doesn't apply NUnit or MSTest settings beyond the defaults.
+  renders one. MVC views (`.cshtml`) are covered by bitwarden/server's Admin app: a view edit, and a
+  constant in a referenced project that only a view reads. Razor Pages, Blazor WebAssembly, other
+  static web assets (`wwwroot/`, `.razor.js`), NUnit and MSTest on a real solution, and graphs much
+  larger than 89 projects are untested. The host doesn't apply NUnit or MSTest settings beyond the defaults.
+- **Known bugs:** one edit that adds a member to a project and starts using it in a dependent can fail
+  with no error shown, and leave a project that references both stale until `dotnet build`
+  ([#57](https://github.com/Igelkottegrodan/blaze-cs/issues/57)). A project whose Compile items list a
+  file twice fails to compile in the daemon ([#56](https://github.com/Igelkottegrodan/blaze-cs/issues/56)).
+- **Custom build steps** (an `Exec` target, such as bitwarden's `cargo build` before compile) run only in
+  `dotnet build`, not in the daemon's builds. Run `dotnet build` after changing what they read.
 - **It trades memory for speed:** the daemon holds a few GB (about 2.3 GB for jellyfin).
 
 ## Contributing
