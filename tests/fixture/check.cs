@@ -38,6 +38,13 @@ Case[] cases =
         () => Replace("Lib/Greeter.cs", "    public static int Twice",
             "    public static string Farewell(string name) => \"Bye, \" + name;\n\n    public static int Twice"),
         [.. consumer, .. lib], "build"),
+    // A generator in the solution goes through dotnet build; the next compile must run its new build.
+    new("generator edit", () => Replace("Generator/GreeterMembersGenerator.cs", "string.Join(\",\",", "string.Join(\";\","),
+        [], "build", "Generator: it is an analyzer other projects load; running dotnet build"),
+    new("generator output after generator edit",
+        () => Replace("Lib/Greeter.cs", "    public static int Twice",
+            "    public static string Wave(string name) => \"Hi, \" + name;\n\n    public static int Twice"),
+        [.. consumer, .. lib], "build"),
     // A test run must also show each rebuilt test project's tests passing (RanTests).
     new("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
     new("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),

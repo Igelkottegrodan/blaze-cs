@@ -577,14 +577,25 @@ sealed class SolutionBuilder
     }
 }
 
-/// <summary>Source generators by analyzer path, loaded once and shared by every unit; analyzers are skipped.</summary>
+/// <summary>
+/// Source generators by analyzer path, shared by every unit; analyzers are skipped. Loaded once, and
+/// again after the file changes: a generator project in the solution was built again.
+/// </summary>
 sealed class GeneratorCache(string shadowDirectory)
 {
     readonly AnalyzerLoader _loader = new(shadowDirectory);
-    readonly ConcurrentDictionary<string, ImmutableArray<ISourceGenerator>> _byPath = new(PathComparer.Instance);
+    readonly ConcurrentDictionary<string, (FileStamp Stamp, ImmutableArray<ISourceGenerator> Generators)> _byPath = new(PathComparer.Instance);
 
     public ImmutableArray<ISourceGenerator> For(IEnumerable<string> analyzerPaths) =>
-        analyzerPaths.Distinct(PathComparer.Instance)
-            .SelectMany(path => _byPath.GetOrAdd(path, p => new AnalyzerFileReference(p, _loader).GetGenerators(LanguageNames.CSharp)))
-            .ToImmutableArray();
+        analyzerPaths.Distinct(PathComparer.Instance).SelectMany(path => Load(path)).ToImmutableArray();
+
+    ImmutableArray<ISourceGenerator> Load(string path)
+    {
+        var stamp = FileStamp.Of(path);
+        if (_byPath.TryGetValue(path, out var cached) && cached.Stamp == stamp)
+            return cached.Generators;
+        var generators = new AnalyzerFileReference(path, _loader).GetGenerators(LanguageNames.CSharp);
+        _byPath[path] = (stamp, generators);
+        return generators;
+    }
 }
