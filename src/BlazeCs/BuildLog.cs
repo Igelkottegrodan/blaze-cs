@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
 
@@ -36,7 +37,46 @@ static class BuildLog
 {
     /// <summary>The `dotnet build` switch that makes it write the file <see cref="Read"/> reads.</summary>
     public static string LoggerSwitch(string path) =>
-        $"\"-logger:BlazeCs.Logger.CompileLogger,{Path.Combine(AppContext.BaseDirectory, "blaze-cs-logger.dll")};{path}\"";
+        $"\"-logger:BlazeCs.Logger.CompileLogger,{LoggerCopy()};{path}\"";
+
+    static readonly string s_logger = Path.Combine(AppContext.BaseDirectory, "blaze-cs-logger.dll");
+    static readonly Lazy<(byte[] Bytes, string Path)?> s_loggerCopy = new(() =>
+    {
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.DoNotVerify);
+        if (local.Length == 0)
+            return null;
+        var bytes = File.ReadAllBytes(s_logger);
+        var hash = Convert.ToHexStringLower(SHA256.HashData(bytes))[..16];
+        return (bytes, Path.Combine(local, "blaze-cs", "logger", hash, "blaze-cs-logger.dll"));
+    });
+
+    /// <summary>
+    /// The logger for MSBuild to load: a copy outside blaze-cs's own directory, named by its content. SDK 11
+    /// runs builds in the MSBuild server by default, which outlives the build and keeps the logger it loaded
+    /// mapped; on Windows a mapped file can't be deleted or replaced, so loaded from the tool directory it
+    /// would make `dotnet tool update` fail. A server that holds an older copy never blocks a newer one.
+    /// Without a per-user directory to copy to, the logger is loaded where it is.
+    /// </summary>
+    static string LoggerCopy()
+    {
+        if (s_loggerCopy.Value is not var (bytes, path))
+            return s_logger;
+        if (File.Exists(path))
+            return path;
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temporary = $"{path}.{Environment.ProcessId}.tmp";
+        File.WriteAllBytes(temporary, bytes);
+        try
+        {
+            File.Move(temporary, path);
+        }
+        catch (IOException) when (File.Exists(path))
+        {
+            // Another daemon copied the same bytes first.
+            File.Delete(temporary);
+        }
+        return path;
+    }
 
     /// <summary>
     /// What that build's environment needs: MSBuild forwards task parameters (Csc's output path,
