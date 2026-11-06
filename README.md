@@ -192,19 +192,22 @@ its own:
   Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon. After the real
   build, every project whose compiler arguments didn't change stays compiled in memory; only the others
   are loaded again, and only projects whose assembly that build changed are compiled once to check it.
-- **`dotnet build` can compile through it too.** The daemon serves the compiler-server pipe that the SDK's
-  `Csc` task sends each compile to (the protocol of the SDK's own `VBCSCompiler`). Build with
-  `-p:SharedCompilationId=<name>`, where the first `blaze-cs build` prints the name (the same for every daemon
-  of the solution, so it can go in a `Directory.Build.props`), and `dotnet build`, `dotnet test` or an IDE
-  build compiles each of the solution's projects from the daemon's warm compilation and writes what csc
-  would. The daemon takes each project's compiler arguments from the request, so such a build keeps it
-  current instead of leaving its cached arguments stale. Each such compile runs the project's analyzers
-  and suppressors over the whole project, compilation-end rules included, as csc does, and reports what
-  csc would; the background analysis then has nothing left to report on that project. A compile it can't
-  answer as csc would is rejected, and the task runs csc itself: another solution's project, a Csc task
-  from another Roslyn (compiler hash), a compile with a warning csc makes an error (warnings as errors, an
-  `error` severity in a config file), or any compile while a `blaze-cs` command runs. A `VBCSCompiler` that
-  a build started on the pipe while no daemon ran is shut down when the next daemon starts.
+- **`dotnet build` compiles through it too.** While the daemon runs, it serves the pipe the SDK's `Csc` task
+  sends every compile to (the one the SDK's own `VBCSCompiler` listens on, named for your user and the SDK), so a
+  plain `dotnet build`, `dotnet test`, `dotnet watch` or IDE build needs no property: each of the solution's
+  projects compiles from the daemon's warm compilation, which writes what csc would. The daemon takes each
+  project's compiler arguments from the request, so such a build keeps it current instead of leaving its cached
+  arguments stale. Each such compile runs the project's analyzers and suppressors over the whole project,
+  compilation-end rules included, as csc does, and reports what csc would; the background analysis then has
+  nothing left to report on that project. Every other compile goes, byte for byte, to a `VBCSCompiler` of the same
+  SDK that the daemon starts on a private pipe: another solution's (the pipe is the SDK's, not the solution's),
+  and one of this solution's it can't answer as csc would (a warning csc makes an error: warnings as errors, an
+  `error` severity in a config file; or any compile while a `blaze-cs` command runs). A `Csc` task from another
+  Roslyn (compiler hash) is rejected and runs csc itself. The pipe has one server at a time: the daemon asks a
+  running `VBCSCompiler` to shut down to take it, `dotnet build-server shutdown` makes the daemon give it up
+  until its next command, and when the daemon stops the next build starts the SDK's server as usual. The private
+  `VBCSCompiler` is shared by the daemons of every solution on that SDK: it exits after its own idle timeout, or
+  on `dotnet build-server shutdown`.
   `BLAZE_CS_COMPILER_SERVER=0` in the environment the daemon starts in turns the pipe off.
 
 ## Good to know
@@ -232,6 +235,9 @@ its own:
   Warnings-as-errors, and rules set to `error`, are reported as warnings and don't fail the build. Run
   `dotnet build` or CI for every warning: a `dotnet build` through the daemon's pipe reports them all as csc
   does, analyzers on every file and errors failing the build.
+- **Two solutions, one SDK:** their daemons share the SDK's pipe, and the one that ran a command last holds
+  it. The other solution's `dotnet build` then compiles through the SDK's server, correctly, and leaves its
+  daemon's arguments stale as without the pipe.
 - **Skipped dependents' PDBs:** a dependent the API diff skipped keeps its DLL. Its code is identical, but
   its PDB still records the old ID of the reference that changed, so its bytes differ from a fresh build
   until the next `dotnet build` recompiles it.

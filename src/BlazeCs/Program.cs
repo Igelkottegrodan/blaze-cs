@@ -152,7 +152,7 @@ static class Program
     /// The `dotnet` that runs this process. As an installed tool the process is the tool's own launcher, not
     /// `dotnet`, so the muxer is found from the runtime's directory (`dotnet/shared/Microsoft.NETCore.App/x.y.z`).
     /// </summary>
-    static string DotnetHost()
+    internal static string DotnetHost()
     {
         if (Path.GetFileNameWithoutExtension(Environment.ProcessPath) == "dotnet")
             return Environment.ProcessPath!;

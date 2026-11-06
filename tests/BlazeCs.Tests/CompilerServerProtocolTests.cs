@@ -144,6 +144,20 @@ public class CompilerServerProtocolTests
         Assert.Equal(Sdk.CommitHash(), hash);
     }
 
+    /// <summary>
+    /// The pipe the daemon listens on is the one the Csc task of that SDK connects to without a SharedCompilationId:
+    /// for the SDK's compiler directory, for others, and with a trailing separator or other casing, which the task
+    /// normalizes away. On Windows the name also says whether the process runs elevated.
+    /// </summary>
+    [Fact]
+    public void PipeNameIsTheOneTheCscTaskDerives()
+    {
+        var bincore = Path.Combine(Sdk.Directory, "Roslyn", "bincore");
+        foreach (var directory in new[] { bincore, bincore + Path.DirectorySeparatorChar, bincore.ToUpperInvariant(), Path.Combine(Path.GetTempPath(), "Ünïcode dir") })
+            Assert.Equal(Sdk.PipeName(directory), CompilerServer.PipeName(directory));
+        Assert.Equal(Sdk.PipeName(bincore), CompilerServer.PipeName(Sdk.ToolDirectory()));
+    }
+
     static byte[] Bytes(ServerResponse response)
     {
         var buffer = new MemoryStream();
@@ -229,6 +243,15 @@ public class CompilerServerProtocolTests
         public byte[] WriteShutdown(int serverProcessId) => Write(Activator.CreateInstance(Type("ShutdownBuildResponse"), serverProcessId)!);
 
         public string? CommitHash() => (string?)Call(Type("BuildProtocolConstants"), "GetCommitHash", null);
+
+        /// <summary>BuildServerConnection.GetPipeName(clientDirectory), which the Csc task names the pipe with.</summary>
+        public string PipeName(string clientDirectory) =>
+            (string)Type("BuildServerConnection").GetMethod("GetPipeName", BindingFlags.NonPublic | BindingFlags.Static, [typeof(string)])!.Invoke(null, [clientDirectory])!;
+
+        /// <summary>ManagedToolTask.GetToolDirectory(): the client directory of the task assembly loaded from the SDK.</summary>
+        public string ToolDirectory() =>
+            (string)_tasks.GetType("Microsoft.CodeAnalysis.BuildTasks.ManagedToolTask", throwOnError: true)!
+                .GetMethod("GetToolDirectory", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, null)!;
 
         static byte[] Write(object message)
         {

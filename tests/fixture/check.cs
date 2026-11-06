@@ -13,6 +13,8 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 
 var fixture = Path.GetDirectoryName(Path.GetFullPath(AppContext.GetData("EntryPointFilePath") as string ?? "tests/fixture/check.cs"))!;
@@ -21,6 +23,9 @@ var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
 var otherBuild = work + "-other-build";
 var otherSolution = work + "-other-solution";
 var roslynCopy = work + "-roslyn";
+// The SDK's server that compiles the builds Verify compares with, on a pipe of this check's own: on the SDK's pipe the
+// daemon would compile them itself.
+var referenceServer = $"blaze-cs-check-{Environment.ProcessId}";
 // BLAZE_CS=<path> runs that blaze-cs command, such as an installed tool's, instead of the launcher built here.
 var blaze = Environment.GetEnvironmentVariable("BLAZE_CS") is { Length: > 0 } given
     ? given
@@ -203,18 +208,23 @@ if (hasNet11)
     Replace("Fixture.slnx", "</Solution>", "  <Project Path=\"Tests11/Tests11.csproj\" />\n</Solution>");
 else
     Directory.Delete(Path.Combine(work, "Tests11"), recursive: true);
+// The projects whose tests passed hot reloaded in the last `blaze-cs test`, and in the one before: a hot reloaded
+// pass doesn't count as one, so they run again on the next `test` (RanTests), whether or not they changed.
+HashSet<string> hotReloaded = [], hotReloadedBefore = [];
+// The daemon takes the SDK's compiler-server pipe, one per user and SDK on the machine, and the checks of builds
+// through it expect it to be this check's: another check of the same SDK (another worktree's) waits for this one.
+using var pipeLock = LockSdkPipe();
 var passed = false;
 var loadedProjects = 0; // from the last "loaded N projects" line a command printed
 // BLAZE_CS_COMPILER_SERVER=0 turns the daemon's compiler-server pipe off; the checks of builds through it are skipped.
 var serverOff = Environment.GetEnvironmentVariable("BLAZE_CS_COMPILER_SERVER") == "0";
-// The projects whose tests passed hot reloaded in the last `blaze-cs test`, and in the one before: a hot reloaded
-// pass doesn't count as one, so they run again on the next `test` (RanTests), whether or not they changed.
-HashSet<string> hotReloaded = [], hotReloadedBefore = [];
+string? sdkPipe = null; // once the first daemon names it
 try
 {
-    // Starts the daemon: a real dotnet build; the warm-up compile runs after it returns. It names the pipe that
-    // builds compile through it with.
-    var pipe = PipeName(Run(blaze, "build"));
+    // Starts the daemon: a real dotnet build; the warm-up compile runs after it returns. It takes the SDK's
+    // compiler-server pipe.
+    Run(blaze, "build");
+    var pipe = sdkPipe = DaemonPipe("first command", 0);
     // The next command reports the warm-up, which must reproduce every assembly.
     WarmedUpIdentical("start", Run(blaze, "build"));
     var prestarted = IdleHosts("before any test command");
@@ -248,11 +258,13 @@ try
     CompilationEndAnalyzers();
     if (!serverOff)
     {
-        BuildThroughTheDaemon(pipe!);
-        ArgumentsChangedThroughTheDaemon(pipe!);
+        BuildThroughTheDaemon();
+        IdeBuildKeepsTheDaemonCurrent();
+        ArgumentsChangedThroughTheDaemon();
+        OtherSolutionThroughTheDaemon();
         RejectedRequests(pipe!);
-        AnalyzersThroughTheDaemon(pipe!);
-        CompilationEndThroughTheDaemon(pipe!);
+        AnalyzersThroughTheDaemon();
+        CompilationEndThroughTheDaemon();
     }
     PreparedHostsSeeNewBytes();
     HotReloadBodyEdit();
@@ -269,7 +281,7 @@ try
     if (!serverOff)
     {
         // Both restart the daemon, so they come after the checks of a daemon's test hosts.
-        PipeTakenOver(pipe!);
+        PipeHandedOver(pipe!);
         ServerTurnedOff(pipe!);
     }
     DaemonLifecycle();
@@ -287,6 +299,12 @@ catch (CheckFailed failure)
 finally
 {
     Run(blaze, "stop", check: false);
+    // The reference builds' server, and the one the daemons passed compiles on to, which outlives them.
+    foreach (var server in sdkPipe is null ? [referenceServer] : new[] { referenceServer, PrivatePipeName(sdkPipe) })
+    {
+        try { Run("dotnet", $"exec \"{Path.Combine(SdkDirectory(), "Roslyn", "bincore", "VBCSCompiler.dll")}\" -shutdown -pipename:{server}", check: false); }
+        catch (CheckFailed) { } // no SDK to find; its server exits when idle
+    }
     foreach (var scratch in new[] { otherBuild, otherSolution, roslynCopy })
     {
         try
@@ -298,12 +316,9 @@ finally
     }
     if (!passed)
     {
+        // daemon-start.log has what the daemon's launcher printed, such as a daemon that can't start.
         foreach (var name in new[] { "daemon.log", "daemon-start.log" })
-        {
-            var text = ReadLog(name);
-            if (text.Length > 0)
-                Console.Error.WriteLine($"{name} ({Path.Combine(work, ".blaze-cs", name)}):\n{text[^Math.Min(4000, text.Length)..]}");
-        }
+            Console.Error.WriteLine($"{name} ({Path.Combine(work, ".blaze-cs", name)}):\n{PrintedLog(name)}");
     }
 }
 return 0;
@@ -317,6 +332,20 @@ string ReadLog(string name)
         return "";
     using var reader = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
     return reader.ReadToEnd();
+}
+
+// A log as the end of a failed check prints it: also when it is missing, empty or can't be read.
+string PrintedLog(string name)
+{
+    try
+    {
+        var text = ReadLog(name);
+        return text.Length > 0 ? text[^Math.Min(4000, text.Length)..] : File.Exists(Path.Combine(work, ".blaze-cs", name)) ? "(empty)" : "(missing)";
+    }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        return $"(can't be read: {e.Message})";
+    }
 }
 
 // The daemons that have started, oldest first, from the log line each writes.
@@ -364,8 +393,9 @@ void IdleCollected()
 }
 
 // A `dotnet build` of one project writes its own obj/ and bin/ but not the copies in the projects that
-// reference it (#133). Without the pipe, the next `test` compiles Lib to the bytes its obj/ already holds;
-// through it, the daemon compiled Lib for the build, and the next `test` has nothing to compile. Either way
+// reference it (#133). Without the pipe (csc, UseSharedCompilation=false), the next `test` compiles Lib to the
+// bytes its obj/ already holds; through it, the daemon compiled Lib for the build, and the next `test` has nothing
+// to compile. Either way
 // every copy must be brought up to date, and the test projects whose copies changed must run rather than be
 // reported unchanged. Every copy in a bin/ is then what `dotnet build --no-incremental` makes. The edit is
 // undone after.
@@ -376,9 +406,9 @@ void OutsideBuildOfOneProject(string? pipe)
     Run(blaze, "test"); // the inputs each test project last passed with
     Replace("Lib/Greeter.cs", before, after);
     if (pipe is null)
-        Run("dotnet", "build Lib/Lib.csproj -nologo -v:q -clp:NoSummary");
+        Run("dotnet", "build Lib/Lib.csproj -nologo -v:q -clp:NoSummary -p:UseSharedCompilation=false");
     else
-        BuildThrough(pipe, "Lib/Lib.csproj");
+        DetailedBuild("Lib/Lib.csproj"); // plain: the SDK's pipe is the daemon's
     var output = Run(blaze, "test");
     var rebuilt = Rebuilt(output);
     string[] expected = pipe is null ? lib : [];
@@ -470,31 +500,66 @@ void Handover(string client, int old, int expectedDaemons, Dictionary<string, st
         Fail($"daemon handshake through {Path.GetFileName(client)}: expected a notice, daemon {old} gone and {expectedDaemons} daemons, got {daemons.Count}:\n{output}");
 }
 
-// The pipe the daemon's first command names: "dotnet build -p:SharedCompilationId=<pipe> compiles through this daemon".
-// None when the pipe is off.
-string? PipeName(string output)
+// The private pipe of the VBCSCompiler the daemons pass compiles on to (CompilerServer.PrivatePipeName).
+static string PrivatePipeName(string pipeName) =>
+    "blaze-cs-" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(pipeName)))[..16];
+
+// Holds a lock for this user and SDK on the machine whatever TMPDIR says, as its pipe is (on Unix the pipe's socket
+// is under /tmp), until the check exits: FileShare.None is flock on Unix. Waits up to an hour for another check.
+FileStream LockSdkPipe()
 {
-    var name = Regex.Match(output, @"^blaze-cs: dotnet build -p:SharedCompilationId=(\S+) compiles through this daemon", RegexOptions.Multiline);
-    if (serverOff == name.Success)
-        Fail($"first command: expected {(serverOff ? "no pipe, which BLAZE_CS_COMPILER_SERVER=0 turns off" : "the pipe to compile through the daemon with")}:\n{output}");
-    return name.Success ? name.Groups[1].Value : null;
+    var bincore = Path.Combine(SdkDirectory(), "Roslyn", "bincore");
+    if (!OperatingSystem.IsWindows())
+        bincore = Run("realpath", $"\"{bincore}\"").Trim(); // the SDK's pipe is named for its real path
+    var key = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes($"{Environment.UserName}.{bincore}")))[..16];
+    var path = Path.Combine(OperatingSystem.IsWindows() ? Path.GetTempPath() : "/tmp", $"blaze-cs-check-{key}.lock");
+    var waiting = Stopwatch.StartNew();
+    while (true)
+    {
+        try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+        catch (IOException) when (waiting.Elapsed < TimeSpan.FromHours(1))
+        {
+            if (waiting.Elapsed < TimeSpan.FromSeconds(1))
+                Console.WriteLine($"waiting for another check of this SDK ({bincore}), which holds {path}");
+            Thread.Sleep(1000);
+        }
+        catch (IOException e)
+        {
+            throw new IOException($"another check of this SDK held {path} for an hour", e);
+        }
+    }
 }
 
+// The SDK's compiler-server pipe a daemon serves, from what its log says after mark: its start names the pipe
+// ("compiler server: pipe <name> of <bincore>"), and once it holds it, "listening on <name>". None when the pipe is off.
+string? DaemonPipe(string when, int mark)
+{
+    var log = ReadLog("daemon.log")[mark..];
+    var name = Regex.Match(log, @"compiler server: pipe (\S+) of ");
+    if (serverOff)
+    {
+        if (name.Success || !log.Contains("compiler server off"))
+            Fail($"{when}: expected no pipe, which BLAZE_CS_COMPILER_SERVER=0 turns off:\n{log}");
+        return null;
+    }
+    if (!name.Success || !log.Contains($"compiler server: listening on {name.Groups[1].Value},"))
+        Fail($"{when}: expected the daemon to listen on the SDK's compiler-server pipe:\n{log}");
+    return name.Groups[1].Value;
+}
+
+int LogMark() => ReadLog("daemon.log").Length;
+
+string LogSince(int mark) => ReadLog("daemon.log")[mark..];
+
 // What the Csc task logged of each compile at -v:d ("CompilerServer: server - server processed compilation - Lib (net10.0)"),
-// by request (project and target framework): "server" for a compile the daemon answered; for one it rejected,
+// by request (project and target framework): "server" for a compile a server answered; for one it rejected,
 // "server failed" and the reason; "tool" for csc by design.
 Dictionary<string, string> CompilerServerLog(string output) =>
     Regex.Matches(output, @"CompilerServer: (.+?) - (.+) - (\S+(?: \([^)]+\))?)\r?$", RegexOptions.Multiline)
         .DistinctBy(m => m.Groups[3].Value) // MSBuild may print a message more than once
         .ToDictionary(m => m.Groups[3].Value, m => $"{m.Groups[1].Value}: {m.Groups[2].Value}");
 
-// Builds through the pipe, in this process's own MSBuild nodes: a reused node or MSBuild server could hold a task
-// assembly that another build here replaces (RejectedRequests), and keep it loaded past the check.
-string BuildThrough(string pipe, string arguments) => BuildThroughWithExit(pipe, arguments, check: true).Output;
-
-(string Output, int ExitCode) BuildThroughWithExit(string pipe, string arguments, bool check) =>
-    RunWithExit("dotnet", $"build {arguments} -nologo -v:d -nodeReuse:false -p:SharedCompilationId={pipe}", check,
-        new() { ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0" });
+string Compiles(Dictionary<string, string> compiles) => string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"));
 
 // The distinct analyzer diagnostics of one id a build printed: file, position and message, without MSBuild's
 // [project] suffix and indent.
@@ -502,36 +567,73 @@ static HashSet<string> Printed(string output, string id) =>
     Regex.Matches(output, $@"(\S+\(\d+,\d+\)): (warning|error|info) ({id}): ([^\[\r\n]*)")
         .Select(m => $"{Path.GetFileName(m.Groups[1].Value)} {m.Groups[2].Value} {m.Groups[3].Value} {m.Groups[4].Value.Trim()}").ToHashSet();
 
-// With the daemon's pipe as SharedCompilationId, dotnet build compiles every project through the daemon: each
-// compile is one the daemon answered (none falls back to csc), the outputs are what dotnet build --no-incremental
-// without it writes, and the next blaze-cs build has nothing to do.
-void BuildThroughTheDaemon(string pipe)
+// The compiles the daemon's log says it answered itself ("compiler server: Lib (net10.0): compiled in 5 ms, exit code 0").
+HashSet<string> Served(string log) =>
+    [.. Regex.Matches(log, @"compiler server: (.+): compiled in \d+ ms, exit code 0").Select(m => m.Groups[1].Value)];
+
+// A plain dotnet build at detailed verbosity, in this process's own MSBuild nodes: a reused node or MSBuild server
+// could hold a task assembly that another build here replaces (RejectedRequests), and keep it loaded past the check.
+string DetailedBuild(string arguments) => DetailedBuildWithExit(arguments, check: true).Output;
+
+(string Output, int ExitCode) DetailedBuildWithExit(string arguments, bool check = false) =>
+    RunWithExit("dotnet", $"build {arguments} -nologo -v:d -nodeReuse:false", check, new() { ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0" });
+
+// Whether a server holds the pipe: the mutex the Csc task checks before it connects, and VBCSCompiler before it listens.
+static bool Held(string pipe)
 {
-    var output = BuildThrough(pipe, "Fixture.slnx --no-incremental");
-    var compiles = CompilerServerLog(output);
-    if (compiles.Count != loadedProjects || compiles.Values.Any(result => result != "server: server processed compilation"))
-        Fail($"dotnet build through the daemon: expected all {loadedProjects} compiles answered by it, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
-    if (!Regex.IsMatch(ReadLog("daemon.log"), @"compiler server: Lib \(net10\.0\): compiled in \d+ ms, exit code 0"))
-        Fail($"dotnet build through the daemon: expected its log to show Lib (net10.0) compiled:\n{ReadLog("daemon.log")}");
-    Console.WriteLine($"ok  dotnet build -p:SharedCompilationId={pipe}: the daemon answered all {compiles.Count} compiles");
+    var open = Mutex.TryOpenExisting($@"Global\{pipe}.server", out var mutex);
+    mutex?.Dispose();
+    return open;
+}
+
+// With no property, dotnet build compiles every project through the daemon: each compile is one it answered (none
+// falls back to csc or goes to VBCSCompiler), the outputs are what csc writes, and the next blaze-cs build has
+// nothing to do.
+void BuildThroughTheDaemon()
+{
+    var mark = LogMark();
+    var compiles = CompilerServerLog(DetailedBuild("Fixture.slnx --no-incremental"));
+    var served = Served(LogSince(mark));
+    if (compiles.Count != loadedProjects || compiles.Values.Any(result => result != "server: server processed compilation") || !served.SetEquals(compiles.Keys))
+        Fail($"dotnet build through the daemon: expected all {loadedProjects} compiles answered by it, got:\n{Compiles(compiles)}\nthe daemon answered: {string.Join(", ", served.Order())}");
+    Console.WriteLine($"ok  dotnet build with no properties: the daemon answered all {compiles.Count} compiles");
     Verify("dotnet build through the daemon", [], "the daemon's pipe");
     var rebuilt = Rebuilt(Run(blaze, "build"));
     if (rebuilt.Count > 0)
         Fail($"blaze-cs build after dotnet build through the daemon: expected nothing to rebuild, it rebuilt {string.Join(", ", rebuilt.Order())}");
 }
 
+// An IDE builds one project: here Lib, with a file the daemon hasn't seen. Lib's compiles come to the daemon with
+// its new arguments, so the next blaze-cs build finds them current and has nothing to do. Without the pipe, it
+// would find Lib's cached arguments stale and run dotnet build --no-incremental (WarmUpAfterFirstCommand).
+void IdeBuildKeepsTheDaemonCurrent()
+{
+    File.WriteAllText(Path.Combine(work, "Lib/Ide.cs"), "namespace Lib;\n\ninternal static class Ide\n{\n}\n");
+    var mark = LogMark();
+    var compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj"));
+    if (!Served(LogSince(mark)).SetEquals(lib) || !compiles.Keys.ToHashSet().SetEquals(lib))
+        Fail($"dotnet build of Lib: expected the daemon to answer its compiles, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
+    var output = Run(blaze, "build");
+    var rebuilt = Rebuilt(output);
+    if (output.Contains("stale") || output.Contains("running dotnet build") || rebuilt.Count > 0)
+        Fail($"blaze-cs build after dotnet build of Lib: expected Lib's arguments current and nothing to rebuild:\n{output}");
+    Console.WriteLine("ok  dotnet build of one project (an IDE's): the daemon took Lib's new arguments, and blaze-cs build after it had nothing to do");
+    Verify("dotnet build of one project", [.. lib], null);
+}
+
 // A project file edit changes Lib's compiler arguments, and dotnet build compiles Lib through the daemon with the
 // new ones: the daemon takes them from the request. The next blaze-cs build evaluates the project file in process,
 // and the pass must give the arguments the request did: every unit stays, and nothing compiles.
-void ArgumentsChangedThroughTheDaemon(string pipe)
+void ArgumentsChangedThroughTheDaemon()
 {
     const string property = "  <PropertyGroup>\n    <DefineConstants>$(DefineConstants);SERVED</DefineConstants>\n  </PropertyGroup>\n";
     const string member = "#if SERVED\n    public const string Served = \"served\";\n\n#endif\n";
     Replace("Lib/Lib.csproj", "</Project>", property + "</Project>");
     Replace("Lib/Greeter.cs", "    public static int Twice", member + "    public static int Twice");
-    var compiles = CompilerServerLog(BuildThrough(pipe, "Fixture.slnx"));
-    if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation") || compiles.Values.Any(result => !result.StartsWith("server: ", StringComparison.Ordinal)))
-        Fail($"changed arguments through the daemon: expected it to answer every compile, Lib's among them, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
+    var mark = LogMark();
+    var compiles = CompilerServerLog(DetailedBuild("Fixture.slnx"));
+    if (!lib.All(Served(LogSince(mark)).Contains) || compiles.Values.Any(result => !result.StartsWith("server: ", StringComparison.Ordinal)))
+        Fail($"changed arguments through the daemon: expected it to answer every compile, Lib's among them, got:\n{Compiles(compiles)}");
     var output = Run(blaze, "build");
     if (output.Contains("stale") || output.Contains("--no-incremental") || output.Contains("running dotnet build")
         || !Regex.IsMatch(output, @"^blaze-cs: evaluated Lib\.csproj in process in \d+ ms; compiler arguments unchanged\r?$", RegexOptions.Multiline)
@@ -551,27 +653,58 @@ void ArgumentsChangedThroughTheDaemon(string pipe)
     Verify("changed arguments undone", undone, null);
 }
 
-// The daemon answers only its own solution's compiles, and only for the Roslyn it loaded: a project of another
-// solution, and a Csc task from a Roslyn with another commit hash (here the SDK's, with the hash in its task
-// assembly changed), are rejected, and those builds succeed through csc.
-void RejectedRequests(string pipe)
+// The pipe is the SDK's, so another solution's build sends its compiles to the daemon too: it passes them to a
+// VBCSCompiler of its own, and that build writes what csc writes without the daemon, byte for byte.
+void OtherSolutionThroughTheDaemon()
 {
     Directory.CreateDirectory(otherSolution);
     File.Copy(Path.Combine(work, "global.json"), Path.Combine(otherSolution, "global.json"), overwrite: true);
     File.WriteAllText(Path.Combine(otherSolution, "Other.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n");
-    File.WriteAllText(Path.Combine(otherSolution, "Other.cs"), "namespace Other;\n\npublic static class Thing\n{\n}\n");
-    var compiles = CompilerServerLog(BuildThrough(pipe, $"\"{Path.Combine(otherSolution, "Other.csproj")}\""));
-    if (compiles.GetValueOrDefault("Other (net10.0)") is not { } other || !other.StartsWith("server failed: server rejected the request", StringComparison.Ordinal)
-        || !other.Contains("is not the output of a project of") || !File.Exists(Path.Combine(otherSolution, "obj", "Debug", "net10.0", "Other.dll")))
-        Fail($"another solution: expected its compile rejected and built by csc, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
-    Console.WriteLine($"ok  another solution's compile: {other}; built by csc");
+    // Analyzers run as under csc: CA2200 (rethrow) is an error by the .editorconfig, then a warning.
+    File.WriteAllText(Path.Combine(otherSolution, "Other.cs"),
+        "namespace Other;\n\npublic static class Thing\n{\n    public static int Twice(int value) => value * 2;\n\n"
+        + "    public static void Rethrow()\n    {\n        try { Twice(1); }\n        catch (System.Exception e) { throw e; }\n    }\n}\n");
+    var editorConfig = Path.Combine(otherSolution, ".editorconfig");
+    File.WriteAllText(editorConfig, "root = true\n\n[*.cs]\ndotnet_diagnostic.CA2200.severity = error\n");
+    var project = $"\"{Path.Combine(otherSolution, "Other.csproj")}\" --no-incremental";
+    var failed = RunWithExit("dotnet", $"build {project} -nologo -nodeReuse:false", check: false);
+    if (failed.ExitCode == 0 || !failed.Output.Contains("error CA2200"))
+        Fail($"another solution with an analyzer error: expected the build through the daemon to fail with CA2200, as under csc:\n{failed.Output}");
+    File.WriteAllText(editorConfig, "root = true\n\n[*.cs]\ndotnet_diagnostic.CA2200.severity = warning\n");
+    var mark = LogMark();
+    var output = DetailedBuild(project);
+    var compiles = CompilerServerLog(output);
+    if (!output.Contains("warning CA2200"))
+        Fail($"another solution with an analyzer warning: expected CA2200 reported through the daemon:\n{output}");
+    var passedOn = Regex.Match(LogSince(mark), @"compiler server: Other \(net10\.0\): not of this solution; VBCSCompiler: compiled, exit code 0 in \d+ ms");
+    if (compiles.GetValueOrDefault("Other (net10.0)") != "server: server processed compilation" || !passedOn.Success)
+        Fail($"another solution: expected the daemon to pass its compile to VBCSCompiler, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
+    var throughDaemon = OtherOutputs();
+    Run("dotnet", $"build {project} -nologo -v:q -clp:ErrorsOnly -p:UseSharedCompilation=false");
+    var csc = OtherOutputs();
+    var differing = csc.Keys.Where(path => !throughDaemon.TryGetValue(path, out var bytes) || !bytes.AsSpan().SequenceEqual(csc[path])).ToList();
+    if (csc.Count == 0 || !throughDaemon.Keys.ToHashSet().SetEquals(csc.Keys) || differing.Count > 0)
+        Fail($"another solution: expected the same outputs as csc without the daemon, these differ: {string.Join(", ", differing)}");
+    if (!Run("dotnet", $"build {project} -nologo -nodeReuse:false -p:UseSharedCompilation=false").Contains("warning CA2200"))
+        Fail("another solution without the daemon: expected csc to report CA2200 too");
+    Console.WriteLine($"ok  another solution's dotnet build: CA2200 at error failed it and at warning was reported, as under csc; the daemon logged '{passedOn.Value[(passedOn.Value.IndexOf(": ", StringComparison.Ordinal) + 2)..]}'; {csc.Count} of {csc.Count} outputs identical to csc's without the daemon");
+}
 
+// The other solution's obj/ assemblies and PDBs, by relative path.
+Dictionary<string, byte[]> OtherOutputs() =>
+    Directory.EnumerateFiles(Path.Combine(otherSolution, "obj"), "*", SearchOption.AllDirectories)
+        .Where(path => path.EndsWith(".dll", StringComparison.Ordinal) || path.EndsWith(".pdb", StringComparison.Ordinal))
+        .ToDictionary(path => Path.GetRelativePath(otherSolution, path), File.ReadAllBytes);
+
+// The daemon answers only for the Roslyn it loaded: a Csc task from a Roslyn with another commit hash (here the SDK's,
+// with the hash in its task assembly changed) that names the daemon's pipe is rejected, not passed on (VBCSCompiler
+// would answer IncorrectHash, which fails the build), and the build succeeds through csc.
+void RejectedRequests(string pipe)
+{
     // The SDK's Roslyn directory with a task assembly whose CommitHashAttribute (prolog, length 40, the hash) differs.
     // The SDK loads the Csc task from RoslynTasksAssembly, which it sets from its own directory, not RoslynTargetsPath.
-    var version = Run("dotnet", "--version").Trim();
-    var sdkRoot = Run("dotnet", "--list-sdks").Split('\n', StringSplitOptions.TrimEntries).Select(line => line.Split(' ', 2))
-        .Where(parts => parts.Length == 2 && parts[0] == version).Select(parts => parts[1].Trim('[', ']')).Single();
-    CopyDirectory(Path.Combine(sdkRoot, version, "Roslyn"), roslynCopy);
+    // That task names another pipe from its own directory, so the build names the daemon's.
+    CopyDirectory(Path.Combine(SdkDirectory(), "Roslyn"), roslynCopy);
     var tasks = Path.Combine(roslynCopy, "Microsoft.Build.Tasks.CodeAnalysis.dll");
     var bytes = File.ReadAllBytes(tasks);
     var at = Enumerable.Range(0, bytes.Length - 45).Single(i => bytes[i] == 1 && bytes[i + 1] == 0 && bytes[i + 2] == 40
@@ -580,10 +713,9 @@ void RejectedRequests(string pipe)
         bytes[i] = bytes[i] == (byte)'0' ? (byte)'1' : (byte)'0';
     File.SetAttributes(tasks, FileAttributes.Normal); // a copy of a read-only SDK (a nix store's) is read-only too
     File.WriteAllBytes(tasks, bytes);
-    var output = BuildThrough(pipe, $"Lib/Lib.csproj --no-incremental \"-p:RoslynTasksAssembly={tasks}\"");
-    compiles = CompilerServerLog(output);
+    var compiles = CompilerServerLog(DetailedBuild($"Lib/Lib.csproj --no-incremental \"-p:RoslynTasksAssembly={tasks}\" -p:SharedCompilationId={pipe}"));
     if (!lib.All(compiles.ContainsKey) || compiles.Values.Any(result => !result.StartsWith("server failed: server rejected the request 'compiler hash", StringComparison.Ordinal)))
-        Fail($"another compiler hash: expected every compile rejected for its hash and built by csc, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
+        Fail($"another compiler hash: expected every compile rejected for its hash and built by csc, got:\n{Compiles(compiles)}");
     Console.WriteLine($"ok  a compile from a task with another compiler hash: {compiles[lib[0]]}; built by csc");
     Verify("compiles the daemon rejected", [], "csc");
 }
@@ -591,37 +723,41 @@ void RejectedRequests(string pipe)
 // csc runs a project's analyzers beside its compile, and a build through the pipe gets what they report as csc
 // reports it: a CA2200 warning (Lib/.editorconfig, which is new, so Lib's compiler arguments change with it) is
 // in the output of the daemon's answer, as in a build without the pipe. With the rule at error the daemon
-// rejects Lib's compile, csc fails it, and the build fails. Once the .editorconfig is gone and a build outside
+// rejects Lib's compile, VBCSCompiler fails it as csc does, and the build fails. Once the .editorconfig is gone and a build outside
 // the daemon compiled Lib without it, the next blaze-cs build reloads fresh instead of failing on the cached
 // arguments that name it.
-void AnalyzersThroughTheDaemon(string pipe)
+void AnalyzersThroughTheDaemon()
 {
     const string rethrow = "    public static void Rethrow()\n    {\n        try { System.Console.WriteLine(); }\n        catch (System.Exception e) { throw e; }\n    }\n\n";
     var editorConfig = Path.Combine(work, "Lib", ".editorconfig");
     Replace("Lib/Greeter.cs", "    public static int Twice", rethrow + "    public static int Twice");
     File.WriteAllText(editorConfig, "[*.cs]\ndotnet_diagnostic.CA2200.severity = warning\n");
-    var output = BuildThrough(pipe, "Fixture.slnx");
+    var mark = LogMark();
+    var output = DetailedBuild("Fixture.slnx");
     var compiles = CompilerServerLog(output);
+    var served = Served(LogSince(mark));
     Verify("analyzer warning through the daemon", [], "the daemon's pipe");
     // What csc itself prints, with no server: last, as it writes Lib's outputs again.
     var csc = Run("dotnet", "build Lib/Lib.csproj -nologo -v:q --no-incremental -p:UseSharedCompilation=false");
-    if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation")
+    if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation" || !served.Contains(unit))
         || Printed(output, "CA2200") is not { Count: > 0 } warnings || !warnings.SetEquals(Printed(csc, "CA2200")))
         Fail($"analyzer warning through the daemon: expected it to answer Lib's compiles with csc's CA2200 warnings ({string.Join("; ", Printed(csc, "CA2200"))}), got {string.Join("; ", Printed(output, "CA2200"))}:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
     Console.WriteLine($"ok  analyzer warning through the daemon: {string.Join("; ", warnings)}, as csc prints it");
 
     File.WriteAllText(editorConfig, "[*.cs]\ndotnet_diagnostic.CA2200.severity = error\n");
-    var (failed, exitCode) = BuildThroughWithExit(pipe, "Fixture.slnx", check: false);
-    compiles = CompilerServerLog(failed);
+    mark = LogMark();
+    var (failed, exitCode) = DetailedBuildWithExit("Fixture.slnx");
+    var log = LogSince(mark);
     if (exitCode == 0 || !Printed(failed, "CA2200").Any(line => line.Contains(" error ", StringComparison.Ordinal))
-        || lib.Any(unit => compiles.GetValueOrDefault(unit) is not { } result || !result.StartsWith("server failed: server rejected the request", StringComparison.Ordinal) || !result.Contains("CA2200")))
-        Fail($"analyzer error through the daemon: expected Lib's compiles rejected for CA2200, csc's error CA2200 and a failed build, got exit code {exitCode}:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}\n{string.Join("\n", Printed(failed, "CA2200"))}");
-    Console.WriteLine($"ok  analyzer error through the daemon: {compiles[lib[0]]}; csc failed the build");
+        || lib.Any(unit => !Regex.IsMatch(log, $@"compiler server: {Regex.Escape(unit)}: rejected: .*CA2200")
+            || !Regex.IsMatch(log, $@"compiler server: {Regex.Escape(unit)}: rejected; VBCSCompiler: compiled, exit code 1 ")))
+        Fail($"analyzer error through the daemon: expected Lib's compiles rejected for CA2200, passed to VBCSCompiler, and the build failed with its error CA2200, got exit code {exitCode}:\n{string.Join("\n", Printed(failed, "CA2200"))}\n{log}");
+    Console.WriteLine("ok  analyzer error through the daemon: it rejected Lib's compiles for CA2200, VBCSCompiler failed them with csc's error, and the build failed");
 
     // At suggestion, csc prints nothing for it (info goes only to an /errorlog), and runs no analyzer that has
     // nothing above info to report.
     File.WriteAllText(editorConfig, "[*.cs]\ndotnet_diagnostic.CA2200.severity = suggestion\n");
-    output = BuildThrough(pipe, "Fixture.slnx");
+    output = DetailedBuild("Fixture.slnx");
     compiles = CompilerServerLog(output);
     if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation") || Printed(output, "CA2200").Count > 0)
         Fail($"analyzer suggestion through the daemon: expected it to answer Lib's compiles and print nothing for CA2200, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}\n{string.Join("\n", Printed(output, "CA2200"))}");
@@ -634,8 +770,8 @@ void AnalyzersThroughTheDaemon(string pipe)
         File.WriteAllText(editorConfig, $"[*.cs]\n{setting}\n");
         var assemblies = lib.Select(unit => Path.Combine(work, "Lib", "obj", "Debug", unit[(unit.IndexOf('(') + 1)..^1], "Lib.dll")).ToList();
         var before = assemblies.Select(path => (File.GetLastWriteTimeUtc(path), File.ReadAllBytes(path))).ToList();
-        var (bulk, bulkExit) = BuildThroughWithExit(pipe, "Lib/Lib.csproj", check: false);
-        var (again, againExit) = BuildThroughWithExit(pipe, "Lib/Lib.csproj", check: false);
+        var (bulk, bulkExit) = DetailedBuildWithExit("Lib/Lib.csproj");
+        var (again, againExit) = DetailedBuildWithExit("Lib/Lib.csproj");
         var (cscBulk, cscExit) = RunWithExit("dotnet", "build Lib/Lib.csproj -nologo -v:q -p:UseSharedCompilation=false", check: false);
         compiles = CompilerServerLog(bulk);
         var errors = Printed(bulk, @"CA\d+");
@@ -649,7 +785,8 @@ void AnalyzersThroughTheDaemon(string pipe)
 
     File.Delete(editorConfig);
     Replace("Lib/Greeter.cs", rethrow, "");
-    Run("dotnet", "build Fixture.slnx -nologo -v:q -clp:ErrorsOnly");
+    // Outside the daemon: through its pipe, the build would hand it Lib's new arguments.
+    Run("dotnet", "build Fixture.slnx -nologo -v:q -clp:ErrorsOnly -p:UseSharedCompilation=false");
     output = Run(blaze, "build");
     if (!output.Contains("cached compiler arguments name a file that is gone"))
         Fail($"deleted .editorconfig: expected blaze-cs to load fresh for the cached arguments that name it:\n{output}");
@@ -661,7 +798,7 @@ void AnalyzersThroughTheDaemon(string pipe)
 // found (CA1812, see CompilationEndAnalyzers): as after a build outside the daemon, the background analysis then
 // has nothing to report on the project. Here the background analysis finished on Lib as it is before the compile,
 // which changes nothing in it (--no-incremental, same arguments), so only that the compile counts drops it.
-void CompilationEndThroughTheDaemon(string pipe)
+void CompilationEndThroughTheDaemon()
 {
     var unused = Path.Combine(work, "Lib", "Unused.cs");
     const string unusedClass = "namespace Lib;\n\ninternal sealed class Unused\n{\n}\n";
@@ -677,59 +814,116 @@ void CompilationEndThroughTheDaemon(string pipe)
 
     // Through the pipe first, so Lib's arguments name the new file.
     File.WriteAllText(unused, unusedClass);
-    Answered("compilation-end rules through the daemon, new file", BuildThrough(pipe, "Fixture.slnx"));
+    Answered("compilation-end rules through the daemon, new file", DetailedBuild("Fixture.slnx"));
     File.WriteAllText(unused, "// Moved down a line.\n" + unusedClass);
     var output = Run(blaze, "build");
     var built = DateTimeOffset.Now;
     if (!Rebuilt(output).SetEquals(lib) || Warnings(output, "CA1812").Count != 0)
         Fail($"compilation-end rules through the daemon: expected {string.Join(", ", lib)} rebuilt and no CA1812 from the build itself:\n{output}");
     WaitForBackgroundAnalysis("compilation-end rules through the daemon", built);
-    var printed = Answered("compilation-end rules through the daemon", BuildThrough(pipe, "Fixture.slnx --no-incremental"));
+    var printed = Answered("compilation-end rules through the daemon", DetailedBuild("Fixture.slnx --no-incremental"));
     output = Run(blaze, "build");
     if (Warnings(output, "CA1812").Count != 0 || Regex.IsMatch(output, @"background analysis \(compilation-end rules\) of .*Lib \("))
         Fail($"compilation-end rules through the daemon: expected the background analysis of Lib, which the compile through the pipe reported, dropped:\n{output}");
     Console.WriteLine($"ok  compilation-end rules through the daemon: {string.Join("; ", printed)}, as csc prints it; the background analysis' report on Lib dropped");
 
     File.Delete(unused);
-    BuildThrough(pipe, "Fixture.slnx");
+    DetailedBuild("Fixture.slnx");
     Verify("compilation-end rules through the daemon undone", [], "the daemon's pipe");
 }
 
-// A build through the pipe while no daemon runs starts the SDK's VBCSCompiler on it. The next daemon shuts that
-// server down before it listens, so the pipe has one server, and the next build through it reaches the daemon.
-void PipeTakenOver(string pipe)
+// The SDK's directory (sdk/<version>) for this fixture's global.json.
+string SdkDirectory()
 {
-    Run(blaze, "stop");
-    var compiles = CompilerServerLog(BuildThrough(pipe, "Lib/Lib.csproj --no-incremental"));
-    if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation"))
-        Fail($"pipe without a daemon: expected VBCSCompiler to answer Lib's compiles, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}");
-    var logged = ReadLog("daemon.log").Length;
-    Run(blaze, "build");
-    var log = ReadLog("daemon.log")[logged..];
-    if (Regex.Match(log, @"compiler server: shut down the server that held the pipe \(pid (\d+)\)") is not { Success: true } shutDown || Running(int.Parse(shutDown.Groups[1].Value)))
-        Fail($"pipe taken over: expected the daemon to shut down the VBCSCompiler on its pipe:\n{log}");
-    // The next command waits for the new daemon's warm-up, which compares Lib's assembly on disk: a build with
-    // --no-incremental cleans it first.
-    Run(blaze, "build");
-    compiles = CompilerServerLog(BuildThrough(pipe, "Lib/Lib.csproj --no-incremental"));
-    log = ReadLog("daemon.log")[logged..];
-    if (lib.Any(unit => compiles.GetValueOrDefault(unit) != "server: server processed compilation" || !log.Contains($"compiler server: {unit}: compiled in")))
-        Fail($"pipe taken over: expected the daemon to answer Lib's compiles, got:\n{string.Join("\n", compiles.Select(c => $"{c.Key}: {c.Value}"))}\n{log}");
-    Console.WriteLine($"ok  pipe taken over: the daemon shut down VBCSCompiler (pid {shutDown.Groups[1].Value}), which a build through the pipe had started, and answered the next build's compiles");
-    Verify("pipe taken over", [], "the daemon's pipe");
+    var version = Run("dotnet", "--version").Trim();
+    var sdkRoot = Run("dotnet", "--list-sdks").Split('\n', StringSplitOptions.TrimEntries).Select(line => line.Split(' ', 2))
+        .Where(parts => parts.Length == 2 && parts[0] == version).Select(parts => parts[1].Trim('[', ']')).Single();
+    return Path.Combine(sdkRoot, version);
 }
 
-// With BLAZE_CS_COMPILER_SERVER=0 the daemon has no pipe and names none; without it, the next daemon has it again.
+// The pipe has one server at a time. `dotnet build-server shutdown` asks the daemon to give it up, which it does
+// and keeps running; the next dotnet build then starts the SDK's server on it, as without blaze-cs; and the next
+// blaze-cs command asks that server to shut down and takes the pipe back. blaze-cs stop gives it up for good: the
+// next dotnet build starts the SDK's server again. Ends with a daemon running, warmed up.
+void PipeHandedOver(string pipe)
+{
+    // With test hosts live for hot reload, where the daemon has the engine: giving the pipe up and taking it back
+    // leaves them, and their sessions, alone.
+    Dictionary<int, string> live = [];
+    if (HotReloadUnavailableBecause() is null)
+    {
+        Run(blaze, "test --all");
+        live = ReadyLiveHosts("before dotnet build-server shutdown", allTests);
+        if (live.Count == 0)
+            Fail($"before dotnet build-server shutdown: expected test hosts live with their hot reload sessions:\n{ReadLog("daemon.log")}");
+    }
+
+    // The daemon stops serving the pipe, then answers with a process id no system gives: the command waits
+    // for that process to exit (SDK 10.0.1xx's with no timeout of its own), finds it gone and exits 0.
+    var mark = LogMark();
+    var daemon = Daemons().Last().Pid;
+    var (shutdown, shutdownExit) = RunWithExit("dotnet", "build-server shutdown --vbcscompiler", check: false, timeout: TimeSpan.FromMinutes(1));
+    if (shutdownExit != 0 || Held(pipe) || PipeAnswers(pipe) || !Running(daemon)
+        || !LogSince(mark).Contains("compiler server: shutdown request") || !LogSince(mark).Contains($"compiler server: gave up {pipe}"))
+        Fail($"dotnet build-server shutdown: expected it to succeed and the daemon to give the pipe up and keep running, got exit code {shutdownExit}:\n{shutdown}\n{LogSince(mark)}");
+    mark = LogMark();
+    var compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
+    if (!lib.All(unit => compiles.GetValueOrDefault(unit) == "server: server processed compilation") || Served(LogSince(mark)).Count > 0 || !Held(pipe))
+        Fail($"dotnet build after dotnet build-server shutdown: expected the SDK's server to answer every compile, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
+
+    mark = LogMark();
+    Run(blaze, "build");
+    var log = LogSince(mark);
+    if (!Regex.IsMatch(log, $@"compiler server: another server holds {Regex.Escape(pipe)}; asked it to shut down: shutting down \(pid \d+\)") || !log.Contains($"compiler server: listening on {pipe},"))
+        Fail($"blaze-cs build with VBCSCompiler on the pipe: expected the daemon to have it shut down and take the pipe:\n{log}");
+    mark = LogMark();
+    compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
+    if (!Served(LogSince(mark)).SetEquals(lib) || !compiles.Keys.ToHashSet().SetEquals(lib))
+        Fail($"dotnet build after the daemon took the pipe back: expected it to answer Lib's compiles, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
+    var kept = LiveHosts();
+    if (live.Any(host => !kept.ContainsKey(host.Key)))
+        Fail($"pipe handover: expected the live test hosts ({string.Join(", ", live.Select(h => $"{h.Value} (pid {h.Key})"))}) still up, got {string.Join(", ", kept.Select(h => $"{h.Value} (pid {h.Key})"))}:\n{ReadLog("daemon.log")}");
+    Console.WriteLine($"ok  dotnet build-server shutdown: exit 0; the daemon gave the pipe up and kept running, dotnet build started VBCSCompiler on it, and the next blaze-cs build took it back{(live.Count > 0 ? $"; the {live.Count} test hosts live for hot reload stayed up through it" : "")}");
+
+    Run(blaze, "stop");
+    if (Held(pipe) || PipeAnswers(pipe))
+        Fail("blaze-cs stop: expected the pipe free");
+    compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
+    if (!lib.All(unit => compiles.GetValueOrDefault(unit) == "server: server processed compilation") || !Held(pipe))
+        Fail($"dotnet build after blaze-cs stop: expected it to start the SDK's server on the pipe, got:\n{Compiles(compiles)}");
+    Console.WriteLine("ok  blaze-cs stop: the daemon gave the pipe up, and dotnet build started VBCSCompiler on it");
+    Verify("builds through VBCSCompiler", [], "VBCSCompiler");
+
+    // The next daemon finds that VBCSCompiler on the pipe at its start and has it shut down before it listens.
+    mark = LogMark();
+    Run(blaze, "build");
+    log = LogSince(mark);
+    if (Regex.Match(log, $@"compiler server: another server holds {Regex.Escape(pipe)}; asked it to shut down: shutting down \(pid (\d+)\)") is not { Success: true } shutDown
+        || Running(int.Parse(shutDown.Groups[1].Value)) || !log.Contains($"compiler server: listening on {pipe},"))
+        Fail($"daemon start with VBCSCompiler on the pipe: expected it shut down and the pipe taken:\n{log}");
+    WarmedUpIdentical("after the pipe handover", Run(blaze, "build"));
+    mark = LogMark();
+    compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
+    if (!Served(LogSince(mark)).SetEquals(lib) || !compiles.Keys.ToHashSet().SetEquals(lib))
+        Fail($"dotnet build after a daemon start took the pipe: expected the daemon to answer Lib's compiles, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
+    Console.WriteLine($"ok  daemon start: it shut down VBCSCompiler (pid {shutDown.Groups[1].Value}), which a build had started on the pipe, and answered the next build's compiles");
+    Verify("pipe taken over at daemon start", [], "the daemon's pipe");
+}
+
+// With BLAZE_CS_COMPILER_SERVER=0 the daemon has no pipe; without it, the next daemon has it again.
 void ServerTurnedOff(string pipe)
 {
     Run(blaze, "stop");
-    var output = Run(blaze, "build", environment: new() { ["BLAZE_CS_COMPILER_SERVER"] = "0" });
-    if (output.Contains("SharedCompilationId") || PipeAnswers(pipe) || !ReadLog("daemon.log").Contains("compiler server off"))
-        Fail($"pipe turned off: expected no pipe named or listening:\n{output}");
+    var mark = LogMark();
+    Run(blaze, "build", environment: new() { ["BLAZE_CS_COMPILER_SERVER"] = "0" });
+    var log = LogSince(mark);
+    if (!log.Contains("compiler server off") || log.Contains("compiler server: listening on"))
+        Fail($"pipe turned off: expected the daemon not to listen:\n{log}");
     Run(blaze, "stop");
-    output = Run(blaze, "build");
-    if (PipeName(output) != pipe || !PipeAnswers(pipe))
-        Fail($"pipe back on: expected the daemon to name and listen on {pipe} again:\n{output}");
+    mark = LogMark();
+    Run(blaze, "build");
+    if (DaemonPipe("pipe back on", mark) != pipe || !PipeAnswers(pipe))
+        Fail($"pipe back on: expected the daemon to listen on {pipe} again:\n{LogSince(mark)}");
     Console.WriteLine("ok  BLAZE_CS_COMPILER_SERVER=0: the daemon had no pipe; the next one listened again");
 }
 
@@ -1511,7 +1705,8 @@ void HostsStopWithTheDaemon()
     IdleHosts("after a new daemon started");
     var daemon = Process.GetProcessById(Daemons().Last().Pid);
     daemon.Kill();
-    daemon.WaitForExit();
+    if (!daemon.WaitForExit(TimeSpan.FromSeconds(30)))
+        Fail($"the killed daemon {daemon.Id} still ran after 30 s");
     NoHostsLeft("the daemon being killed");
 }
 
@@ -1868,7 +2063,7 @@ static int TestCount(string project) => project switch { "Tests" => 6, "Componen
 string Verify(string name, HashSet<string> rebuilt, string? fallback)
 {
     var ours = Outputs();
-    var build = Run("dotnet", "build Fixture.slnx -nologo -v:q -clp:NoSummary --no-incremental");
+    var build = Run("dotnet", $"build Fixture.slnx -nologo -v:q -clp:NoSummary --no-incremental -p:SharedCompilationId={referenceServer}");
     var theirs = Outputs();
     if (!ours.Keys.ToHashSet().SetEquals(theirs.Keys))
         Fail($"{name}: output sets differ: {string.Join(", ", ours.Keys.ToHashSet().Except(theirs.Keys).Union(theirs.Keys.Except(ours.Keys)))}");
@@ -1901,15 +2096,25 @@ Dictionary<string, byte[]> Outputs() =>
 string Run(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null) =>
     RunWithExit(file, arguments, check, environment).Output;
 
-(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null)
+(string Output, int ExitCode) RunWithExit(string file, string arguments, bool check = true, Dictionary<string, string>? environment = null, TimeSpan? timeout = null)
 {
     var start = new ProcessStartInfo(file, arguments) { WorkingDirectory = work, RedirectStandardOutput = true, RedirectStandardError = true };
     foreach (var (name, value) in environment ?? [])
         start.Environment[name] = value;
     using var process = Process.Start(start)!;
+    var stdout = process.StandardOutput.ReadToEndAsync();
     var stderr = process.StandardError.ReadToEndAsync();
-    var output = process.StandardOutput.ReadToEnd() + stderr.Result;
-    process.WaitForExit();
+    // No step waits forever: one that hangs (a client waiting on a server that never answers) fails the check.
+    var limit = timeout ?? CommandTimeout();
+    if (!process.WaitForExit(limit))
+    {
+        try { process.Kill(entireProcessTree: true); }
+        catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+        var partial = (stdout.Wait(TimeSpan.FromSeconds(10)) ? stdout.Result : "") + (stderr.Wait(TimeSpan.FromSeconds(10)) ? stderr.Result : "");
+        Fail($"{file} {arguments} still ran after {limit}; killed it:\n{partial}");
+    }
+    // A process it started (a daemon, an MSBuild node) may hold the output open: what came by then is enough.
+    var output = (stdout.Wait(TimeSpan.FromSeconds(30)) ? stdout.Result : "") + (stderr.Wait(TimeSpan.FromSeconds(30)) ? stderr.Result : "");
     if (file == blaze && arguments.StartsWith("test", StringComparison.Ordinal))
     {
         hotReloadedBefore = hotReloaded;
@@ -1919,6 +2124,9 @@ string Run(string file, string arguments, bool check = true, Dictionary<string, 
         Fail($"{file} {arguments} exited {process.ExitCode}:\n{output}");
     return (output, process.ExitCode);
 }
+
+// The longest any one command of the check may take (a cold first load on a slow CI machine takes about a minute).
+static TimeSpan CommandTimeout() => TimeSpan.FromMinutes(10);
 
 static void CopyFixture(string from, string to)
 {

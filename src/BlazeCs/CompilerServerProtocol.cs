@@ -74,9 +74,9 @@ sealed record ServerRequest(string RequestId, RequestLanguage Language, string C
         return new ServerRequest(requestId, RequestLanguage.CSharpCompile, compilerHash, all);
     }
 
-    /// <summary>The request `dotnet build-server shutdown` sends (BuildRequest.CreateShutdown).</summary>
-    public static ServerRequest Shutdown(string compilerHash) =>
-        new("", RequestLanguage.CSharpCompile, compilerHash, [new(ArgumentId.Shutdown, 0, "")]);
+    /// <summary>The request `dotnet build-server shutdown` sends (BuildRequest.CreateShutdown), with its id.</summary>
+    public static ServerRequest Shutdown(string compilerHash, string requestId = "") =>
+        new(requestId, RequestLanguage.CSharpCompile, compilerHash, [new(ArgumentId.Shutdown, 0, "")]);
 
     public static ServerRequest Read(Stream stream)
     {
@@ -242,6 +242,14 @@ static class ServerMessage
         BitConverter.TryWriteBytes(bytes.AsSpan(0, 4), bytes.Length - 4);
         stream.Write(bytes);
         stream.Flush();
+    }
+
+    /// <summary>A whole message as it came, its length included: what a proxy passes on unread.</summary>
+    public static byte[] ReadMessage(Stream stream)
+    {
+        var length = ReadExactly(stream, 4);
+        var body = ReadExactly(stream, checked((int)BitConverter.ToUInt32(length)));
+        return [.. length, .. body];
     }
 
     public static byte[] ReadExactly(Stream stream, int count)
