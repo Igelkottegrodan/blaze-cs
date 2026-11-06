@@ -11,6 +11,14 @@ namespace BlazeCs;
 sealed record EmitOutput(byte[] Assembly, byte[]? Pdb, byte[]? Documentation, byte[]? ReferenceAssembly);
 
 /// <summary>
+/// What a unit's last prepared compilation was made of: its syntax trees, generated ones included, its
+/// references and options. Hot reload (HotReload.cs) gives the Edit and Continue engine these, not the
+/// compilation, which would keep its symbols alive.
+/// </summary>
+sealed record UnitSources(string AssemblyName, IReadOnlyList<SyntaxTree> Trees, IReadOnlyList<MetadataReference> References,
+    CompilationOptions Options, ParseOptions ParseOptions);
+
+/// <summary>
 /// One compile unit kept warm: parsed syntax trees, its Roslyn compilation and the generator driver's
 /// caches. Built from csc's own arguments so that what it emits matches what csc would emit.
 /// </summary>
@@ -48,6 +56,10 @@ sealed class ProjectCompiler
     object _version = new();
 
     public CompileUnit Unit { get; }
+    /// <summary>What the last <see cref="Prepare"/> compiled from: after a build, what the assembly on disk was compiled from.</summary>
+    public UnitSources? Sources { get; private set; }
+    /// <summary>Compiled without optimizations, so the runtime can apply updates to it (hot reload).</summary>
+    public bool Debug => _args.CompilationOptions.OptimizationLevel == OptimizationLevel.Debug;
     /// <summary>How long the last Emit spent in source generators (the rest is binding and emit).</summary>
     public TimeSpan LastGeneratorTime { get; private set; }
     public string AssemblyPath { get; }
@@ -479,6 +491,8 @@ sealed class ProjectCompiler
                 .Select(tree => EmbeddedText.FromSource(tree.FilePath, tree.GetText(cancellationToken))));
         }
         LastGeneratorTime = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+        Sources = new UnitSources(compilation.AssemblyName!, [.. compilation.SyntaxTrees], [.. compilation.References],
+            compilation.Options, _args.ParseOptions);
         return new Prepared(compilation, embeddedTexts, generatorDiagnostics);
     }
 

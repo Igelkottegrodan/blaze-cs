@@ -138,6 +138,29 @@ public class HotReloadTests
         Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the host should exit after an unreadable line");
     }
 
+    // A test project's tests may not have loaded every assembly they run with when an edit comes (here, a library
+    // the tests load by name, only once a gate file exists). The delta names its baseline, which the host loads
+    // before it applies the delta: the file the tests would load later is the edited build, which no delta fits.
+    [Fact]
+    public void ADeltaForAnAssemblyTheTestsHaveNotLoadedLoadsItsBaselineFirst()
+    {
+        using var subject = new Subject("xunit3", answerInLibrary: true);
+        using var host = new Host(hotReload: true);
+        var pid = host.Process.Id;
+
+        var first = host.Send(subject.Run);
+        Assert.Equal((1, 0, 1), (first.Total, first.Passed, first.Failed));
+        Assert.Null(first.CannotHotReload);
+
+        subject.OpenGate();
+        var second = host.Send(new TestHostUpdate([subject.Fix()]));
+        Assert.Null(second.Unsupported);
+        Assert.Equal((1, 1, 0), (second.Total, second.Passed, second.Failed));
+        Assert.Null(second.CannotHotReload);
+        Assert.False(host.Process.HasExited);
+        Assert.Equal(pid, host.Process.Id);
+    }
+
     /// <summary>A test host process, as the daemon starts one, with or without the runtime's switch for updates.</summary>
     sealed class Host : IDisposable
     {
@@ -182,7 +205,10 @@ public class HotReloadTests
 
     /// <summary>
     /// A test assembly in a framework, written over a copy of its kit's own: a test that passes, and one that
-    /// fails until <see cref="Fix"/>'s delta makes Answer.Value return 42.
+    /// fails until <see cref="Fix"/>'s delta makes Answer.Value return 42. With answerInLibrary (xUnit v3 only),
+    /// Answer is in AnswerLib, a library the test assembly doesn't reference: its one test, which fails, loads it
+    /// by name once <see cref="OpenGate"/> was called, and reads 0 until then. AnswerLib's build is in a
+    /// directory of its own (<see cref="Baseline"/>), where no resolver finds it, as a snapshot of the daemon's.
     /// </summary>
     sealed class Subject : IDisposable
     {
@@ -191,9 +217,10 @@ public class HotReloadTests
         readonly CSharpCompilation _compilation;
         readonly EmitBaseline _baseline;
         readonly Guid _module;
+        readonly Func<int, string> _source;
 
         /// <param name="extraTest">A third test in the test class, in the framework's attributes.</param>
-        public Subject(string framework, string extraTest = "")
+        public Subject(string framework, string extraTest = "", bool answerInLibrary = false)
         {
             (_framework, _extraTest) = (framework, extraTest);
             var kit = framework switch { "xunit3" => "XunitV3Kit", "nunit" => "NUnitKit", "mstest" => "MSTestKit", _ => throw new ArgumentOutOfRangeException(nameof(framework)) };
@@ -208,35 +235,58 @@ public class HotReloadTests
             var frameworkNames = runtime.Select(Path.GetFileName).ToHashSet();
             var packages = Directory.EnumerateFiles(kitDirectory, "*.dll")
                 .Where(path => Path.GetFileName(path) is var name && name != kit + ".dll" && !frameworkNames.Contains(name));
-            _compilation = CSharpCompilation.Create(kit, [Parse(Source(41))],
-                [.. runtime.Concat(packages).Select(path => MetadataReference.CreateFromFile(path))],
-                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Debug));
+            MetadataReference[] references = [.. runtime.Concat(packages).Select(path => MetadataReference.CreateFromFile(path))];
+            var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Debug);
+            if (!answerInLibrary)
+            {
+                _source = Source;
+                _compilation = CSharpCompilation.Create(kit, [Parse(Source(41))], references, options);
+                (_module, _baseline) = Emit(_compilation, AssemblyPath);
+                return;
+            }
+            Assert.Equal("xunit3", framework);
+            _source = AnswerSource;
+            _compilation = CSharpCompilation.Create("AnswerLib", [Parse(AnswerSource(41))], references, options);
+            Baseline = Path.Combine(_directory.FullName, "baseline", "AnswerLib.dll");
+            Directory.CreateDirectory(Path.GetDirectoryName(Baseline)!);
+            (_module, _baseline) = Emit(_compilation, Baseline);
+            Emit(CSharpCompilation.Create(kit, [Parse(GatedTestsSource)], references, options), AssemblyPath);
+        }
 
+        /// <summary>Writes a compilation's assembly and PDB, and returns its module version id and a baseline for deltas.</summary>
+        static (Guid Module, EmitBaseline Baseline) Emit(CSharpCompilation compilation, string path)
+        {
             using var image = new MemoryStream();
             using var pdb = new MemoryStream();
-            var emitted = _compilation.Emit(image, pdb, options: new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb));
+            var emitted = compilation.Emit(image, pdb, options: new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb));
             Assert.True(emitted.Success, string.Join("\n", emitted.Diagnostics));
-            File.WriteAllBytes(AssemblyPath, image.ToArray());
-            File.WriteAllBytes(Path.ChangeExtension(AssemblyPath, ".pdb"), pdb.ToArray());
+            File.WriteAllBytes(path, image.ToArray());
+            File.WriteAllBytes(Path.ChangeExtension(path, ".pdb"), pdb.ToArray());
 
             var reader = new PEReader(ImmutableArray.Create(image.ToArray()));
             var metadata = reader.GetMetadataReader();
-            _module = metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
-            _baseline = EmitBaseline.CreateInitialBaseline(_compilation, ModuleMetadata.CreateFromImage(image.ToArray()),
+            return (metadata.GetGuid(metadata.GetModuleDefinition().Mvid), EmitBaseline.CreateInitialBaseline(compilation, ModuleMetadata.CreateFromImage(image.ToArray()),
                 debugInformationProvider: _ => default, // Answer.Value has no locals or lambdas to map
                 localSignatureProvider: method => metadata.GetMethodDefinition(method).RelativeVirtualAddress is var rva and > 0
                     ? reader.GetMethodBody(rva).LocalSignature : default,
-                hasPortableDebugInformation: true);
+                hasPortableDebugInformation: true));
         }
 
         public string AssemblyPath { get; }
+
+        /// <summary>With answerInLibrary, the build of AnswerLib the delta is made against; otherwise null.</summary>
+        public string? Baseline { get; }
+
+        /// <summary>Lets the test load AnswerLib from now on.</summary>
+        public void OpenGate() => File.WriteAllText(Path.Combine(_directory.FullName, "gate"), "");
+
 
         public TestHostRequest Run => new(_framework, AssemblyPath, null);
 
         /// <summary>The delta that makes Answer.Value return 42, as the daemon would send it.</summary>
         public TestHostDelta Fix()
         {
-            var fixedCompilation = _compilation.ReplaceSyntaxTree(_compilation.SyntaxTrees.Single(), Parse(Source(42)));
+            var fixedCompilation = _compilation.ReplaceSyntaxTree(_compilation.SyntaxTrees.Single(), Parse(_source(42)));
             ISymbol Value(Compilation compilation) => compilation.GetTypeByMetadataName("Answer")!.GetMembers("Value").Single();
             using var metadata = new MemoryStream();
             using var il = new MemoryStream();
@@ -246,8 +296,30 @@ public class HotReloadTests
                 _ => false, metadata, il, pdb, EmitDifferenceOptions.Default, TestContext.Current.CancellationToken);
             Assert.True(result.Success, string.Join("\n", result.Diagnostics));
             return new TestHostDelta(_module, metadata.ToArray(), il.ToArray(), pdb.ToArray(),
-                [.. result.ChangedTypes.Select(type => MetadataTokens.GetToken(type))]);
+                [.. result.ChangedTypes.Select(type => MetadataTokens.GetToken(type))], Baseline);
         }
+
+        static string AnswerSource(int answer) => $$"""
+            public static class Answer
+            {
+                public static int Value() => {{answer}};
+            }
+            """;
+
+        const string GatedTestsSource = """
+            using System;
+            using System.IO;
+            using Xunit;
+
+            public class AnswerTests
+            {
+                static int Answer() => File.Exists(Path.Combine(Path.GetDirectoryName(typeof(AnswerTests).Assembly.Location)!, "gate"))
+                    ? (int)Type.GetType("Answer, AnswerLib", throwOnError: true)!.GetMethod("Value")!.Invoke(null, null)!
+                    : 0;
+
+                [Fact] public void IsFortyTwo() => Assert.Equal(42, Answer());
+            }
+            """;
 
         static SyntaxTree Parse(string source) => CSharpSyntaxTree.ParseText(source, path: "Answer.cs", encoding: System.Text.Encoding.UTF8);
 

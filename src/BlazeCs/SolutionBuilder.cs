@@ -68,6 +68,12 @@ sealed partial class SolutionBuilder
 
     public IReadOnlyList<ProjectCompiler> Units => _units;
 
+    /// <summary>The SDK whose compiler the daemon runs, and whose dotnet-watch has the hot reload engine.</summary>
+    public string SdkDirectory => _sdkDirectory;
+
+    /// <summary>The daemon's directory next to the solution, .blaze-cs.</summary>
+    public string StateDirectory => _stateDirectory;
+
     /// <summary>
     /// The .runsettings `dotnet test` applies to a unit's project: its evaluated RunSettingsFilePath at the
     /// last build, wherever the build got it (the project, a Directory.Build.props); null if it sets none.
@@ -235,6 +241,35 @@ sealed partial class SolutionBuilder
 
     /// <summary>A warm-up's report, and whether it found cached arguments stale.</summary>
     sealed record WarmedUp(List<string> Lines, bool Stale);
+
+    /// <summary>
+    /// Runs an action once each unit holds what its assembly on disk was compiled from: now, or, while the
+    /// first load's warm-up runs, after it (and before the next command touches the units, which waits for
+    /// it). Skipped if the warm-up fails or calls for another load. The action's own errors go to the log.
+    /// </summary>
+    public void WhenSettled(Action action)
+    {
+        void Run()
+        {
+            try { action(); }
+            catch (Exception e) { Console.WriteLine($"{DateTime.Now:O} {e}"); }
+        }
+        if (_warmUp is { } warmUp)
+        {
+            _warmUp = warmUp.ContinueWith(done =>
+            {
+                if (done.IsCompletedSuccessfully && !done.Result.Stale)
+                    Run();
+                return done;
+            }, TaskScheduler.Default).Unwrap();
+        }
+        else if (_reload is null)
+            Run();
+    }
+
+    /// <summary>Whether a unit's assembly on disk is the one its sources compile to, as the daemon last wrote or verified it.</summary>
+    public bool Reproduces(ProjectCompiler unit) =>
+        _published.TryGetValue(unit.AssemblyPath, out var last) && Holds(unit.AssemblyPath, last.Bytes);
 
     /// <summary>The load that warm-up called for, run by each command until it succeeds, as the first load is.</summary>
     Func<Action<string>, bool>? _reload;
@@ -867,11 +902,14 @@ sealed partial class SolutionBuilder
     /// The solution's assemblies a test project runs with: its own, and every unit's that MSBuild copied
     /// next to it.
     /// </summary>
-    public IEnumerable<string> RuntimeClosure(ProjectCompiler unit)
+    public IEnumerable<string> RuntimeClosure(ProjectCompiler unit) => RuntimeUnits(unit).Select(loaded => loaded.Path);
+
+    /// <summary>The units in a test project's runtime closure, each with the path its assembly runs from.</summary>
+    public IEnumerable<(ProjectCompiler Unit, string Path)> RuntimeUnits(ProjectCompiler unit)
     {
         var directory = Path.GetDirectoryName(InstalledPath(unit));
-        return _units.SelectMany(u => Closure(u.AssemblyPath))
-            .Where(path => PathComparer.Instance.Equals(Path.GetDirectoryName(path), directory));
+        return _units.SelectMany(u => Closure(u.AssemblyPath).Select(path => (Unit: u, Path: path)))
+            .Where(loaded => PathComparer.Instance.Equals(Path.GetDirectoryName(loaded.Path), directory));
     }
 
     /// <summary>A path and every place MSBuild copies it to, transitively.</summary>
