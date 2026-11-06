@@ -150,7 +150,7 @@ sealed class SolutionBuilder
         foreach (var gone in held.Values.Except(compilers))
         {
             foreach (var path in new[] { gone.AssemblyPath, gone.PdbPath, gone.ReferenceAssemblyPath }.OfType<string>())
-                _published.TryRemove(path, out _);
+                _published.Forget(path);
         }
 
         // A kept unit needs no compile to be trusted while its assembly on disk is still the bytes the
@@ -160,7 +160,7 @@ sealed class SolutionBuilder
         bool NeedsCompile(ProjectCompiler unit) =>
             !kept.Contains(unit)
             || (unit.Realign() | unit.RefreshReferences()) // both run; each brings the unit up to date
-            || !(_published.TryGetValue(unit.AssemblyPath, out var last) && Holds(unit.AssemblyPath, last.Bytes));
+            || !_published.HoldsLast(unit.AssemblyPath);
         var verify = _units.AsParallel().Where(NeedsCompile).ToList();
 
         log($"blaze-cs: loaded {_units.Count} projects in {stopwatch.ElapsedMilliseconds} ms (build log {read} ms"
@@ -268,7 +268,7 @@ sealed class SolutionBuilder
             var (output, diagnostics) = unit.Emit(prepared);
             if (output is null)
                 mismatches[unit] = $"{unit.Unit.Name}: {diagnostics.First(d => d.Severity == DiagnosticSeverity.Error)}";
-            else if (!Holds(unit.AssemblyPath, output.Assembly))
+            else if (!_published.Holds(unit.AssemblyPath, output.Assembly))
                 mismatches[unit] = $"{unit.Unit.Name}: emitted assembly differs from {unit.AssemblyPath}";
         });
         log($"blaze-cs: warmed up in {stopwatch.ElapsedMilliseconds} ms; {_units.Count - mismatches.Count}/{_units.Count} assemblies identical to dotnet build"
@@ -619,7 +619,8 @@ sealed class SolutionBuilder
     /// <summary>Writes an output and its copies, unless it already holds these bytes.</summary>
     void Write(string path, byte[] bytes)
     {
-        if (Holds(path, bytes))
+        var content = OutputContent.Of(bytes);
+        if (_published.Holds(path, content))
             return;
         void Replace(string target)
         {
@@ -632,31 +633,11 @@ sealed class SolutionBuilder
         // partway is done again in full.
         Parallel.ForEach(Closure(path).Skip(1), Replace);
         Replace(path);
-        var info = new FileInfo(path);
-        _published[path] = new Published(bytes, info.Length, info.LastWriteTimeUtc);
+        _published.Wrote(path, content);
     }
 
-    /// <summary>
-    /// Whether a file holds these bytes. The disk is only read when something else wrote the file since
-    /// the daemon last wrote or verified it; if it holds them, that is remembered with the file's stamp.
-    /// </summary>
-    bool Holds(string path, byte[] bytes)
-    {
-        var info = new FileInfo(path);
-        if (!info.Exists)
-            return false;
-        if (_published.TryGetValue(path, out var last) && last.Length == info.Length && last.Modified == info.LastWriteTimeUtc)
-            return last.Bytes.AsSpan().SequenceEqual(bytes);
-        if (info.Length != bytes.Length || !File.ReadAllBytes(path).AsSpan().SequenceEqual(bytes))
-            return false;
-        _published[path] = new Published(bytes, info.Length, info.LastWriteTimeUtc);
-        return true;
-    }
-
-    /// <summary>What the daemon last wrote to or verified in each file, with the file's stamp as of then.</summary>
-    readonly ConcurrentDictionary<string, Published> _published = new(PathComparer.Instance);
-
-    sealed record Published(byte[] Bytes, long Length, DateTime Modified);
+    /// <summary>What the daemon last wrote to or verified in each output file.</summary>
+    readonly PublishedOutputs _published = new();
 
     /// <summary>Where the build puts a unit's assembly for running: its copy in the project's bin/.</summary>
     public string InstalledPath(ProjectCompiler unit)

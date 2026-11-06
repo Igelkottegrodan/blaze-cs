@@ -179,6 +179,7 @@ try
     WarmUpAfterFirstCommand();
     DaemonLifecycle();
     ParentFails();
+    TouchedOutputLeftAlone();
     StopThenCommandAtOnce();
     HostsStopWithTheDaemon();
     passed = true;
@@ -684,6 +685,24 @@ void ParentFails()
     Verify("failing write in Lib, fixed", rebuilt, null);
 }
 
+// An output something else touched without changing its bytes, here the reference assembly csc writes for Lib
+// (/refout:, obj/.../refint/), is compared on disk with what the next build emits for it and, still holding
+// those bytes, is not written again: its stamp stays the one it was touched to.
+void TouchedOutputLeftAlone()
+{
+    var reference = Directory.EnumerateFiles(Path.Combine(work, "Lib", "obj"), "Lib.dll", SearchOption.AllDirectories)
+        .Single(p => Path.GetFileName(Path.GetDirectoryName(p)) == "refint" && Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(p))) == "net10.0");
+    var bytes = File.ReadAllBytes(reference);
+    var touched = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+    File.SetLastWriteTimeUtc(reference, touched);
+    Replace("Lib/Greeter.cs", "Twice(int amount) => amount + amount", "Twice(int amount) => amount * 2");
+    var rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(lib))
+        Fail($"touched reference assembly: expected blaze-cs to rebuild {string.Join(", ", lib)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+    if (File.GetLastWriteTimeUtc(reference) != touched || !File.ReadAllBytes(reference).AsSpan().SequenceEqual(bytes))
+        Fail($"touched reference assembly: expected blaze-cs to leave {Path.GetRelativePath(work, reference)} as it was, stamp {touched:O}; it is stamped {File.GetLastWriteTimeUtc(reference):O}");
+    Verify("touched reference assembly, body in Lib", rebuilt, null);
+}
 
 // With every test skipped, the warm host's summary reads like dotnet test's for each framework: "Skipped!"
 // and the same counts. The xUnit v3 project keeps its explicit test, which neither counts.
