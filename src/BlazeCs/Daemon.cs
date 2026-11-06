@@ -90,6 +90,8 @@ static class Daemon
                 if (!loaded)
                 {
                     loaded = builder.Load(Log, warmUpLater: true);
+                    if (loaded)
+                        tests.Prestart();
                     exitCode = !loaded ? 1 : request?.Command switch
                     {
                         "build" => 0,
@@ -106,6 +108,9 @@ static class Daemon
                         _ => 2,
                     };
                 }
+                // A build may have reloaded the solution, and a run took hosts.
+                if (loaded)
+                    tests.Prestart();
             }
             catch (Exception e)
             {
