@@ -1,7 +1,5 @@
-using System.Text.RegularExpressions;
-using Microsoft.Build.Logging.StructuredLogger;
+using System.Text.Json;
 using Microsoft.CodeAnalysis;
-using MSBuildTask = Microsoft.Build.Logging.StructuredLogger.Task;
 
 namespace BlazeCs;
 
@@ -27,59 +25,39 @@ sealed record CompileUnit(string Name, string ProjectFile, string ProjectDirecto
             : null;
 }
 
-/// <summary>What the daemon learns from a `dotnet build -bl` binlog.</summary>
+/// <summary>What the daemon learns from a `dotnet build` that ran with blaze-cs-logger.</summary>
 /// <param name="Units">The csc invocations that ran: an incremental build runs csc only where something changed.</param>
 /// <param name="Compiled">Every C# project (or target framework of one) the build ran CoreCompile for, whether csc ran
 /// or the target was up to date, as <see cref="CompileUnit.Key"/>: the units the solution builds.</param>
 /// <param name="Copies">Every file copy MSBuild made or confirmed up to date, source to destination.</param>
 sealed record BuildLogInfo(IReadOnlyList<CompileUnit> Units, IReadOnlySet<string> Compiled, IReadOnlyList<(string From, string To)> Copies);
 
-static partial class BuildLog
+static class BuildLog
 {
-    public static BuildLogInfo Read(string binlogPath, string sdkDirectory)
-    {
-        var build = BinaryLog.ReadBuild(binlogPath);
-        if (!build.Succeeded)
-            throw new InvalidOperationException($"The build in {binlogPath} failed");
+    /// <summary>The `dotnet build` switch that makes it write the file <see cref="Read"/> reads.</summary>
+    public static string LoggerSwitch(string path) =>
+        $"\"-logger:BlazeCs.Logger.CompileLogger,{Path.Combine(AppContext.BaseDirectory, "blaze-cs-logger.dll")};{path}\"";
 
+    public static BuildLogInfo Read(string path, string sdkDirectory)
+    {
+        var record = JsonSerializer.Deserialize<BuildRecord>(File.ReadAllText(path))
+            ?? throw new InvalidOperationException($"{path} is empty");
         // What belongs to the SDK is compared by real path: in a dotnet root assembled from symlinks (nix,
         // or one combining two SDKs) `dotnet --list-sdks` names the link, while MSBuild loads its targets
         // from where the link points.
         var realPaths = new Dictionary<string, string>(PathComparer.Instance);
         var dotnetRoot = Path.GetDirectoryName(Path.GetDirectoryName(RealPath(sdkDirectory, realPaths)))!;
-        var units = new List<CompileUnit>();
-        var compiled = new HashSet<string>(PathComparer.Instance);
-        var copies = new List<(string, string)>();
-        foreach (var project in build.FindChildrenRecursive<Project>())
-        {
-            // A project shows up once per MSBuild invocation (restore, build, each target framework);
-            // only invocations that ran their own targets matter here.
-            var targets = project.Children.OfType<Target>().ToList();
-            var projectDirectory = Path.GetDirectoryName(project.ProjectFile)!;
-
-            foreach (var task in targets.SelectMany(t => t.Children.OfType<MSBuildTask>()))
-            {
-                if (task.Name is "Copy" or "CopyRefAssembly")
-                    copies.AddRange(CopiesOf(task, projectDirectory));
-            }
-
-            var name = Path.GetFileNameWithoutExtension(project.ProjectFile)
-                + (string.IsNullOrEmpty(project.TargetFramework) ? "" : $" ({project.TargetFramework})");
-            // Skipped as up to date, CoreCompile still has its node: that is how a project csc didn't run for shows.
-            if (targets.Any(t => t.Name == "CoreCompile" && t.SourceFilePath?.EndsWith("Microsoft.CSharp.Core.targets", PathComparer.Comparison) == true))
-                compiled.Add(CompileUnit.KeyOf(project.ProjectFile, name));
-
-            var csc = targets.Where(t => t.Name == "CoreCompile")
-                .SelectMany(t => t.Children.OfType<MSBuildTask>())
-                .FirstOrDefault(t => t.Name == "Csc");
-            if (csc?.CommandLineArguments is not { } commandLine)
-                continue;
-
-            var unit = new CompileUnit(name, project.ProjectFile, projectDirectory, CompilerArguments(commandLine), null);
-            units.Add(unit with { SlowPathReason = SlowPathReason(targets, unit.AssemblyPath, dotnetRoot, realPaths) });
-        }
-        return new BuildLogInfo(units, compiled, copies);
+        var units = record.Compiles.Select(compile =>
+            new CompileUnit(UnitName(compile.ProjectFile, compile.TargetFramework), compile.ProjectFile,
+                Path.GetDirectoryName(compile.ProjectFile)!, CompilerArguments(compile.CommandLine),
+                SlowPathReason(compile.AfterCompile, dotnetRoot, realPaths)));
+        var compiled = record.Compiled.Select(p => CompileUnit.KeyOf(p.ProjectFile, UnitName(p.ProjectFile, p.TargetFramework)));
+        return new BuildLogInfo([.. units], compiled.ToHashSet(PathComparer.Instance), [.. record.Copies.Select(c => (c.From, c.To))]);
     }
+
+    /// <summary>A unit's name: the project's, and the target framework it was built for, if it was given one.</summary>
+    static string UnitName(string projectFile, string? targetFramework) =>
+        Path.GetFileNameWithoutExtension(projectFile) + (string.IsNullOrEmpty(targetFramework) ? "" : $" ({targetFramework})");
 
     /// <summary>csc's arguments without the compiler executable in front.</summary>
     static string[] CompilerArguments(string commandLine)
@@ -93,24 +71,11 @@ static partial class BuildLog
     /// A task outside the SDK that runs after CoreCompile and is handed the freshly compiled assembly
     /// is a post-compile rewrite (Fody, XAML compilers). SDK targets only read it.
     /// </summary>
-    static string? SlowPathReason(List<Target> targets, string output, string dotnetRoot, Dictionary<string, string> realPaths)
-    {
-        var afterCompile = targets.SkipWhile(t => t.Name != "CoreCompile").Skip(1);
-        foreach (var target in afterCompile)
-        {
-            if (target.SourceFilePath is { } file
-                && RealPath(file, realPaths).StartsWith(dotnetRoot + Path.DirectorySeparatorChar, PathComparer.Comparison))
-                continue;
-            foreach (var task in target.Children.OfType<MSBuildTask>())
-            {
-                var mentionsAssembly = task.FindChildrenRecursive<BaseNode>()
-                    .Any(n => n.ToString() is { } text && text.Contains(output, PathComparer.Comparison));
-                if (mentionsAssembly)
-                    return $"target {target.Name} ({task.Name}) rewrites the assembly after compile";
-            }
-        }
-        return null;
-    }
+    static string? SlowPathReason(IEnumerable<AfterCompileTask> afterCompile, string dotnetRoot, Dictionary<string, string> realPaths) =>
+        afterCompile.FirstOrDefault(t => t.TargetFile is not { } file
+                || !RealPath(file, realPaths).StartsWith(dotnetRoot + Path.DirectorySeparatorChar, PathComparer.Comparison)) is { } task
+            ? $"target {task.Target} ({task.Task}) rewrites the assembly after compile"
+            : null;
 
     /// <summary>The full path with every symlink in it resolved, as realpath(3) does; memoized in
     /// <paramref name="resolved"/>.</summary>
@@ -127,28 +92,4 @@ static partial class BuildLog
             real = RealPath(target.FullName, resolved);
         return resolved[path] = real;
     }
-
-    static IEnumerable<(string, string)> CopiesOf(MSBuildTask task, string projectDirectory)
-    {
-        foreach (var message in task.FindChildrenRecursive<Message>())
-        {
-            var match = CopyMessage().Match(message.Text ?? "");
-            if (match.Success)
-                yield return (Path.GetFullPath(match.Groups[1].Value, projectDirectory),
-                    Path.GetFullPath(match.Groups[2].Value, projectDirectory));
-        }
-
-        // CopyRefAssembly logs no paths when the destination is already current.
-        if (task.Name == "CopyRefAssembly"
-            && task.FindChildrenRecursive<Property>(p => p.Name == "SourcePath").FirstOrDefault() is { } source
-            && task.FindChildrenRecursive<Property>(p => p.Name == "DestinationPath").FirstOrDefault() is { } destination)
-        {
-            yield return (Path.GetFullPath(source.Value, projectDirectory), Path.GetFullPath(destination.Value, projectDirectory));
-        }
-    }
-
-    // "Copying file from "a" to "b".", "Did not copy from file "a" to file "b" because ...",
-    // "Creating hard link to copy "a" to "b".", "Copying reference assembly from "a" to "b"."
-    [GeneratedRegex("""(?:from|copy) (?:file )?"([^"]+)" to (?:file )?"([^"]+)"[ .]""")]
-    private static partial Regex CopyMessage();
 }

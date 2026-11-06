@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>blaze-cs-logger</AssemblyName>
+    <RootNamespace>BlazeCs.Logger</RootNamespace>
+    <!-- Loaded into the MSBuild of the solution's `dotnet build`, which runs on .NET 10 or newer. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- MSBuild supplies its own Microsoft.Build.Framework at run time. -->
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.11.31" ExcludeAssets="runtime" PrivateAssets="all" />
+    <Compile Include="../BlazeCs/PathComparer.cs" Link="PathComparer.cs" />
+  </ItemGroup>
+</Project>

@@ -60,14 +60,14 @@ sealed class SolutionBuilder
     public bool Load(Action<string> log, bool fresh = false)
     {
         var cached = fresh ? [] : UnitsCache.Read();
-        var binlog = Path.Combine(_stateDirectory, "build.binlog");
-        var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly -bl:\"{binlog}\"" + (cached.Count == 0 ? " --no-incremental" : "");
+        var record = Path.Combine(_stateDirectory, "build.json");
+        var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly {BuildLog.LoggerSwitch(record)}" + (cached.Count == 0 ? " --no-incremental" : "");
         if (RunDotnet(arguments, log) != 0)
             return false;
         _retry = [];
 
         var stopwatch = Stopwatch.StartNew();
-        var info = BuildLog.Read(binlog, _sdkDirectory);
+        var info = BuildLog.Read(record, _sdkDirectory);
         var read = stopwatch.ElapsedMilliseconds;
         // An incremental build logs csc only for the projects it compiled, so the cache holds the rest. One
         // the build didn't run CoreCompile for any more (removed from the solution, a target framework
@@ -166,7 +166,7 @@ sealed class SolutionBuilder
             return Load(log, fresh: true);
         }
 
-        // The build log's tree and the images just read are garbage now, hundreds of MB per load. The
+        // The build log and the images just read are garbage now, hundreds of MB per load. The
         // server GC on many cores lets that pile up over several loads (jellyfin: 1.7 GB to 3.1 GB RSS)
         // before it collects; collected here, during a step MSBuild already made slow, it costs ~0.1 s.
         GC.Collect();

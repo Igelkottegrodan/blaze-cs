@@ -17,7 +17,13 @@
     <!-- Compiled against RoslynVersion (Directory.Build.props); at run time the daemon loads the Roslyn
          that ships with the solution's SDK (see SdkRoslyn), so its output matches csc byte for byte. -->
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="$(RoslynVersion)" ExcludeAssets="runtime" />
-    <PackageReference Include="MSBuild.StructuredLogger" Version="2.3.269" />
     <InternalsVisibleTo Include="BlazeCs.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The MSBuild logger the daemon's `dotnet build` runs with, next to the CLI and in the tool package,
+         and the record it writes. -->
+    <Compile Include="..\BlazeCs.Logger\BuildRecord.cs" Link="BuildRecord.cs" />
+    <ProjectReference Include="..\BlazeCs.Logger\BlazeCs.Logger.csproj" ReferenceOutputAssembly="false"
+                      OutputItemType="None" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
