@@ -291,6 +291,13 @@ use it. It skips `PrepareResources`, so every `/resource:` argument was missing.
 got 152 fewer arguments than in its real build, and three other projects one fewer each.
 `BuildOnlySettings` sets `BuildingProject=true`, as in a real build.
 
+The implementation ([#102](https://github.com/Igelkottegrodan/blaze-cs/issues/102)) adds
+`_CheckForInvalidConfigurationAndPlatform` in front of these targets. A real build runs it before `BeforeBuild`,
+and the SDK's `CheckForDuplicateItems` runs before it, so that check sees the items as evaluated. Without it,
+`CheckForDuplicateItems` ran just before `CoreCompile`, after a project's own target had added a `Compile`
+item again. The fixture's `Lib` does that, and the pass failed with `NETSDK1022`, which the real build doesn't
+raise.
+
 The global properties are the real build's plus four:
 
 | Property | Why |
@@ -408,9 +415,23 @@ What hosting adds to the daemon, from the spike's numbers:
 Expected daemon growth, then: about +100 to 150 MB for a `.csproj` edit (one evaluation, its 8 references'
 evaluations inside the pass, MSBuild's code), and up to +400 MB right after a `.props` edit that reaches
 every project. The second shrinks again once the idle GC of
-[#80](https://github.com/Igelkottegrodan/blaze-cs/issues/80) runs. That is an estimate. The issue's
-criterion asks for the real figure, so the first ticket measures daemon RSS before and after the first and
-fifth project-file edit on jellyfin, and records it here.
+[#80](https://github.com/Igelkottegrodan/blaze-cs/issues/80) runs.
+
+**Measured in the daemon** ([#102](https://github.com/Igelkottegrodan/blaze-cs/issues/102), 2026-11-06):
+jellyfin, SDK 10.0.403, the daemon's server GC. Each edit set a new value in `DefineConstants` of
+`MediaBrowser.Controller.csproj`, then `blaze-cs build` ran. RSS is `VmRSS` after the command returned. The
+runs held `bench/.measure.lock`, but other agents were compiling (load average 17 to 30).
+
+| Daemon | Before the first edit | After the first | After the fifth | Later |
+|---|---:|---:|---:|---|
+| main (edit through `dotnet build`), 8 edits | 1,272 MB | 1,298 MB | 1,319 MB | 1,321 MB after the 8th |
+| in-process MSBuild, run 1, 8 edits | 1,239 MB | 1,296 MB | 1,399 MB | 1,446 MB after the 8th |
+| in-process MSBuild, run 2, 20 edits | 1,255 MB | 1,314 MB | 1,470 MB | 1,408 to 1,512 MB from the 4th to the 20th, 1,428 MB after the 20th |
+
+So the first edit adds about 60 MB, MSBuild's code and its first evaluations. Passes then add GC slack and
+MSBuild's caches until RSS levels off 170 to 250 MB above where it started. Over 20 edits it went up and
+down within that band and didn't keep growing. That fits the estimate above, with server GC's slack on top.
+Main's daemon grows by about 50 MB over the same edits, because each `dotnet build` reload reads a build log.
 
 Choices that follow from this:
 
