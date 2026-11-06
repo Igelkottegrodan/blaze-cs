@@ -258,6 +258,7 @@ try
     HotReloadBodyEdit();
     HotReloadFallbacks();
     HotReloadedPassRunsAgain();
+    HotReloadedClassRunsAgain();
     ProjectRemovedAndRestored();
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
@@ -1370,6 +1371,65 @@ void SessionNotReady()
     {
         Run(blaze, "stop", check: false);
     }
+}
+
+// A test class that ran hot reloaded runs again with every later delta to its host, even one that can't reach
+// it: its pass may rest on statics the code before that edit computed, and only a pass in a new host is listed
+// as unchanged since last run. Two deltas to Tests' host: a body edit in Lib, which only WelcomeTests reaches,
+// then one in RuntimeTests, which WelcomeTests can't reach. WelcomeTests runs with both.
+void HotReloadedClassRunsAgain()
+{
+    if (HotReloadUnavailableBecause() is not null)
+        return;
+    const string name = "hot reloaded class";
+    // A new host for Tests: with nothing changed, the projects whose last pass was hot reloaded run in new
+    // hosts. Then body edits in Lib until Tests' host is among those that stay up: while it isn't, Tests runs
+    // in a new host. Either way Tests' host has run once, so no class of it ran hot reloaded there yet.
+    Run(blaze, "test");
+    IdleHosts($"before {name}");
+    for (var edits = 0; ReadyLiveHosts(name, ["Tests"]).Count == 0; edits++)
+    {
+        if (edits == 4)
+            Fail($"{name}: expected a host to stay up for Tests after {edits} body edits in Lib:\n{ReadLog("daemon.log")}");
+        ToggleShout();
+        Run(blaze, "test");
+        IdleHosts($"before {name}");
+    }
+    var pid = ReadyLiveHosts(name, ["Tests"]).Single().Key;
+    var host = $@"hot reload: test host {pid} \(Tests\.dll\) runs ";
+
+    // The first delta reaches WelcomeTests, and not RuntimeTests, whose last pass was in a new host.
+    var logged = ReadLog("daemon.log").Length;
+    ToggleShout();
+    var first = Run(blaze, "test");
+    if (!Regex.IsMatch(first, $@"^blaze-cs: Tests\.dll: hot reloaded Lib \(net10\.0\) \(1 type\) into its test host \(pid {pid}\)", RegexOptions.Multiline)
+        || !UnchangedClasses(first).GetValueOrDefault("Tests", []).SequenceEqual(["RuntimeTests (1 passed)"])
+        || !Regex.IsMatch(ReadLog("daemon.log")[logged..], host + "1 of 2 test classes, those the delta can reach: Tests.WelcomeTests\r?$", RegexOptions.Multiline))
+        Fail($"{name}: expected a body edit in Lib to run only WelcomeTests in Tests' host {pid}, and list RuntimeTests as unchanged:\n{first}");
+    Verify(name, Rebuilt(first), null);
+
+    // The second reaches RuntimeTests only; WelcomeTests runs too, since its last pass was hot reloaded. (The
+    // log says so only when a class the delta can't reach runs for that reason.)
+    IdleHosts($"{name}, before a body edit in RuntimeTests");
+    if (!ReadyLiveHosts($"{name}, before a body edit in RuntimeTests", ["Tests"]).ContainsKey(pid))
+        Fail($"{name}: expected Tests' host {pid} to stay up with its session after the first delta:\n{ReadLog("daemon.log")}");
+    const string runtime = "Environment.Version.Major.ToString())";
+    logged = ReadLog("daemon.log").Length;
+    Replace("Tests/WelcomeTests.cs", runtime, "Environment.Version.Major.ToString(System.Globalization.CultureInfo.InvariantCulture))");
+    var second = Run(blaze, "test");
+    if (!Regex.IsMatch(second, $@"^blaze-cs: Tests\.dll: hot reloaded Tests \(\d+ types?\) into its test host \(pid {pid}\)", RegexOptions.Multiline)
+        || UnchangedClasses(second).ContainsKey("Tests")
+        || !Regex.IsMatch(ReadLog("daemon.log")[logged..],
+            host + "2 of 2 test classes, those the delta can reach or whose last pass was hot reloaded: Tests.RuntimeTests, Tests.WelcomeTests\r?$", RegexOptions.Multiline)
+        || Summaries(second).GetValueOrDefault("Tests") != new Summary("Passed!", 0, TestCount("Tests"), 0, TestCount("Tests")))
+        Fail($"{name}: expected a body edit in RuntimeTests to run WelcomeTests again in Tests' host {pid}, whose last pass there was hot reloaded, and list no class as unchanged:\n{second}");
+    Verify($"{name}, second delta", Rebuilt(second), null);
+
+    Replace("Tests/WelcomeTests.cs", "Environment.Version.Major.ToString(System.Globalization.CultureInfo.InvariantCulture))", runtime);
+    var undone = Run(blaze, "test");
+    Run(blaze, "test"); // the hot reloaded passes again, in new hosts
+    Verify($"{name} undone", Rebuilt(undone), null);
+    Console.WriteLine($"ok  {name}: after a Lib edit ran WelcomeTests hot reloaded in Tests' host, an edit only RuntimeTests reaches ran it again there, not listed as unchanged");
 }
 
 // A body edit in Lib that changes no test's result: Shout's, which no test runs.
