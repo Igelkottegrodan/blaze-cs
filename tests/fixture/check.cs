@@ -784,10 +784,14 @@ string SdkDirectory()
 // next dotnet build starts the SDK's server again. Ends with a daemon running, warmed up.
 void PipeHandedOver(string pipe)
 {
+    // As VBCSCompiler does, the daemon answers the request with its process id, then stops serving the pipe;
+    // the command waits for that and exits 0.
     var mark = LogMark();
-    Run("dotnet", "build-server shutdown --vbcscompiler");
-    if (Held(pipe) || !LogSince(mark).Contains($"compiler server: gave up {pipe}"))
-        Fail($"dotnet build-server shutdown: expected the daemon to give the pipe up:\n{LogSince(mark)}");
+    var daemon = Daemons().Last().Pid;
+    var (shutdown, shutdownExit) = RunWithExit("dotnet", "build-server shutdown --vbcscompiler", check: false);
+    if (shutdownExit != 0 || Held(pipe) || PipeAnswers(pipe) || !Running(daemon)
+        || !LogSince(mark).Contains("compiler server: shutdown request") || !LogSince(mark).Contains($"compiler server: gave up {pipe}"))
+        Fail($"dotnet build-server shutdown: expected it to succeed and the daemon to give the pipe up and keep running, got exit code {shutdownExit}:\n{shutdown}\n{LogSince(mark)}");
     mark = LogMark();
     var compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
     if (!lib.All(unit => compiles.GetValueOrDefault(unit) == "server: server processed compilation") || Served(LogSince(mark)).Count > 0 || !Held(pipe))
@@ -802,7 +806,7 @@ void PipeHandedOver(string pipe)
     compiles = CompilerServerLog(DetailedBuild("Lib/Lib.csproj --no-incremental"));
     if (!Served(LogSince(mark)).SetEquals(lib) || !compiles.Keys.ToHashSet().SetEquals(lib))
         Fail($"dotnet build after the daemon took the pipe back: expected it to answer Lib's compiles, got:\n{Compiles(compiles)}\n{LogSince(mark)}");
-    Console.WriteLine("ok  dotnet build-server shutdown: the daemon gave the pipe up, dotnet build started VBCSCompiler on it, and the next blaze-cs build took it back");
+    Console.WriteLine("ok  dotnet build-server shutdown: exit 0; the daemon gave the pipe up and kept running, dotnet build started VBCSCompiler on it, and the next blaze-cs build took it back");
 
     Run(blaze, "stop");
     if (Held(pipe) || PipeAnswers(pipe))

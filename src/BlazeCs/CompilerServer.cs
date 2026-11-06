@@ -340,7 +340,7 @@ sealed class CompilerServer : IDisposable
                 {
                     // `dotnet build-server shutdown`, or another daemon taking the pipe: that waits until the
                     // mutex goes. The VBCSCompiler compiles were passed to goes too.
-                    Log($"{request.RequestId}: asked to shut down");
+                    Log("shutdown request (dotnet build-server shutdown, or another daemon): giving the pipe up until the next blaze-cs command");
                     new ServerResponse.Shutdown(Environment.ProcessId).Write(client);
                     Release();
                     ShutDownPrivateServer();
