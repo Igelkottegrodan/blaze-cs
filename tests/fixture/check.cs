@@ -178,6 +178,9 @@ try
         Verify(name, rebuilt, fallback);
     }
     IdleCollected();
+    OutsideBuildOfOneProject(pipe: null);
+    if (!serverOff)
+        OutsideBuildOfOneProject(pipe);
     AnalyzerWarnings();
     CompilationEndAnalyzers();
     if (!serverOff)
@@ -282,6 +285,51 @@ void IdleCollected()
     var last = collections[^1].Groups;
     Console.WriteLine($"ok  idle collection: {collections.Count} logged, the last took {last[1].Value} ms and left a {last[2].Value} MB heap");
 }
+
+// A `dotnet build` of one project writes its own obj/ and bin/ but not the copies in the projects that
+// reference it (#133). Without the pipe, the next `test` compiles Lib to the bytes its obj/ already holds;
+// through it, the daemon compiled Lib for the build, and the next `test` has nothing to compile. Either way
+// every copy must be brought up to date, and the test projects whose copies changed must run rather than be
+// reported unchanged. Every copy in a bin/ is then what `dotnet build --no-incremental` makes. The edit is
+// undone after.
+void OutsideBuildOfOneProject(string? pipe)
+{
+    var name = pipe is null ? "body in Lib, built by dotnet build Lib/Lib.csproj" : "body in Lib, built through the daemon's pipe";
+    const string before = "Twice(int amount) => amount + amount", after = "Twice(int amount) => 2 * amount";
+    Run(blaze, "test"); // the inputs each test project last passed with
+    Replace("Lib/Greeter.cs", before, after);
+    if (pipe is null)
+        Run("dotnet", "build Lib/Lib.csproj -nologo -v:q -clp:NoSummary");
+    else
+        BuildThrough(pipe, "Lib/Lib.csproj");
+    var output = Run(blaze, "test");
+    var rebuilt = Rebuilt(output);
+    string[] expected = pipe is null ? lib : [];
+    if (!rebuilt.SetEquals(expected))
+        Fail($"{name}: expected blaze-cs to rebuild {(expected.Length == 0 ? "nothing" : string.Join(", ", expected))}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
+    RanTests(name, output, libTests);
+    var ours = Copies();
+    Verify(name, rebuilt, pipe is null ? null : "the daemon's pipe");
+    var theirs = Copies();
+    if (!ours.Keys.ToHashSet().SetEquals(theirs.Keys))
+        Fail($"{name}: bin/ copies differ in which exist: {string.Join(", ", ours.Keys.ToHashSet().Except(theirs.Keys).Union(theirs.Keys.Except(ours.Keys)))}");
+    var stale = ours.Keys.Where(path => !ours[path].AsSpan().SequenceEqual(theirs[path])).Order().ToList();
+    if (stale.Count > 0)
+        Fail($"{name}: these copies differ from dotnet build --no-incremental's: {string.Join(", ", stale)}");
+    Console.WriteLine($"ok  {name}: all {ours.Count} assemblies, PDBs and documentation files in bin/ identical to dotnet build's");
+
+    Replace("Lib/Greeter.cs", after, before);
+    rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(lib))
+        Fail($"{name}, undone: expected blaze-cs to rebuild {string.Join(", ", lib)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+}
+
+// Every assembly, PDB and documentation file in a project's bin/, by relative path with / separators.
+Dictionary<string, byte[]> Copies() =>
+    Directory.EnumerateFiles(work, "*", SearchOption.AllDirectories)
+        .Select(path => Path.GetRelativePath(work, path).Replace('\\', '/'))
+        .Where(path => path.Split('/') is [_, "bin", ..] && Path.GetExtension(path) is ".dll" or ".pdb" or ".xml")
+        .ToDictionary(path => path, path => File.ReadAllBytes(Path.Combine(work, path)));
 
 // A client from another build of blaze-cs stops the daemon the cases used and starts its own, with a notice;
 // that daemon, started with a short idle limit, exits on its own and removes its socket; and the next
