@@ -13,6 +13,8 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 
 var fixture = Path.GetDirectoryName(Path.GetFullPath(AppContext.GetData("EntryPointFilePath") as string ?? "tests/fixture/check.cs"))!;
@@ -204,6 +206,9 @@ if (hasNet11)
     Replace("Fixture.slnx", "</Solution>", "  <Project Path=\"Tests11/Tests11.csproj\" />\n</Solution>");
 else
     Directory.Delete(Path.Combine(work, "Tests11"), recursive: true);
+// The daemon takes the SDK's compiler-server pipe, one per user and SDK on the machine, and the checks of builds
+// through it expect it to be this check's: another check of the same SDK (another worktree's) waits for this one.
+using var pipeLock = LockSdkPipe();
 var passed = false;
 var loadedProjects = 0; // from the last "loaded N projects" line a command printed
 // BLAZE_CS_COMPILER_SERVER=0 turns the daemon's compiler-server pipe off; the checks of builds through it are skipped.
@@ -211,12 +216,13 @@ var serverOff = Environment.GetEnvironmentVariable("BLAZE_CS_COMPILER_SERVER") =
 // The projects whose tests passed hot reloaded in the last `blaze-cs test`, and in the one before: a hot reloaded
 // pass doesn't count as one, so they run again on the next `test` (RanTests), whether or not they changed.
 HashSet<string> hotReloaded = [], hotReloadedBefore = [];
+string? sdkPipe = null; // once the first daemon names it
 try
 {
     // Starts the daemon: a real dotnet build; the warm-up compile runs after it returns. It takes the SDK's
     // compiler-server pipe.
     Run(blaze, "build");
-    var pipe = DaemonPipe("first command", 0);
+    var pipe = sdkPipe = DaemonPipe("first command", 0);
     // The next command reports the warm-up, which must reproduce every assembly.
     WarmedUpIdentical("start", Run(blaze, "build"));
     var prestarted = IdleHosts("before any test command");
@@ -291,8 +297,12 @@ catch (CheckFailed failure)
 finally
 {
     Run(blaze, "stop", check: false);
-    try { Run("dotnet", $"exec \"{Path.Combine(SdkDirectory(), "Roslyn", "bincore", "VBCSCompiler.dll")}\" -shutdown -pipename:{referenceServer}", check: false); }
-    catch (CheckFailed) { } // no SDK to find; its server exits when idle
+    // The reference builds' server, and the one the daemons passed compiles on to, which outlives them.
+    foreach (var server in sdkPipe is null ? [referenceServer] : new[] { referenceServer, PrivatePipeName(sdkPipe) })
+    {
+        try { Run("dotnet", $"exec \"{Path.Combine(SdkDirectory(), "Roslyn", "bincore", "VBCSCompiler.dll")}\" -shutdown -pipename:{server}", check: false); }
+        catch (CheckFailed) { } // no SDK to find; its server exits when idle
+    }
     foreach (var scratch in new[] { otherBuild, otherSolution, roslynCopy })
     {
         try
@@ -465,6 +475,36 @@ void Handover(string client, int old, int expectedDaemons, Dictionary<string, st
     var daemons = Daemons();
     if (!output.Contains("blaze-cs: the running daemon is from another build") || daemons.Count != expectedDaemons || Running(old))
         Fail($"daemon handshake through {Path.GetFileName(client)}: expected a notice, daemon {old} gone and {expectedDaemons} daemons, got {daemons.Count}:\n{output}");
+}
+
+// The private pipe of the VBCSCompiler the daemons pass compiles on to (CompilerServer.PrivatePipeName).
+static string PrivatePipeName(string pipeName) =>
+    "blaze-cs-" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(pipeName)))[..16];
+
+// Holds a lock for this user and SDK on the machine whatever TMPDIR says, as its pipe is (on Unix the pipe's socket
+// is under /tmp), until the check exits: FileShare.None is flock on Unix. Waits up to an hour for another check.
+FileStream LockSdkPipe()
+{
+    var bincore = Path.Combine(SdkDirectory(), "Roslyn", "bincore");
+    if (!OperatingSystem.IsWindows())
+        bincore = Run("realpath", $"\"{bincore}\"").Trim(); // the SDK's pipe is named for its real path
+    var key = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes($"{Environment.UserName}.{bincore}")))[..16];
+    var path = Path.Combine(OperatingSystem.IsWindows() ? Path.GetTempPath() : "/tmp", $"blaze-cs-check-{key}.lock");
+    var waiting = Stopwatch.StartNew();
+    while (true)
+    {
+        try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+        catch (IOException) when (waiting.Elapsed < TimeSpan.FromHours(1))
+        {
+            if (waiting.Elapsed < TimeSpan.FromSeconds(1))
+                Console.WriteLine($"waiting for another check of this SDK ({bincore}), which holds {path}");
+            Thread.Sleep(1000);
+        }
+        catch (IOException e)
+        {
+            throw new IOException($"another check of this SDK held {path} for an hour", e);
+        }
+    }
 }
 
 // The SDK's compiler-server pipe a daemon serves, from what its log says after mark: its start names the pipe

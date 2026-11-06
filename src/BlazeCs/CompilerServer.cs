@@ -19,12 +19,13 @@ namespace BlazeCs;
 /// csc itself.
 /// </summary>
 /// <remarks>
-/// The pipe has one server at a time: whoever holds its server mutex (<c>Global\&lt;pipe&gt;.server</c>), which
-/// is what a client checks before it connects, and what a VBCSCompiler checks before it listens. The daemon takes
-/// the pipe at its start and before each command (<see cref="Take"/>): if another server holds it, a
-/// VBCSCompiler or another solution's daemon, it asks that one to shut down, as `dotnet build-server shutdown`
-/// does, and takes the mutex once it is given up. Asked to shut down itself, the daemon gives the pipe up and
-/// keeps running. It gives it up when it exits too, and the next build starts the SDK's server as usual.
+/// The pipe has one server at a time: whoever owns its server mutex (<c>Global\&lt;pipe&gt;.server</c>). A client
+/// checks that the mutex exists before it connects, and a VBCSCompiler owns it while it listens. The daemon takes
+/// the pipe at its start and before each command (<see cref="Take"/>): if another server owns it, a VBCSCompiler
+/// or another solution's daemon, it asks that one to shut down, as `dotnet build-server shutdown` does, and waits
+/// to own the mutex; of several daemons that ask at once, only the one that gets it listens. Asked to shut down
+/// itself, the daemon gives the pipe up and keeps running. It gives it up when it exits too, and the next build
+/// starts the SDK's server as usual.
 /// </remarks>
 sealed class CompilerServer : IDisposable
 {
@@ -56,8 +57,9 @@ sealed class CompilerServer : IDisposable
     }
 
     /// <summary>
-    /// The private pipe of the VBCSCompiler that compiles what the daemon passes on: one per SDK pipe, so the
-    /// next daemon of any solution finds it warm.
+    /// The private pipe of the VBCSCompiler that compiles what the daemon passes on: one per SDK pipe, shared by
+    /// the daemons of every solution, so the next one finds it warm. It exits after its own idle timeout, or on
+    /// `dotnet build-server shutdown`; never when a daemon exits or another takes the SDK's pipe.
     /// </summary>
     public static string PrivatePipeName(string pipeName) =>
         "blaze-cs-" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(pipeName)))[..16];
@@ -119,7 +121,7 @@ sealed class CompilerServer : IDisposable
     readonly Func<ServerRequest, ServerResponse?> _serve;
     readonly Lock _gate = new();
     readonly Lock _starting = new();
-    Listening? _listening;
+    Holding? _holding;
     Task _taking = Task.CompletedTask;
     bool _disposed;
     long _lastRequest = DateTime.UtcNow.Ticks;
@@ -143,6 +145,18 @@ sealed class CompilerServer : IDisposable
 
     public string Name => _pipeName;
 
+    /// <summary>How long a takeover waits for the server it asked to shut down to give the mutex up.</summary>
+    internal TimeSpan TakeoverTimeout { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>Whether the daemon owns the pipe and listens on it.</summary>
+    internal bool IsListening => Volatile.Read(ref _holding) is not null;
+
+    /// <summary>
+    /// The request id of a daemon's shutdown request: the daemon that gets it gives the pipe up but leaves the
+    /// private VBCSCompiler, which the asking daemon passes compiles on to as well.
+    /// </summary>
+    const string TakeoverRequestId = "blaze-cs takeover";
+
     /// <summary>When the last compile of the daemon's solution arrived: the daemon stays up while builds use it.</summary>
     public DateTime LastRequest => new(Interlocked.Read(ref _lastRequest), DateTimeKind.Utc);
 
@@ -156,109 +170,111 @@ sealed class CompilerServer : IDisposable
     {
         lock (_gate)
         {
-            if (_disposed || _listening is not null || !_taking.IsCompleted)
+            if (_disposed || _holding is not null || !_taking.IsCompleted)
                 return _taking;
-            return _taking = Task.Run(TakeOver);
+            var taken = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            // A mutex is owned by a thread: this one owns it for as long as the daemon holds the pipe.
+            new Thread(() =>
+            {
+                try { Hold(taken); }
+                finally { taken.TrySetResult(); }
+            }) { IsBackground = true, Name = "blaze-cs compiler-server mutex" }.Start();
+            return _taking = taken.Task;
         }
     }
 
-    void TakeOver()
+    /// <summary>
+    /// Owns the server mutex, listens on the pipe and, once <see cref="Release"/> asks, releases the mutex again.
+    /// Whoever owns the mutex is the pipe's server: of the daemons that ask its server to shut down at once, one
+    /// gets it, and the others find it owned again and leave the pipe to that one.
+    /// </summary>
+    void Hold(TaskCompletionSource taken)
     {
         Mutex mutex;
-        bool created;
-        try { mutex = new Mutex(initiallyOwned: false, ServerMutexName(_pipeName), out created); }
+        bool owned;
+        try { mutex = new Mutex(initiallyOwned: true, ServerMutexName(_pipeName), out owned); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException)
         {
             Log($"no mutex for {_pipeName} ({e.Message}); builds compile without the daemon");
             return;
         }
-        // Another server has the pipe: a VBCSCompiler a build started while no daemon held it, or another
-        // solution's daemon. The daemon keeps the mutex open meanwhile, so a client in between finds a server and
-        // connects (or, while none listens, compiles with csc) instead of starting another VBCSCompiler, and a
-        // VBCSCompiler started anyway finds the mutex taken and exits.
-        if (!created && GiveUp(_pipeName) is { } kept)
+        Holding? holding = null;
+        try
         {
-            mutex.Dispose();
-            Log($"{_pipeName} stays with another server: {kept}; the next blaze-cs command asks again");
-            return;
-        }
-        lock (_gate)
-        {
-            if (_disposed)
+            // Not created: another server owns it, a VBCSCompiler a build started while no daemon held the pipe, or
+            // another solution's daemon; or a client checking for one has it open. Asked to shut down, a server
+            // stops listening, then releases the mutex. Meanwhile it exists, so a client in between finds a server
+            // and connects (or, while none listens, compiles with csc) instead of starting another VBCSCompiler.
+            if (!owned && !(owned = Own(mutex, TimeSpan.Zero)))
             {
-                mutex.Dispose();
-                return;
+                var answer = Send(_pipeName, ServerRequest.Shutdown(_compilerHash, TakeoverRequestId), TimeSpan.FromSeconds(5));
+                Log($"another server holds {_pipeName}; asked it to shut down: {Describe(answer)}");
+                owned = Own(mutex, answer is ServerResponse.Shutdown ? TakeoverTimeout : TimeSpan.Zero);
+                if (!owned)
+                {
+                    var why = answer is ServerResponse.Shutdown
+                        ? $"its server, or a daemon that asked it at the same time, owns the mutex {TakeoverTimeout.TotalSeconds:F0} s after the shutdown request"
+                        : Describe(answer);
+                    Log($"{_pipeName} stays with another server: {why}; the next blaze-cs command asks again");
+                    return;
+                }
             }
-            _listening = new Listening(this, mutex);
+            lock (_gate)
+            {
+                if (_disposed)
+                    return;
+                Volatile.Write(ref _holding, holding = new Holding(new Listening(this)));
+            }
+            Log($"listening on {_pipeName}, the pipe of the SDK's Csc task (Roslyn {_compilerHash}): dotnet build compiles through this daemon");
+            taken.TrySetResult();
+            holding.Give.Wait();
         }
-        Log($"listening on {_pipeName}, the pipe of the SDK's Csc task (Roslyn {_compilerHash}): dotnet build compiles through this daemon");
+        finally
+        {
+            if (owned)
+                mutex.ReleaseMutex();
+            mutex.Dispose();
+            holding?.Given.Set();
+        }
+    }
+
+    /// <summary>Waits to own the mutex; one its owner exited without releasing is this thread's too.</summary>
+    static bool Own(Mutex mutex, TimeSpan timeout)
+    {
+        try { return mutex.WaitOne(timeout); }
+        catch (AbandonedMutexException) { return true; }
+    }
+
+    /// <summary>The pipe while the daemon holds it: its listeners, and the thread that owns its mutex.</summary>
+    sealed class Holding(Listening listening)
+    {
+        public Listening Listening { get; } = listening;
+
+        /// <summary>Set when the mutex is to be released.</summary>
+        public ManualResetEventSlim Give { get; } = new();
+
+        /// <summary>Set once it is.</summary>
+        public ManualResetEventSlim Given { get; } = new();
     }
 
     /// <summary>
-    /// Asks the server on the pipe to shut down, as `dotnet build-server shutdown` does, and waits until it has
-    /// stopped listening: a VBCSCompiler exits once its compiles finish, and a daemon stops listening and keeps
-    /// running. Returns why it didn't, or null.
+    /// Gives the pipe up: no more connections, then the mutex goes, so a client starts the SDK's server and a
+    /// daemon waiting for it takes it. Returns once the mutex is released.
     /// </summary>
-    string? GiveUp(string pipeName)
-    {
-        var answer = Send(pipeName, ServerRequest.Shutdown(_compilerHash), TimeSpan.FromSeconds(5));
-        Log($"another server holds {pipeName}; asked it to shut down: {Describe(answer)}");
-        if (answer is not ServerResponse.Shutdown { ServerProcessId: var pid })
-            return Describe(answer);
-        Process? server = null;
-        // Another daemon answers with NoProcess once it has stopped listening (see Handle).
-        try { server = pid is > 0 and not NoProcess ? Process.GetProcessById(pid) : null; }
-        catch (ArgumentException) { } // gone already
-        using (server)
-        {
-            // On Unix its socket goes with its listener; on Windows its pipe instances do.
-            bool Stopped() => server is null || server.HasExited
-                || (OperatingSystem.IsWindows() ? !Answers(pipeName) : !File.Exists(PipePath(pipeName)));
-            if (!WaitUntil(Stopped, TimeSpan.FromSeconds(60)))
-                return $"its server (pid {pid}) still listens 60 s after a shutdown request";
-        }
-        return null;
-    }
-
-    /// <summary>Whether a server accepts a connection on the pipe within a moment.</summary>
-    static bool Answers(string pipeName)
-    {
-        using var client = new NamedPipeClientStream(".", PipePath(pipeName), PipeDirection.InOut, PipeOptions.CurrentUserOnly);
-        try
-        {
-            client.Connect(100);
-            return true;
-        }
-        catch (Exception e) when (e is TimeoutException or IOException or UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
-
-    static bool WaitUntil(Func<bool> condition, TimeSpan timeout)
-    {
-        var until = Stopwatch.GetTimestamp() + (long)(timeout.TotalSeconds * Stopwatch.Frequency);
-        while (!condition())
-        {
-            if (Stopwatch.GetTimestamp() > until)
-                return false;
-            Thread.Sleep(20);
-        }
-        return true;
-    }
-
-    /// <summary>Gives the pipe up: no more connections, and the mutex goes, so a client starts the SDK's server.</summary>
     void Release()
     {
-        Listening? listening;
+        Holding? holding;
         lock (_gate)
         {
-            listening = _listening;
-            _listening = null;
+            holding = _holding;
+            Volatile.Write(ref _holding, null);
         }
-        if (listening is null)
+        if (holding is null)
             return;
-        listening.Dispose();
+        holding.Listening.Dispose();
+        holding.Give.Set();
+        if (!holding.Given.Wait(TimeSpan.FromSeconds(5)))
+            Log($"the mutex of {_pipeName} not released within 5 s");
         Log($"gave up {_pipeName}");
     }
 
@@ -267,11 +283,9 @@ sealed class CompilerServer : IDisposable
     {
         readonly CancellationTokenSource _stopping = new();
         readonly Task[] _listeners;
-        readonly Mutex _mutex;
 
-        public Listening(CompilerServer server, Mutex mutex)
+        public Listening(CompilerServer server)
         {
-            _mutex = mutex;
             // As many pending connections as the SDK's server keeps, so parallel project builds don't queue.
             _listeners = [.. Enumerable.Range(0, Math.Min(4, Environment.ProcessorCount)).Select(_ => Task.Run(() => server.Listen(_stopping.Token)))];
         }
@@ -282,7 +296,6 @@ sealed class CompilerServer : IDisposable
             _stopping.Cancel();
             try { Task.WaitAll(_listeners, TimeSpan.FromSeconds(5)); }
             catch (AggregateException) { }
-            _mutex.Dispose();
         }
     }
 
@@ -346,13 +359,16 @@ sealed class CompilerServer : IDisposable
                 if (request.IsShutdown)
                 {
                     // `dotnet build-server shutdown`, or another daemon taking the pipe. The daemon gives the pipe up
-                    // first, and the VBCSCompiler compiles were passed to goes too. The answer names no running
-                    // process: the client waits for the one it names to exit, Roslyn up to SDK 10.0.1xx with no
-                    // other way out (RunServerShutdownRequestAsync), and the daemon keeps running. Not 0 (or -1):
-                    // on Unix, kill(0, 0) succeeds, so .NET takes process 0 as running and waits on it forever.
-                    Log("shutdown request (dotnet build-server shutdown, or another daemon): giving the pipe up until the next blaze-cs command");
+                    // first. On `dotnet build-server shutdown` the VBCSCompiler compiles were passed to goes too;
+                    // another daemon passes compiles on to it as well. The answer names no running process: the
+                    // client waits for the one it names to exit, Roslyn up to SDK 10.0.1xx with no other way out
+                    // (RunServerShutdownRequestAsync), and the daemon keeps running. Not 0 (or -1): on Unix,
+                    // kill(0, 0) succeeds, so .NET takes process 0 as running and waits on it forever.
+                    var takeover = request.RequestId == TakeoverRequestId;
+                    Log($"shutdown request ({(takeover ? "another daemon" : "dotnet build-server shutdown")}): giving the pipe up until the next blaze-cs command");
                     Release();
-                    ShutDownPrivateServer();
+                    if (!takeover)
+                        ShutDownPrivateServer();
                     new ServerResponse.Shutdown(NoProcess).Write(client);
                     return;
                 }
@@ -497,12 +513,14 @@ sealed class CompilerServer : IDisposable
         }
     }
 
-    /// <summary>Gives the pipe up and shuts the private VBCSCompiler down; compiles in flight still get their answers.</summary>
+    /// <summary>
+    /// Gives the pipe up; compiles in flight still get their answers. The private VBCSCompiler stays for the other
+    /// daemons of the SDK, and exits after its idle timeout.
+    /// </summary>
     public void Dispose()
     {
         lock (_gate)
             _disposed = true;
         Release();
-        ShutDownPrivateServer();
     }
 }

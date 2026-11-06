@@ -201,7 +201,9 @@ its own:
   `error` severity in a config file; or any compile while a `blaze-cs` command runs). A `Csc` task from another
   Roslyn (compiler hash) is rejected and runs csc itself. The pipe has one server at a time: the daemon asks a
   running `VBCSCompiler` to shut down to take it, `dotnet build-server shutdown` makes the daemon give it up
-  until its next command, and when the daemon stops the next build starts the SDK's server as usual.
+  until its next command, and when the daemon stops the next build starts the SDK's server as usual. The private
+  `VBCSCompiler` is shared by the daemons of every solution on that SDK: it exits after its own idle timeout, or
+  on `dotnet build-server shutdown`.
   `BLAZE_CS_COMPILER_SERVER=0` in the environment the daemon starts in turns the pipe off.
 
 ## Good to know

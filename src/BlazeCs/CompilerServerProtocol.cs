@@ -74,9 +74,9 @@ sealed record ServerRequest(string RequestId, RequestLanguage Language, string C
         return new ServerRequest(requestId, RequestLanguage.CSharpCompile, compilerHash, all);
     }
 
-    /// <summary>The request `dotnet build-server shutdown` sends (BuildRequest.CreateShutdown).</summary>
-    public static ServerRequest Shutdown(string compilerHash) =>
-        new("", RequestLanguage.CSharpCompile, compilerHash, [new(ArgumentId.Shutdown, 0, "")]);
+    /// <summary>The request `dotnet build-server shutdown` sends (BuildRequest.CreateShutdown), with its id.</summary>
+    public static ServerRequest Shutdown(string compilerHash, string requestId = "") =>
+        new(requestId, RequestLanguage.CSharpCompile, compilerHash, [new(ArgumentId.Shutdown, 0, "")]);
 
     public static ServerRequest Read(Stream stream)
     {
