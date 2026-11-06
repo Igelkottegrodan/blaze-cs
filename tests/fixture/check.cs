@@ -460,7 +460,7 @@ void CompilationEndAnalyzers()
     Replace("Lib/Lib.csproj", "</Project>", "  <!-- edited with Unused.cs -->\n</Project>");
     built = DateTimeOffset.Now;
     output = Run(blaze, "build");
-    if (!output.Contains("blaze-cs: Lib/Lib.csproj changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
+    if (!output.Contains($"blaze-cs: {Path.Combine("Lib", "Lib.csproj")} changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
         Fail($"compilation-end analyzers, fallback: expected a dotnet build that shows no CA1812:\n{output}");
     WaitForBackgroundAnalysis("compilation-end analyzers, fallback", built);
     output = Run(blaze, "build");
@@ -477,7 +477,7 @@ void CompilationEndAnalyzers()
     Replace("App/App.csproj", "</Project>", "  <!-- edited -->\n</Project>");
     built = DateTimeOffset.Now;
     output = Run(blaze, "build");
-    if (!output.Contains("blaze-cs: App/App.csproj changed, running dotnet build"))
+    if (!output.Contains($"blaze-cs: {Path.Combine("App", "App.csproj")} changed, running dotnet build"))
         Fail($"compilation-end analyzers, pending across a fallback: expected a dotnet build:\n{output}");
     // The run may have finished before the fallback, which then reports it.
     if (Warnings(output, "CA1812").Count == 0)
@@ -492,7 +492,7 @@ void CompilationEndAnalyzers()
     File.Delete(unused);
     Replace("Lib/Lib.csproj", "  <!-- edited with Unused.cs -->\n", "");
     output = Run(blaze, "build");
-    if (!output.Contains("blaze-cs: Lib/Lib.csproj changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
+    if (!output.Contains($"blaze-cs: {Path.Combine("Lib", "Lib.csproj")} changed, running dotnet build") || Warnings(output, "CA1812").Count != 0)
         Fail($"compilation-end analyzers, fixed: expected a dotnet build and no CA1812:\n{output}");
     Console.WriteLine("ok  compilation-end analyzers: CA1812 not from the build, then from the background analysis after the next command's build and from build --all, "
         + "as dotnet build reports it; a result for a deleted file dropped; reported after a fallback dotnet build");
