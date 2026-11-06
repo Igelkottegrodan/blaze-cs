@@ -22,7 +22,8 @@ namespace BlazeCs;
 /// A Debug project's host, once it has run the project, stays up as the project's host: the next run sends it
 /// the edit as a delta (hot reload, HotReload.cs) when the edit is one the runtime can apply, and the tests run
 /// again in the same process; otherwise the project runs in a new host, as it would without, the output says why in
-/// one line, and the new host stays up in the old one's place.
+/// one line, and the new host stays up in the old one's place. Of a hot reloaded project, only the test classes the
+/// delta can reach run (TestSelection.cs); the others are listed as unchanged since their last run, with its result.
 /// </summary>
 sealed class TestRunner(SolutionBuilder builder) : IDisposable
 {
@@ -68,13 +69,16 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
 
     /// <summary>
     /// A host that ran its project and waits for an update (Protocol.cs): the inputs its tests last ran with
-    /// (<see cref="Inputs(ProjectCompiler)"/>), and its hot reload session, which starts in the background.
+    /// (<see cref="Inputs(ProjectCompiler)"/>), each test class's last result in it, and its hot reload session,
+    /// which starts in the background.
     /// </summary>
-    sealed class LiveHost(Process process, HostKey key, string inputs)
+    sealed class LiveHost(Process process, HostKey key, string inputs, Dictionary<string, TestCounts>? classes)
     {
         public Process Process => process;
         public HostKey Key => key;
         public string Inputs { get; set; } = inputs;
+        /// <summary>Each test class's last result in this host, by the framework's name for it; null if a run didn't account for every test by class.</summary>
+        public Dictionary<string, TestCounts>? Classes { get; set; } = classes;
         /// <summary>Null until the solution's units hold what the host loaded (see SolutionBuilder.WhenSettled); its result is null if it didn't start.</summary>
         public Task<HotReloadSession?>? Session { get; set; }
         public string? Failure { get; set; }
@@ -191,7 +195,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         {
             while (inHost.TryDequeue(out var test))
             {
-                var outcome = RunHosted(test.Unit, test.Request, inputs[test.Unit], kept, log);
+                var outcome = RunHosted(test.Unit, test.Request, inputs[test.Unit], all, kept, log);
                 if (outcome is not null)
                 {
                     lock (_recent)
@@ -293,15 +297,16 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// Runs a test project in a host: in its live host, with the edit since its last run as a delta, if the
     /// edit hot reloads (see <see cref="Plan"/>); otherwise in a host that loads it anew. Null if the host ran
     /// no tests, which `dotnet test` then settles. A host that can stay up after its run goes to
-    /// <paramref name="kept"/>.
+    /// <paramref name="kept"/>. With <paramref name="all"/>, a hot reload runs every test, not only those the
+    /// delta can reach.
     /// </summary>
-    Outcome? RunHosted(ProjectCompiler unit, TestHostRequest request, string inputs, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
+    Outcome? RunHosted(ProjectCompiler unit, TestHostRequest request, string inputs, bool all, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
     {
         LiveHost? live;
         lock (_idleHosts)
             _live.Remove(request.Assembly, out live);
         if (live is not null)
-            return HotReload(unit, request, live, inputs, kept, log);
+            return HotReload(unit, request, live, inputs, all, kept, log);
 
         var stopwatch = Stopwatch.StartNew();
         var output = new List<string>();
@@ -320,7 +325,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         Stopwatch stopwatch, List<string> output, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
     {
         if (hotReload && result is { CannotHotReload: null })
-            kept.Add((unit, new LiveHost(host, key, inputs)));
+            kept.Add((unit, new LiveHost(host, key, inputs, result.Error is null ? result.Classes : null)));
         else
         {
             var why = result is null ? "it exited mid-run"
@@ -338,14 +343,18 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
 
     /// <summary>
     /// Logs a host's run of a test assembly in one piece, as `dotnet test` reports it, with "(hot reloaded)" after
-    /// the summary of a run in a host that took the edit as a delta; null if it ran no tests.
+    /// the summary of a run in a host that took the edit as a delta; null if it ran no tests. A run of some test
+    /// classes (<paramref name="unchanged"/> has the others' last results) that ran none has no summary line, and
+    /// its outcome counts the others too.
     /// </summary>
-    Outcome? Report(string assembly, TestHostResult result, Stopwatch stopwatch, List<string> output, Action<string> log, bool hotReloaded = false)
+    Outcome? Report(string assembly, TestHostResult result, Stopwatch stopwatch, List<string> output, Action<string> log, bool hotReloaded = false,
+        string[]? classes = null, Dictionary<string, TestCounts>? unchanged = null)
     {
         _lastDuration[assembly] = stopwatch.Elapsed;
         var name = Path.GetFileName(assembly);
-        // An empty run proves nothing: the host may have missed tests that dotnet test would find.
-        var fallback = result.Unsupported ?? (result is { Total: 0, Error: null } ? "the test host found no tests" : null);
+        // An empty run proves nothing: the host may have missed tests that dotnet test would find. One that was
+        // asked to run no test class ran what it should.
+        var fallback = result.Unsupported ?? (result is { Total: 0, Error: null } && classes is not [] ? "the test host found no tests" : null);
         if (fallback is not null)
         {
             lock (_hostConfigs)
@@ -356,35 +365,50 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return null;
         }
 
+        // Classes run again unless they passed (TestSelection's caller), so the unchanged ones passed.
         var passed = result.Error is null && result.Failed == 0;
         if (result.Error is not null)
             output.Add($"blaze-cs: {name}: {result.Error}");
         // As `dotnet test` labels it: a run that only skipped tests is "Skipped!".
         var label = !passed ? "Failed!" : result is { Passed: 0, Skipped: > 0 } ? "Skipped!" : "Passed!";
-        output.Add($"{label}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
-            + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}{(hotReloaded ? " (hot reloaded)" : "")}");
+        if (classes is not [] || result.Total > 0 || result.Error is not null)
+            output.Add($"{label}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
+                + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}{(hotReloaded ? " (hot reloaded)" : "")}");
         lock (_hostConfigs)
             output.ForEach(log);
-        return new Outcome(passed, result.Skipped > 0 ? $"{result.Passed} passed, {result.Skipped} skipped" : $"{result.Passed} passed", hotReloaded);
+        var all = (unchanged?.Values ?? Enumerable.Empty<TestCounts>()).Aggregate(new TestCounts(result.Passed, result.Failed, result.Skipped), (sum, counts) => sum + counts);
+        return new Outcome(passed, Counts(all), hotReloaded);
     }
+
+    /// <summary>A passing run's counts, in a few words.</summary>
+    static string Counts(TestCounts counts) => counts.Skipped > 0 ? $"{counts.Passed} passed, {counts.Skipped} skipped" : $"{counts.Passed} passed";
 
     /// <summary>
     /// Runs a test project in its live host: sends it the edit since its last run as a delta and reports the run
-    /// that follows, if the edit hot reloads (<see cref="Plan"/>) and the host applies it. Otherwise the project
-    /// runs as it would without hot reload (<see cref="RunLive"/>): the live host and its session end, and the
-    /// project runs in a new host, which can stay up for the next edit with a session of its own.
+    /// that follows, if the edit hot reloads (<see cref="Plan"/>) and the host applies it. The run is of the test
+    /// classes the delta can reach (<see cref="Narrow"/>), or with <paramref name="all"/>, of every test. Otherwise
+    /// the project runs as it would without hot reload (<see cref="RunLive"/>): the live host and its session end,
+    /// and the project runs in a new host, which can stay up for the next edit with a session of its own.
     /// </summary>
-    Outcome? HotReload(ProjectCompiler unit, TestHostRequest request, LiveHost live, string inputs, ConcurrentBag<(ProjectCompiler, LiveHost)> kept, Action<string> log)
+    Outcome? HotReload(ProjectCompiler unit, TestHostRequest request, LiveHost live, string inputs, bool all, ConcurrentBag<(ProjectCompiler, LiveHost)> kept,
+        Action<string> log)
     {
         var stopwatch = Stopwatch.StartNew();
         var name = Path.GetFileName(request.Assembly);
         var pid = live.Process.Id;
         HotReloadSession? session = null;
         TestHostUpdate? update = null;
+        (string[] Classes, Dictionary<string, TestCounts> Unchanged)? narrowed = null;
         string? reason;
         try
         {
             (session, update, reason) = Plan(live, inputs);
+            if (update is not null)
+            {
+                narrowed = !all ? Narrow(request.Assembly, live, session!, update) : null;
+                if (narrowed is var (classes, _))
+                    update = update with { Classes = classes };
+            }
         }
         catch (Exception e)
         {
@@ -430,6 +454,16 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) applied a delta to module {modules[delta.Module].Name} "
                     + $"({delta.Module}): {Types(delta)} updated");
             output.Insert(0, $"blaze-cs: {name}: hot reloaded {applied} into its test host (pid {pid})");
+            var ran = result.Error is null ? result.Classes : null;
+            if (narrowed is var (_, unchanged))
+            {
+                live.Classes = ran is null ? null : new(unchanged.Concat(ran), StringComparer.Ordinal);
+                if (unchanged.Count > 0)
+                    output.Insert(1, $"blaze-cs: {name}: unchanged since last run: "
+                        + string.Join(", ", unchanged.OrderBy(c => c.Key, StringComparer.Ordinal).Select(c => $"{TestSelection.Display(c.Key)} ({Counts(c.Value)})")));
+            }
+            else
+                live.Classes = ran;
             try
             {
                 session.Commit();
@@ -448,7 +482,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         }
         else
             End(live);
-        return Report(request.Assembly, result, stopwatch, output, log, hotReloaded: true);
+        return Report(request.Assembly, result, stopwatch, output, log, hotReloaded: true, classes: update.Classes, unchanged: narrowed?.Unchanged);
     }
 
     /// <summary>A run in a host: the host, its result (null if the host exited first), and why the run left the live host for a new one, if it did.</summary>
@@ -471,7 +505,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             reason = result is null ? "the host exited"
                 : result.Unsupported
                 // After an update, a run without tests means the framework didn't find them again; a new host settles it.
-                ?? (result is { Total: 0, Error: null } ? "it found no tests after the update" : null);
+                // Unless the update named no test class to run (TestSelection): then it ran none, as it should.
+                ?? (result is { Total: 0, Error: null } && update.Classes is not [] ? "it found no tests after the update" : null);
             if (reason is null)
                 return new(live, result, null);
         }
@@ -489,6 +524,42 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// <summary>The line that tells the user a test project's edit didn't hot reload, and why.</summary>
     internal static string FallbackLine(string assembly, string reason) =>
         $"blaze-cs: {Path.GetFileName(assembly)}: not hot reloaded: {reason.ReplaceLineEndings(" ")}; running it in a new test host";
+
+    /// <summary>
+    /// The test classes a delta's run is of: those that can reach a type the delta updated (TestSelection), and
+    /// those whose last run in the host failed; the others' last results stand. Null, with the reason in the
+    /// daemon log, if every test runs.
+    /// </summary>
+    (string[] Classes, Dictionary<string, TestCounts> Unchanged)? Narrow(string assembly, LiveHost live, HotReloadSession session, TestHostUpdate update)
+    {
+        var name = Path.GetFileName(assembly);
+        var host = $"hot reload: test host {live.Process.Id} ({name})";
+        if (live.Classes is not { } last)
+        {
+            Console.WriteLine($"{DateTime.Now:O} {host} runs every test: its last run didn't give every test's class");
+            return null;
+        }
+        TestSelection.Selection selection;
+        try
+        {
+            var baselines = session.Modules.ToDictionary(module => module.Mvid, module => module.Snapshot);
+            selection = TestSelection.Select(assembly, [.. session.Modules.Select(module => module.Loaded).Append(assembly).Distinct(PathComparer.Instance)],
+                update.Deltas.Select(delta => (delta.Baseline ?? baselines[delta.Module], delta.UpdatedTypes)), last.Keys);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or BadImageFormatException or InvalidOperationException or KeyNotFoundException)
+        {
+            selection = new TestSelection.Selection(null, $"its assemblies' metadata couldn't be read: {e.Message}");
+        }
+        if (selection.Classes is not { } reached)
+        {
+            Console.WriteLine($"{DateTime.Now:O} {host} runs every test: {selection.Everything}");
+            return null;
+        }
+        var classes = last.Keys.Where(c => reached.Contains(c) || last[c].Failed > 0).Order(StringComparer.Ordinal).ToArray();
+        Console.WriteLine($"{DateTime.Now:O} {host} runs {classes.Length} of {last.Count} test classes, those the delta can reach"
+            + (classes.Length > reached.Count ? " or that failed last" : "") + (classes.Length > 0 ? $": {string.Join(", ", classes)}" : ""));
+        return (classes, last.Where(c => !classes.Contains(c.Key)).ToDictionary(StringComparer.Ordinal));
+    }
 
     /// <summary>
     /// Whether an edit hot reloads into a live host, and the update that carries it; otherwise why not. The

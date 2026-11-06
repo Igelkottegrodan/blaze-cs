@@ -20,9 +20,14 @@ public sealed class WelcomeTests
         Assert.AreEqual("from runsettings", Environment.GetEnvironmentVariable("BLAZE_CS_FIXTURE_VARIABLE"));
         Assert.AreEqual("from runsettings", TestContext.Properties["fixtureParameter"]);
     }
+}
 
+// Uses nothing of Lib, so a hot reloaded edit there runs only WelcomeTests, and lists this class as unchanged.
+[TestClass]
+public sealed class RuntimeTests
+{
     [TestMethod]
     public void RunsOnTargetRuntime() => Assert.AreEqual(
-        typeof(WelcomeTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "TargetRuntimeMajor").Value,
+        typeof(RuntimeTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "TargetRuntimeMajor").Value,
         Environment.Version.Major.ToString());
 }

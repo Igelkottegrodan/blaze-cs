@@ -1096,11 +1096,14 @@ Dictionary<int, string> ReadyLiveHosts(string when, string[] projects)
 }
 
 // A method body edit in Lib reaches the hosts that stay up for the Debug test projects as a delta: each runs its
-// tests again in the same process (the output and the daemon log name the host and the module), with the same
-// passes and failures as `dotnet test` of the same build, and Lib's files on disk are what dotnet build makes.
-// Undone, the tests pass again, in the hosts that stay up then. (Five test projects run with Lib, and hosts
-// stay up for the four run most recently.) ComponentTests is compiled with optimizations, as in Release: its
-// host never stays up, so each run of it is in a new host, and the daemon log says why.
+// tests again in the same process (the output and the daemon log name the host and the module), and Lib's files
+// on disk are what dotnet build makes. Only the test classes that reach Lib's Greeter run (TestSelection): in each
+// project whose host stayed up, WelcomeTests runs and RuntimeTests is listed as unchanged since its last run, with
+// its result; the passes and failures are those of `dotnet test` of the same build without RuntimeTests. Undone
+// with `test --all`, every test of every project runs and passes, in the hosts that stay up then. (Five test
+// projects run with Lib, and hosts stay up for the four run most recently.) ComponentTests is compiled with
+// optimizations, as in Release: its host never stays up, so each run of it is in a new host, and the daemon log
+// says why.
 void HotReloadBodyEdit()
 {
     if (HotReloadUnavailableBecause() is { } reason)
@@ -1112,7 +1115,7 @@ void HotReloadBodyEdit()
     var releaseHosts = new List<int>();
     foreach (var undo in new[] { false, true })
     {
-        var name = undo ? "hot reload undone" : "hot reload";
+        var name = undo ? "hot reload undone, test --all" : "hot reload";
         var idle = IdleHosts($"before {name}"); // and the hosts of projects no longer among the most recent are gone
         var live = ReadyLiveHosts(name, libTests);
         // A run right after the one before ends the hosts whose sessions weren't ready: body edits until some are.
@@ -1133,7 +1136,7 @@ void HotReloadBodyEdit()
             Replace("Lib/Greeter.cs", "\"Howdy there, \"", "\"Hello there, \"");
         else
             Replace("Lib/Greeter.cs", "\"Hello there, \"", "\"Howdy there, \"");
-        var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+        var (output, exitCode) = RunWithExit(blaze, undo ? "test --all" : "test", check: false);
         if (!Rebuilt(output).SetEquals(lib))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", lib)}:\n{output}");
         var reloaded = Regex.Matches(output, @"^blaze-cs: (\w+)\.dll: hot reloaded Lib \(net10\.0\) \(1 type\) into its test host \(pid (\d+)\)", RegexOptions.Multiline)
@@ -1148,17 +1151,31 @@ void HotReloadBodyEdit()
             || why != $"{release} is compiled with optimizations (Release), so its hosts never take updates" || log.Contains($"stays up for {release}"))
             Fail($"{name}: expected {release} to run in a new host that doesn't stay up, and the daemon log to say it is compiled with optimizations:\n{log}");
         releaseHosts.Add(pid);
+        var unchanged = UnchangedClasses(output);
         if (undo)
-            RanTests(name, output, libTests);
+        {
+            if (unchanged.Count > 0)
+                Fail($"{name}: expected every test class to run:\n{output}");
+            RanTests(name, output, allTests);
+        }
         else
         {
             if (exitCode == 0)
                 Fail($"{name}: expected each greeting test to fail on \"Howdy\":\n{output}");
+            foreach (var project in libTests)
+            {
+                string[] expected = live.ContainsValue(project) ? ["RuntimeTests (1 passed)"] : [];
+                if (!unchanged.GetValueOrDefault(project, []).SequenceEqual(expected))
+                    Fail($"{name}: {project}: expected {(expected.Length == 0 ? "no test class" : string.Join(", ", expected))} listed as unchanged since last run:\n{output}");
+            }
+            if (live.FirstOrDefault(host => !Regex.IsMatch(log, $@"hot reload: test host {host.Key} \({host.Value}\.dll\) runs 1 of 2 test classes, those the delta can reach: ")) is { Key: > 0 } unnarrowed)
+                Fail($"{name}: expected the daemon log to say host {unnarrowed.Key} runs the one test class that reaches Greeter:\n{log}");
             SameAsDotnetTest(name, output, libTests);
         }
         Verify(name, [.. lib], null);
     }
-    Console.WriteLine($"ok  hot reload: a Lib body edit and its undo reached the hosts that stayed up ({string.Join(", ", reloadedInto.Order())}) as deltas, in the same processes; the failures matched dotnet test's");
+    Console.WriteLine($"ok  hot reload: a Lib body edit and its undo reached the hosts that stayed up ({string.Join(", ", reloadedInto.Order())}) as deltas, in the same processes; "
+        + "the edit ran only the test classes that reach Greeter, listed the rest as unchanged, and matched dotnet test without them; test --all ran every test");
     Console.WriteLine($"ok  hot reload, Release: {release} ran in a new host each time (pids {string.Join(", ", releaseHosts)}), started without the runtime's switch for updates; the daemon log said it is compiled with optimizations");
 }
 
@@ -1364,14 +1381,23 @@ void ToggleShout()
         Replace("Lib/Greeter.cs", "who.ToUpperInvariant()", "who.ToUpperInvariant().ToString()");
 }
 
-// Each project's summary and failed tests in a blaze-cs run, as `dotnet test --no-build` reports them.
+// The test classes each hot reloaded project lists as unchanged since its last run, with their results, by project:
+// "blaze-cs: Tests.dll: unchanged since last run: RuntimeTests (1 passed), ...".
+static Dictionary<string, string[]> UnchangedClasses(string output) =>
+    Regex.Matches(output, @"^blaze-cs: (\w+)\.dll: unchanged since last run: (.+?)\r?$", RegexOptions.Multiline)
+        .ToDictionary(m => m.Groups[1].Value, m => Regex.Matches(m.Groups[2].Value, @"[^,(]+ \([^)]*\)").Select(c => c.Value.Trim()).ToArray());
+
+// Each project's summary and failed tests in a blaze-cs run, as `dotnet test --no-build` reports them, without the
+// test classes the run lists as unchanged.
 void SameAsDotnetTest(string name, string output, string[] projects)
 {
     var ours = Summaries(output);
     var ourFailures = FailedTests(output);
+    var unchanged = UnchangedClasses(output);
     foreach (var project in projects)
     {
-        var theirOutput = RunWithExit("dotnet", $"test --no-build {project} -nologo", check: false).Output;
+        var filter = string.Join("&", unchanged.GetValueOrDefault(project, []).Select(c => $"FullyQualifiedName!~.{c.Split(" (")[0]}."));
+        var theirOutput = RunWithExit("dotnet", $"test --no-build {project} -nologo" + (filter.Length > 0 ? $" --filter \"{filter}\"" : ""), check: false).Output;
         var theirs = Summaries(theirOutput).GetValueOrDefault(project);
         var theirFailures = FailedTests(theirOutput).Values.SelectMany(names => names).Select(Method).ToHashSet();
         if (ours.GetValueOrDefault(project) is not { } summary || summary != theirs
@@ -1839,7 +1865,8 @@ static Dictionary<string, Summary> Summaries(string output) =>
 // counted as dotnet test counts them (explicit tests that weren't asked for aren't), and none through
 // dotnet test, since the warm host must run them on the runtime each one targets. Every other test
 // project in the solution (`among`, by default all) is listed as unchanged since its last run. A project
-// whose last pass was hot reloaded is among the expected ones: such a pass doesn't count.
+// whose last pass was hot reloaded is among the expected ones: such a pass doesn't count. A hot reloaded
+// project's run may leave out test classes that it lists as unchanged, each with its tests passed.
 void RanTests(string name, string output, string[] expected, string[]? among = null)
 {
     among ??= allTests;
@@ -1854,9 +1881,13 @@ void RanTests(string name, string output, string[] expected, string[]? among = n
         Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Keys.Order())}:\n{output}");
     if (output.Contains("running dotnet test"))
         Fail($"{name}: expected the test host to run these, not dotnet test:\n{output}");
+    var unchangedClasses = UnchangedClasses(output);
     foreach (var (project, summary) in summaries)
-        if (summary != new Summary("Passed!", 0, TestCount(project), 0, TestCount(project)))
-            Fail($"{name}: {project}: expected {TestCount(project)} tests passed and no others, got {summary}:\n{output}");
+    {
+        var count = TestCount(project) - unchangedClasses.GetValueOrDefault(project, []).Sum(c => int.Parse(Regex.Match(c, @"\((\d+) passed\)$").Groups[1].Value));
+        if (summary != new Summary("Passed!", 0, count, 0, count))
+            Fail($"{name}: {project}: expected {count} tests passed and no others, got {summary}:\n{output}");
+    }
 }
 
 // Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings;

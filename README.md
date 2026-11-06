@@ -158,6 +158,17 @@ its own:
   - A delta to a project output the tests hadn't loaded yet loads it from the daemon's copy in
     `.blaze-cs/hotreload/`, so its `Assembly.Location` is that copy, not the `bin/` file.
   - Not on Windows yet: a host that stays up would keep the project outputs it loaded locked.
+- **Only the test classes a hot reload can reach.** After a hot reload, only the test classes that can run
+  the updated code run: those whose code, through a chain of types each naming the next (in the
+  solution's assemblies the tests run with), uses an updated type, plus those whose last run failed. The
+  others are listed as unchanged since their last run, with their result:
+  `blaze-cs: Tests.dll: unchanged since last run: RuntimeTests (1 passed)`. Every test runs when code may
+  reach the updated type without naming it (an interface or a base class, a type that implements or
+  derives from one, a generic type, a type with a framework attribute), when code that runs around every
+  test (a module initializer, an assembly fixture, assembly initialize) reaches it, or when the framework
+  names a test class after no type (a generic test class); the daemon log says which. A test class that
+  looks types up by name (`Type.GetType`, `Assembly.GetTypes`, `Activator.CreateInstance`) runs after
+  every hot reload. `blaze-cs test --all` runs every test.
 - **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
   (its own, and every project output copied next to it), its `.deps.json` or its `.runsettings` differs
   from when it last ran in this daemon, when it hasn't run in this daemon yet, or when its last run
@@ -267,9 +278,9 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | Path | What |
 |---|---|
 | `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
-| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner, compiler-server pipe (`CompilerServer`, `CompilerServerProtocol`), and hot reload through the SDK's Edit and Continue engine (`HotReload`) |
+| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner, compiler-server pipe (`CompilerServer`, `CompilerServerProtocol`), hot reload through the SDK's Edit and Continue engine (`HotReload`), and the test classes a hot reload can reach (`TestSelection`) |
 | `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile, each project's `RunSettingsFilePath` |
-| `src/BlazeCs.TestHost` | the test host (xUnit v2 and v3, NUnit, MSTest), and its protocol with the daemon (`Protocol.cs`): one run, then, started with `DOTNET_MODIFIABLE_ASSEMBLIES=debug`, metadata deltas applied and the tests run again in the same process |
+| `src/BlazeCs.TestHost` | the test host (xUnit v2 and v3, NUnit, MSTest), and its protocol with the daemon (`Protocol.cs`): one run, then, started with `DOTNET_MODIFIABLE_ASSEMBLIES=debug`, metadata deltas applied and the tests run again in the same process, all of them or those of the classes the daemon names |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, what counts as a dependent naming an identifier, the test host applying a delta (with `tests/TestHostKits`, each test framework's packages), and the compiler-server wire format against the SDK's own implementation |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
