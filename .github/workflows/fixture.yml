@@ -8,12 +8,23 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The SDK the fixture solution is built and compared with; blaze-cs itself always builds on global.json's.
+        sdk: ['10.0.x', '11.0.x']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+          dotnet-quality: preview
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: task check
+      - run: task build
+      - run: BLAZE_CS_SDK="$(dotnet --list-sdks | grep "^${SDK%.x}" | tail -1 | cut -d' ' -f1)" dotnet run tests/fixture/check.cs
+        env:
+          SDK: ${{ matrix.sdk }}

@@ -113,8 +113,9 @@ static class Program
         // Detached into its own session so it outlives this terminal and ignores its Ctrl+C.
         var start = new ProcessStartInfo("/bin/sh") { UseShellExecute = false };
         start.ArgumentList.Add("-c");
-        start.ArgumentList.Add("setsid \"$0\" \"$1\" daemon \"$2\" </dev/null >>\"$3\" 2>&1 &");
+        start.ArgumentList.Add("setsid \"$0\" exec --runtimeconfig \"$1\" \"$2\" daemon \"$3\" </dev/null >>\"$4\" 2>&1 &");
         start.ArgumentList.Add(Environment.ProcessPath!);
+        start.ArgumentList.Add(SdkRoslyn.CompilerRuntimeConfig(Path.GetDirectoryName(solutionPath)!));
         start.ArgumentList.Add(typeof(Program).Assembly.Location);
         start.ArgumentList.Add(solutionPath);
         start.ArgumentList.Add(log);
