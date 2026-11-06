@@ -206,9 +206,16 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
 
         foreach (var unit in affected.Except(hosted.Select(test => test.Unit)))
             Record(unit, DotnetTest(unit, log));
-        Task.WaitAll(workers);
-        foreach (var (unit, host) in kept)
-            Keep(unit, host);
+        try
+        {
+            Task.WaitAll(workers);
+        }
+        finally
+        {
+            // Also when a worker threw: the hosts that ran are kept, or ended if they can't be.
+            foreach (var (unit, host) in kept)
+                Keep(unit, host);
+        }
         return failed > 0 ? 1 : 0;
     }
 
@@ -388,15 +395,28 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var key = Key(request.Framework, request.Assembly, request.RunSettings, unit.Debug);
         var hotReload = false;
         var output = new List<string>();
-        var run = RunLive(live.Process, update, reason, request, () =>
+        var ended = false;
+        HostRun run;
+        try
         {
-            (var host, hotReload) = TakeHost(request.Assembly, key, replacing: true);
-            return host;
-        }, output, announce: !(update is null && reason == NothingChanged));
+            run = RunLive(live.Process, update, reason, request, () =>
+            {
+                // Ended before its replacement starts: if starting that throws, the live host doesn't stay behind.
+                ended = true;
+                End(live);
+                (var host, hotReload) = TakeHost(request.Assembly, key, replacing: true);
+                return host;
+            }, output, announce: !(update is null && reason == NothingChanged));
+        }
+        catch
+        {
+            if (!ended)
+                End(live);
+            throw;
+        }
         if (run.Fallback is not null)
         {
             Console.WriteLine($"{DateTime.Now:O} hot reload: test host {pid} ({name}) ends, and {name} runs in a new host ({run.Host.Id}): {run.Fallback}");
-            End(live);
             return Finish(unit, request, inputs, key, run.Host, hotReload, run.Result, stopwatch, output, kept, log);
         }
 
@@ -522,6 +542,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             return (session, null, updates.Errors.FirstOrDefault() ?? $"the engine's status is {updates.Status}");
         if (updates.ProjectsToRestartOrRebuild > 0)
             return (session, null, "the engine asks for a restart or rebuild" + (updates.RudeEdits.FirstOrDefault() is { } rude ? $": {rude}" : ""));
+        // A rude edit that comes as a warning with a delta anyway (ENC0118: a static field's initializer "might not
+        // have any effect until the application is restarted") would run the tests on the old behavior and pass.
+        if (updates.RudeEdits.FirstOrDefault() is { } warned)
+            return (session, null, $"the engine reports a rude edit: {warned}");
         var updated = updates.Deltas.Select(delta => keys[delta.Project]).ToHashSet(PathComparer.Instance);
         if (changed.Select(path => loaded[path]).FirstOrDefault(module => !updated.Contains(module.Key)) is { } missed)
             return (session, null, $"{missed.Name} changed, and the engine has no delta for it");
