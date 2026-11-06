@@ -69,19 +69,21 @@ static class Daemon
             int exitCode;
             try
             {
+                // The socket goes before the reply: once the client has its answer it may start a daemon that
+                // binds the same path, and a later delete would remove that daemon's socket.
                 if (request?.Command == "stop")
                 {
+                    File.Delete(socketPath);
                     Log("blaze-cs: daemon stopped");
                     writer.WriteLine($"{ExitPrefix}0");
-                    File.Delete(socketPath);
                     return 0;
                 }
 
                 if (request?.Build != Build)
                 {
                     Console.WriteLine($"{DateTime.Now:O} a client of another build sent {request?.Command}; exiting");
-                    writer.WriteLine($"{RestartPrefix}{Environment.ProcessId}");
                     File.Delete(socketPath);
+                    writer.WriteLine($"{RestartPrefix}{Environment.ProcessId}");
                     return 0;
                 }
 
