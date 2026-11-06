@@ -63,14 +63,14 @@ sealed class SolutionBuilder
     public bool Load(Action<string> log, bool fresh = false, bool warmUpLater = false)
     {
         var cached = fresh ? [] : UnitsCache.Read();
-        var binlog = Path.Combine(_stateDirectory, "build.binlog");
-        var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly -bl:\"{binlog}\"" + (cached.Count == 0 ? " --no-incremental" : "");
-        if (RunDotnet(arguments, log) != 0)
+        var record = Path.Combine(_stateDirectory, "build.json");
+        var arguments = $"build \"{_solutionPath}\" -nologo -v:q -clp:ErrorsOnly {BuildLog.LoggerSwitch(record)}" + (cached.Count == 0 ? " --no-incremental" : "");
+        if (RunDotnet(arguments, log, BuildLog.LoggerEnvironment) != 0)
             return false;
         _retry = [];
 
         var stopwatch = Stopwatch.StartNew();
-        var info = BuildLog.Read(binlog, _sdkDirectory);
+        var info = BuildLog.Read(record, _sdkDirectory);
         var read = stopwatch.ElapsedMilliseconds;
         // An incremental build logs csc only for the projects it compiled, so the cache holds the rest. One
         // the build didn't run CoreCompile for any more (removed from the solution, a target framework
@@ -228,7 +228,7 @@ sealed class SolutionBuilder
     bool StaleAfterWarmUp(Action<string> log, IReadOnlyCollection<ProjectCompiler> units, HashSet<string> logged, bool fresh)
     {
         var mismatched = WarmUp(log, units);
-        // The build log's tree and the images just read are garbage now, hundreds of MB per load. The
+        // The build log and the images just read are garbage now, hundreds of MB per load. The
         // server GC on many cores lets that pile up over several loads (jellyfin: 1.7 GB to 3.1 GB RSS)
         // before it collects; collected here, after a step MSBuild or the warm-up already made slow, it
         // costs ~0.1 s.
@@ -781,7 +781,7 @@ sealed class SolutionBuilder
     }
 
     /// <summary>Runs the real `dotnet` with its output streamed to the client.</summary>
-    public int RunDotnet(string arguments, Action<string> log)
+    public int RunDotnet(string arguments, Action<string> log, IReadOnlyDictionary<string, string>? environment = null)
     {
         var start = new ProcessStartInfo("dotnet", arguments)
         {
@@ -790,6 +790,8 @@ sealed class SolutionBuilder
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        foreach (var (name, value) in environment ?? new Dictionary<string, string>())
+            start.Environment[name] = value;
         using var process = new Process { StartInfo = start };
         process.OutputDataReceived += (_, e) => { if (e.Data is not null) log(e.Data); };
         process.ErrorDataReceived += (_, e) => { if (e.Data is not null) log(e.Data); };

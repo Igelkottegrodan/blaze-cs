@@ -103,11 +103,11 @@ bitwarden/server, clone it into `bench/bitwarden` (its RustSdk project needs `ca
 A daemon keeps your solution compiled in memory, with Roslyn and MSBuild under it instead of a compiler of
 its own:
 
-- **Same output as `dotnet build`.** The daemon takes each project's exact compiler arguments from the
-  binlog of that build and compiles with the Roslyn that ships with your SDK. It writes the same files
-  to `obj/` and `bin/`, so your IDE, `dotnet run`, `dotnet test` and later `dotnet build`s keep working.
-  On jellyfin, every one of its 41 assemblies comes out byte-identical to `dotnet build`'s; on
-  bitwarden/server, 88 of its 89 (the 89th lists a source file twice, [#56](https://github.com/Igelkottegrodan/blaze-cs/issues/56)).
+- **Same output as `dotnet build`.** The daemon takes each project's exact compiler arguments from that
+  build, through a small MSBuild logger of its own, and compiles with the Roslyn that ships with your
+  SDK. It writes the same files to `obj/` and `bin/`, so your IDE, `dotnet run`, `dotnet test` and later
+  `dotnet build`s keep working. On jellyfin, every one of its 41 assemblies comes out byte-identical to
+  `dotnet build`'s; on bitwarden/server, 88 of its 89 (the 89th lists a source file twice, [#56](https://github.com/Igelkottegrodan/blaze-cs/issues/56)).
 - **Only what changed.** It recompiles the projects whose sources changed. When a project's public API
   changes, it diffs the API member by member and recompiles only the dependents that use a changed
   member (or whose source generators' output changes). Changes that code can reach without naming them
@@ -170,7 +170,8 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 | Path | What |
 |---|---|
 | `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
-| `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
+| `src/BlazeCs` | CLI client and daemon: build log reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
+| `src/BlazeCs.Logger` | the MSBuild logger the daemon's `dotnet build` runs with: compiler command lines, copies, tasks after compile |
 | `src/BlazeCs.TestHost` | the single-use test host (xUnit v2 and v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/BlazeCs.Tests` | xUnit v3 unit tests (`task test`, runs in CI): a table of API edits and which dependents each recompiles, and what counts as a dependent naming an identifier |
@@ -185,7 +186,7 @@ project compiled and does minimal work per edit, and its README's layout and pix
 also to the people who built:
 
 - [Roslyn](https://github.com/dotnet/roslyn), the compiler blaze-cs drives
-- [MSBuild](https://github.com/dotnet/msbuild) and [MSBuild Structured Log](https://github.com/KirillOsenkov/MSBuildStructuredLog), whose binlogs give each project's compiler arguments
+- [MSBuild](https://github.com/dotnet/msbuild), whose build events give each project's compiler arguments
 - [xUnit](https://xunit.net), [NUnit](https://nunit.org) and [MSTest](https://github.com/microsoft/testfx), whose runners the test host loads
 
 None of these projects endorses blaze-cs.

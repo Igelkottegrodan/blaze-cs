@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="src/BlazeCs.Client/BlazeCs.Client.csproj" />
   <Project Path="src/BlazeCs/BlazeCs.csproj" />
+  <Project Path="src/BlazeCs.Logger/BlazeCs.Logger.csproj" />
   <Project Path="src/BlazeCs.TestHost/BlazeCs.TestHost.csproj" />
   <Project Path="tests/BlazeCs.Tests/BlazeCs.Tests.csproj" />
 </Solution>
