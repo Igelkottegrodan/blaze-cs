@@ -66,9 +66,21 @@ sealed class SolutionBuilder
         var stopwatch = Stopwatch.StartNew();
         var info = BuildLog.Read(binlog, _sdkDirectory);
         var read = stopwatch.ElapsedMilliseconds;
-        var units = cached.ToDictionary(u => u.AssemblyPath, PathComparer.Instance);
+        // An incremental build logs csc only for the projects it compiled, so the cache holds the rest. One
+        // the build didn't run CoreCompile for any more (removed from the solution, a target framework
+        // dropped) is no unit: it is dropped here, before anything is read for it.
+        var units = cached.Where(u => info.Compiled.Contains(u.Key)).ToDictionary(u => u.AssemblyPath, PathComparer.Instance);
         foreach (var unit in info.Units)
             units[unit.AssemblyPath] = unit;
+
+        // A project the build did run CoreCompile for but csc not (it was removed and is back, with its
+        // obj/ up to date) has no arguments yet: compile everything once to log them all.
+        var keys = units.Values.Select(u => u.Key).ToHashSet(PathComparer.Instance);
+        if (!fresh && info.Compiled.FirstOrDefault(key => !keys.Contains(key)) is { } missing)
+        {
+            log($"blaze-cs: {missing[(missing.IndexOf('|') + 1)..]} has no cached compiler arguments; running dotnet build --no-incremental");
+            return Load(log, fresh: true);
+        }
         UnitsCache.Write(units.Values);
 
         _copies = new(PathComparer.Instance);
@@ -119,6 +131,12 @@ sealed class SolutionBuilder
         {
             _surfaces.TryRemove(gone, out _);
             _lastDuration.TryRemove(gone, out _);
+        }
+        // The files the daemon wrote or verified for a unit that left the solution.
+        foreach (var gone in held.Values.Except(compilers))
+        {
+            foreach (var path in new[] { gone.AssemblyPath, gone.PdbPath, gone.ReferenceAssemblyPath }.OfType<string>())
+                _published.TryRemove(path, out _);
         }
 
         // A kept unit needs no compile to be trusted while its assembly on disk is still the bytes the
