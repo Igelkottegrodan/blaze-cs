@@ -124,6 +124,7 @@ try
     RunSettingsTheHostDoesNotApply();
     AllTestsSkipped();
     DaemonLifecycle();
+    ParentFails();
     passed = true;
 }
 catch (CheckFailed failure)
@@ -263,6 +264,60 @@ void RunSettingsTheHostDoesNotApply()
         Fail($"runsettings the host doesn't apply: expected NUnitTests to pass under dotnet test:\n{output}");
     Console.WriteLine("ok  runsettings the host doesn't apply: dotnet test ran the project");
 }
+
+// An API change in Lib whose compile, or whose writes, fail: the build fails naming the cause, and Consumer,
+// though it may compile against Lib's new image while Lib's files are written, writes nothing. Once the
+// cause is gone, the next build brings every output back to what dotnet build makes.
+void ParentFails()
+{
+    const string greet = "Greet(string person) => \"Hello there, \" + person";
+    Dictionary<string, byte[]> ConsumerOutputs(string framework) =>
+        Outputs().Where(o => o.Key.StartsWith($"Consumer/obj/Debug/{framework}/", StringComparison.Ordinal)).ToDictionary();
+    void Unchanged(string name, Dictionary<string, byte[]> before, string framework)
+    {
+        var after = ConsumerOutputs(framework);
+        if (before.Count == 0 || before.Any(o => !after.TryGetValue(o.Key, out var bytes) || !bytes.AsSpan().SequenceEqual(o.Value)))
+            Fail($"{name}: expected Consumer ({framework}) to write nothing");
+    }
+
+    var consumer10 = ConsumerOutputs("net10.0");
+    var consumer8 = ConsumerOutputs("net8.0");
+    Replace("Lib/Greeter.cs", greet, "Greet(string name) => \"Hello there, \" + person");
+    var (output, exitCode) = RunWithExit(blaze, "build", check: false);
+    if (exitCode == 0 || !output.Contains("error CS0103") || !output.Contains("blaze-cs: build failed"))
+        Fail($"failing compile in Lib: expected the build to fail with CS0103, got exit {exitCode}:\n{output}");
+    Unchanged("failing compile in Lib", consumer10, "net10.0");
+    Unchanged("failing compile in Lib", consumer8, "net8.0");
+    Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + person", greet);
+    var rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(lib))
+        Fail($"failing compile in Lib, fixed: expected blaze-cs to rebuild {string.Join(", ", lib)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+    Verify("failing compile in Lib, fixed", rebuilt, null);
+
+    // A directory where Lib's net10.0 PDB is first written makes that write fail; its assembly is already written.
+    var pdb = Directory.EnumerateFiles(Path.Combine(work, "Lib", "obj"), "Lib.pdb", SearchOption.AllDirectories)
+        .Single(p => Path.GetFileName(Path.GetDirectoryName(p)) == "net10.0");
+    var obstacle = Directory.CreateDirectory(pdb + ".blaze-cs.tmp");
+    try
+    {
+        Replace("Lib/Greeter.cs", greet, "Greet(string name) => \"Hello there, \" + name");
+        (output, exitCode) = RunWithExit(blaze, "build", check: false);
+    }
+    finally
+    {
+        obstacle.Delete();
+    }
+    if (exitCode == 0 || !output.Contains("Lib.pdb.blaze-cs.tmp") || !output.Contains("blaze-cs: build failed"))
+        Fail($"failing write in Lib: expected the build to fail naming Lib.pdb.blaze-cs.tmp, got exit {exitCode}:\n{output}");
+    Unchanged("failing write in Lib", consumer10, "net10.0");
+    Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + name", greet);
+    string[] both = [.. consumer, .. lib];
+    rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(both))
+        Fail($"failing write in Lib, fixed: expected blaze-cs to rebuild {string.Join(", ", both)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+    Verify("failing write in Lib, fixed", rebuilt, null);
+}
+
 
 // With every test skipped, the warm host's summary reads like dotnet test's for each framework: "Skipped!"
 // and the same counts. The xUnit v3 project keeps its explicit test, which neither counts.

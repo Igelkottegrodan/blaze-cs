@@ -362,23 +362,58 @@ sealed class SolutionBuilder
             Unaffected.TryRemove(unit, out _);
             Interlocked.Increment(ref _compiles);
 
+            // Dependents need the new surface only if the image changes, but then they need it at once:
+            // build it while the emit runs.
+            var surface = builder._dependents[unit].Count > 0 ? Task.Run(() => new ApiSurface(prepared.Compilation)) : null;
             var (emitted, diagnostics) = unit.Emit(prepared);
             var compiled = Stopwatch.GetElapsedTime(started);
             builder._lastDuration[unit] = compiled;
-            Diagnostics[unit] = diagnostics;
             if (emitted is null)
             {
+                Diagnostics[unit] = diagnostics;
                 Failed[unit] = true;
                 Times[unit] = (compiled, unit.LastGeneratorTime, TimeSpan.Zero);
                 return;
             }
+
+            // This unit may have compiled against a reference's image whose files are still being written;
+            // it publishes nothing until they are, and if they fail it is blocked like a failed compile.
+            foreach (var dependency in builder._dependencies[unit])
+                _written.GetValueOrDefault(dependency)?.Wait();
+            if (builder._dependencies[unit].Any(Failed.ContainsKey))
+            {
+                Failed[unit] = true;
+                return;
+            }
+            Diagnostics[unit] = diagnostics;
             Failed.TryRemove(unit, out _);
 
+            // Dependents start on the new image and API change while this unit's files are written.
+            // Pending before the image is published, so no dependent that sees the image misses the wait.
             started = Stopwatch.GetTimestamp();
-            if (builder.Publish(unit, emitted) && builder._dependents[unit].Count > 0)
-                ScheduleDependents(unit, builder.SurfaceChange(unit, prepared));
+            var written = new TaskCompletionSource();
+            _written[unit] = written.Task;
+            try
+            {
+                var imageChanged = builder.PublishImage(unit, emitted);
+                if (imageChanged && surface is not null)
+                    ScheduleDependents(unit, builder.SurfaceChange(unit, surface.Result));
+                builder.Write(unit, emitted, imageChanged);
+            }
+            catch
+            {
+                Failed[unit] = true;
+                throw;
+            }
+            finally
+            {
+                written.SetResult();
+            }
             Times[unit] = (compiled, unit.LastGeneratorTime, Stopwatch.GetElapsedTime(started));
         }
+
+        /// <summary>Each unit's latest output writes, done once its files are on disk or have failed.</summary>
+        readonly ConcurrentDictionary<ProjectCompiler, Task> _written = new();
 
         void ScheduleDependents(ProjectCompiler unit, ApiChange change)
         {
@@ -390,38 +425,44 @@ sealed class SolutionBuilder
     readonly ConcurrentDictionary<ProjectCompiler, ApiSurface> _surfaces = new();
 
     /// <summary>What changed in a unit's API since its last image, which has just changed.</summary>
-    ApiChange SurfaceChange(ProjectCompiler unit, ProjectCompiler.Prepared prepared)
+    ApiChange SurfaceChange(ProjectCompiler unit, ApiSurface surface)
     {
-        var surface = new ApiSurface(prepared.Compilation);
         var change = _surfaces.TryGetValue(unit, out var before) ? surface.ChangeFrom(before) : ApiChange.All;
         _surfaces[unit] = surface;
         return change;
     }
 
-    /// <summary>Writes a unit's outputs where csc and MSBuild's copies would; true if its public API changed.</summary>
-    bool Publish(ProjectCompiler unit, EmitOutput output)
+    /// <summary>Makes a unit's new image the one dependents compile against; true if its public API changed.</summary>
+    bool PublishImage(ProjectCompiler unit, EmitOutput output)
     {
-        Write(unit.AssemblyPath, output.Assembly);
-        if (unit.PdbPath is { } pdb && output.Pdb is { } pdbBytes)
-            Write(pdb, pdbBytes);
-        if (unit.DocumentationPath is { } documentation && output.Documentation is { } documentationBytes)
-            Write(Path.GetFullPath(documentation, unit.Unit.ProjectDirectory), documentationBytes);
-
         // Dependents compile against exactly the bytes MSBuild would hand them: their PDBs record each
         // reference's MVID, timestamp and size, so any other image (even one that binds the same, like a
         // metadata-only emit) would make their output differ from `dotnet build`'s.
-        var image = unit.ReferenceAssemblyPath is null ? output.Assembly : output.ReferenceAssembly!;
+        var image = ImageBytes(unit, output);
         lock (_images)
         {
             if (_images.TryGetValue(unit.ImagePath, out var current) && current.Bytes.AsSpan().SequenceEqual(image))
                 return false;
             _images[unit.ImagePath] = new Image(image);
         }
+        return true;
+    }
+
+    static byte[] ImageBytes(ProjectCompiler unit, EmitOutput output) =>
+        unit.ReferenceAssemblyPath is null ? output.Assembly : output.ReferenceAssembly!;
+
+    /// <summary>Writes a unit's outputs where csc and MSBuild's copies would.</summary>
+    void Write(ProjectCompiler unit, EmitOutput output, bool imageChanged)
+    {
+        Write(unit.AssemblyPath, output.Assembly);
+        if (unit.PdbPath is { } pdb && output.Pdb is { } pdbBytes)
+            Write(pdb, pdbBytes);
+        if (unit.DocumentationPath is { } documentation && output.Documentation is { } documentationBytes)
+            Write(Path.GetFullPath(documentation, unit.Unit.ProjectDirectory), documentationBytes);
         // Like MSBuild's CopyRefAssembly: an unchanged reference assembly is left untouched, so nothing
         // that compiles against it looks out of date.
-        if (unit.ReferenceAssemblyPath is { } reference)
-            Write(reference, image);
-        return true;
+        if (imageChanged && unit.ReferenceAssemblyPath is { } reference)
+            Write(reference, ImageBytes(unit, output));
     }
 
     /// <summary>Writes an output and its copies, unless it already holds these bytes.</summary>
