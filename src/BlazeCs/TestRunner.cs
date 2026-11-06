@@ -79,6 +79,11 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         public string Inputs { get; set; } = inputs;
         /// <summary>Each test class's last result in this host, by the framework's name for it; null if a run didn't account for every test by class.</summary>
         public Dictionary<string, TestCounts>? Classes { get; set; } = classes;
+        /// <summary>
+        /// The test classes that ran in a hot reloaded run in this host: their last result is hot reloaded, and
+        /// may rest on statics the code before an edit computed. Every other class's is from the host's first run.
+        /// </summary>
+        public HashSet<string> Reloaded { get; } = new(StringComparer.Ordinal);
         /// <summary>Null until the solution's units hold what the host loaded (see SolutionBuilder.WhenSettled); its result is null if it didn't start.</summary>
         public Task<HotReloadSession?>? Session { get; set; }
         public string? Failure { get; set; }
@@ -455,6 +460,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                     + $"({delta.Module}): {Types(delta)} updated");
             output.Insert(0, $"blaze-cs: {name}: hot reloaded {applied} into its test host (pid {pid})");
             var ran = result.Error is null ? result.Classes : null;
+            live.Reloaded.UnionWith(ran?.Keys ?? update.Classes ?? live.Classes?.Keys ?? Enumerable.Empty<string>());
             if (narrowed is var (_, unchanged))
             {
                 live.Classes = ran is null ? null : new(unchanged.Concat(ran), StringComparer.Ordinal);
@@ -526,9 +532,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         $"blaze-cs: {Path.GetFileName(assembly)}: not hot reloaded: {reason.ReplaceLineEndings(" ")}; running it in a new test host";
 
     /// <summary>
-    /// The test classes a delta's run is of: those that can reach a type the delta updated (TestSelection), and
-    /// those whose last run in the host failed; the others' last results stand. Null, with the reason in the
-    /// daemon log, if every test runs.
+    /// The test classes a delta's run is of: those that can reach a type the delta updated (TestSelection),
+    /// those whose last run in the host failed, and those that ran in a hot reloaded run before (their pass may
+    /// rest on stale statics); the others' last results, from the host's first run, stand. Null, with the reason
+    /// in the daemon log, if every test runs.
     /// </summary>
     (string[] Classes, Dictionary<string, TestCounts> Unchanged)? Narrow(string assembly, LiveHost live, HotReloadSession session, TestHostUpdate update)
     {
@@ -555,9 +562,15 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             Console.WriteLine($"{DateTime.Now:O} {host} runs every test: {selection.Everything}");
             return null;
         }
-        var classes = last.Keys.Where(c => reached.Contains(c) || last[c].Failed > 0).Order(StringComparer.Ordinal).ToArray();
+        // A class the delta can't reach is unchanged only if its last pass was in a new host: one that ran hot
+        // reloaded before may have passed on statics the code before that edit computed, so it runs again.
+        var classes = last.Keys.Where(c => reached.Contains(c) || last[c].Failed > 0 || live.Reloaded.Contains(c)).Order(StringComparer.Ordinal).ToArray();
+        var reachedCount = last.Keys.Count(reached.Contains);
+        var failed = last.Keys.Any(c => !reached.Contains(c) && last[c].Failed > 0);
+        var reloaded = last.Keys.Any(c => !reached.Contains(c) && last[c].Failed == 0 && live.Reloaded.Contains(c));
         Console.WriteLine($"{DateTime.Now:O} {host} runs {classes.Length} of {last.Count} test classes, those the delta can reach"
-            + (classes.Length > reached.Count ? " or that failed last" : "") + (classes.Length > 0 ? $": {string.Join(", ", classes)}" : ""));
+            + (failed ? " or that failed last" : "") + (reloaded ? " or whose last pass was hot reloaded" : "")
+            + (classes.Length > 0 ? $": {string.Join(", ", classes)}" : ""));
         return (classes, last.Where(c => !classes.Contains(c.Key)).ToDictionary(StringComparer.Ordinal));
     }
 

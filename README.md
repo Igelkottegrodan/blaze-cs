@@ -161,8 +161,9 @@ its own:
 - **Only the test classes a hot reload can reach.** After a hot reload, only the test classes that can run
   the updated code run: those whose code, through a chain of types each naming the next (in the
   solution's assemblies the tests run with; code that names a type's base class or interface there names
-  the type too), uses an updated type, plus those whose last run failed. The
-  others are listed as unchanged since their last run, with their result:
+  the type too), uses an updated type, plus those whose last run failed and those that ran hot reloaded
+  before (such a pass may rest on stale statics, see above). The others, whose last pass was in a new
+  host, are listed as unchanged since their last run, with their result:
   `blaze-cs: Tests.dll: unchanged since last run: RuntimeTests (1 passed)`. Every test runs when code may
   reach the updated type without naming it (an interface or a base class, a type that implements or
   derives from one, a generic type, a type with a framework attribute), when a type on the chain
