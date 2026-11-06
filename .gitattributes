@@ -1,0 +1,3 @@
+# The fixture check edits these files by exact text, newlines included: keep them LF on every checkout.
+tests/fixture/** text eol=lf
+*.cmd text eol=crlf

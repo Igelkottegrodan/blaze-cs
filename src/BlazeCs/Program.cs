@@ -118,22 +118,31 @@ static class Program
         var log = DaemonLog(solutionPath);
         Directory.CreateDirectory(Path.GetDirectoryName(log)!);
 
-        // Detached into its own session so it outlives this terminal and ignores its Ctrl+C. The daemon
-        // writes its log itself; the redirect only catches what the runtime prints when it dies.
-        var start = new ProcessStartInfo("/bin/sh") { UseShellExecute = false };
-        start.ArgumentList.Add("-c");
-        start.ArgumentList.Add("setsid \"$0\" exec --runtimeconfig \"$1\" \"$2\" daemon \"$3\" </dev/null >>\"$4\" 2>&1 &");
-        start.ArgumentList.Add(Environment.ProcessPath!);
-        start.ArgumentList.Add(SdkRoslyn.CompilerRuntimeConfig(Path.GetDirectoryName(solutionPath)!));
-        start.ArgumentList.Add(typeof(Program).Assembly.Location);
-        start.ArgumentList.Add(solutionPath);
-        start.ArgumentList.Add(log);
         // The daemon lives for many builds of a large heap: server GC, and the JIT straight to optimized
         // code for hot compiler paths. Measured on jellyfin, a body edit's compile went from ~1 s to ~0.3 s.
-        start.Environment["DOTNET_gcServer"] = "1";
-        start.Environment["DOTNET_TieredPGO"] = "0";
-        start.Environment["DOTNET_TC_CallCountingDelayMs"] = "0";
-        Process.Start(start)!.WaitForExit();
+        var environment = new Dictionary<string, string>
+        {
+            ["DOTNET_gcServer"] = "1",
+            ["DOTNET_TieredPGO"] = "0",
+            ["DOTNET_TC_CallCountingDelayMs"] = "0",
+        };
+        string[] arguments = ["exec", "--runtimeconfig", SdkRoslyn.CompilerRuntimeConfig(Path.GetDirectoryName(solutionPath)!),
+            typeof(Program).Assembly.Location, "daemon", solutionPath];
+        if (OperatingSystem.IsWindows())
+            StartDetachedOnWindows(arguments, environment);
+        else
+        {
+            // Detached into its own session so it outlives this terminal and ignores its Ctrl+C. The daemon
+            // writes its log itself; the redirect only catches what the runtime prints when it dies.
+            var start = new ProcessStartInfo("/bin/sh") { UseShellExecute = false };
+            start.ArgumentList.Add("-c");
+            start.ArgumentList.Add("log=$1; shift; setsid \"$@\" </dev/null >>\"$log\" 2>&1 &");
+            foreach (var argument in new[] { "sh", log, Environment.ProcessPath! }.Concat(arguments))
+                start.ArgumentList.Add(argument);
+            foreach (var (name, value) in environment)
+                start.Environment[name] = value;
+            Process.Start(start)!.WaitForExit();
+        }
 
         var deadline = Stopwatch.StartNew();
         while (deadline.Elapsed < TimeSpan.FromSeconds(30))
@@ -143,6 +152,28 @@ static class Program
             Thread.Sleep(20);
         }
         return null;
+    }
+
+    /// <summary>
+    /// Through ShellExecute, in a hidden console of its own: it gets none of this process's handles (a
+    /// plain start would inherit the pipe a caller reads this process's output from, and that caller
+    /// would wait for the daemon to exit), and this terminal's Ctrl+C doesn't reach it. ShellExecute
+    /// passes this process's environment, so the daemon's variables are set here for the start.
+    /// </summary>
+    static void StartDetachedOnWindows(string[] arguments, Dictionary<string, string> environment)
+    {
+        var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
+        foreach (var argument in arguments)
+            start.ArgumentList.Add(argument);
+        var previous = environment.Keys.ToDictionary(name => name, Environment.GetEnvironmentVariable);
+        foreach (var (name, value) in environment)
+            Environment.SetEnvironmentVariable(name, value);
+        try { Process.Start(start)?.Dispose(); }
+        finally
+        {
+            foreach (var (name, value) in previous)
+                Environment.SetEnvironmentVariable(name, value);
+        }
     }
 
     static string DaemonLog(string solutionPath) =>

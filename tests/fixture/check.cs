@@ -13,7 +13,7 @@ using System.Text.RegularExpressions;
 var fixture = Path.GetDirectoryName(Path.GetFullPath(AppContext.GetData("EntryPointFilePath") as string ?? "tests/fixture/check.cs"))!;
 var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
-var blaze = Path.Combine(root, "blaze-cs");
+var blaze = Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
 
 // (name, edit, units blaze-cs must rebuild, command, fallback); the edits build on each other. Lib and
 // Consumer target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
@@ -179,10 +179,11 @@ void Verify(string name, HashSet<string> rebuilt, string? fallback)
 static bool CompiledBy(HashSet<string> rebuilt, string path) => path.Split('/') is [var project, "obj", _, var framework, ..]
     && (rebuilt.Contains(project) || rebuilt.Contains($"{project} ({framework})"));
 
-// Every obj/ assembly, and the scoped CSS that MSBuild rewrites and bundles (obj/.../scopedcss/).
+// Every obj/ assembly, and the scoped CSS that MSBuild rewrites and bundles (obj/.../scopedcss/), by
+// relative path with / separators on every OS.
 Dictionary<string, byte[]> Outputs() =>
     Directory.EnumerateFiles(work, "*", SearchOption.AllDirectories)
-        .Select(path => Path.GetRelativePath(work, path))
+        .Select(path => Path.GetRelativePath(work, path).Replace('\\', '/'))
         .Where(path => path.Split('/') is [_, "obj", ..] parts && !parts.Contains("refint")
             && (path.EndsWith(".dll", StringComparison.Ordinal) || parts.Contains("scopedcss") && path.EndsWith(".css", StringComparison.Ordinal)))
         .ToDictionary(path => path, path => File.ReadAllBytes(Path.Combine(work, path)));
