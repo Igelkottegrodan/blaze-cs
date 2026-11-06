@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml;
@@ -17,10 +18,10 @@ sealed record TestHostResult(int Total, int Passed, int Failed, int Skipped, str
 sealed record TestHostRequest(string Framework, string Assembly, string? RunSettings);
 
 /// <summary>
-/// Runs the test projects a build affected. xUnit (v2 and v3), NUnit and MSTest projects run in test host
-/// processes, longest first, like `dotnet test` runs projects side by side; the rest go through
-/// `dotnet test --no-build`. A host runs one assembly and exits, and a few wait already started, so a
-/// run doesn't wait for a runtime to start.
+/// Runs the test projects whose inputs changed since they last passed in this daemon. xUnit (v2 and
+/// v3), NUnit and MSTest projects run in test host processes, longest first, like `dotnet test` runs
+/// projects side by side; the rest go through `dotnet test --no-build`. A host runs one assembly and
+/// exits, and a few wait already started, so a run doesn't wait for a runtime to start.
 /// </summary>
 sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
 {
@@ -35,39 +36,90 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
     readonly ConcurrentDictionary<string, ConcurrentBag<Process>> _idleHosts = [];
     readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(PathComparer.Instance);
 
-    public int Run(IReadOnlyCollection<ProjectCompiler> changed, Action<string> log)
+    /// <summary>
+    /// Each test project's last run in this daemon, by assembly, if it passed: the inputs it ran with and
+    /// its result. A project without one (never run here, or it failed) runs next time.
+    /// </summary>
+    readonly ConcurrentDictionary<string, (string Inputs, string Result)> _passed = new(PathComparer.Instance);
+    readonly ConcurrentDictionary<string, (FileStamp Stamp, string Hash)> _hashes = new(PathComparer.Instance);
+
+    /// <summary>What a test run reports: whether it passed, and in a few words for the next unchanged run.</summary>
+    readonly record struct Outcome(bool Passed, string Result);
+
+    /// <param name="all">Run every test project, not only those whose inputs changed since they passed.</param>
+    public int Run(bool all, Action<string> log)
     {
-        var testUnits = builder.Units.Where(u => Framework(u) is not null).ToList();
-        // Nothing changed means the user wants the tests run, not skipped.
-        var affected = changed.Count == 0 ? testUnits : builder.Downstream(changed).Intersect(testUnits).ToList();
-        if (affected.Count == 0)
+        var tests = builder.Units.Where(u => Framework(u) is not null).ToList();
+        if (tests.Count == 0)
         {
-            log("blaze-cs: no test projects depend on what changed");
+            log("blaze-cs: no test projects");
             return 0;
+        }
+        var inputs = tests.AsParallel().ToDictionary(u => u, Inputs);
+        var unchanged = all ? [] : tests
+            .Where(u => _passed.TryGetValue(u.Unit.AssemblyPath, out var last) && last.Inputs == inputs[u])
+            .ToList();
+        if (unchanged.Count > 0)
+            log("blaze-cs: unchanged since last run: "
+                + string.Join(", ", unchanged.Select(u => $"{u.Unit.Name} ({_passed[u.Unit.AssemblyPath].Result})")));
+        var affected = tests.Except(unchanged).ToList();
+
+        var failed = 0;
+        void Record(ProjectCompiler unit, Outcome outcome)
+        {
+            if (outcome.Passed)
+                _passed[unit.Unit.AssemblyPath] = (inputs[unit], outcome.Result);
+            else
+            {
+                _passed.TryRemove(unit.Unit.AssemblyPath, out _);
+                Interlocked.Increment(ref failed);
+            }
         }
 
         var hosted = affected.Select(u => (Unit: u, Applies: InHost(u.Unit, log, out var runSettings), RunSettings: runSettings))
             .Where(test => test.Applies).ToList();
-        var failed = 0;
         var inHost = new ConcurrentQueue<(ProjectCompiler Unit, TestHostRequest Request)>(hosted
             .Select(test => (test.Unit, new TestHostRequest(Framework(test.Unit)!, builder.InstalledPath(test.Unit), test.RunSettings)))
             .OrderByDescending(test => _lastDuration.GetValueOrDefault(test.Item2.Assembly)));
         var workers = Enumerable.Range(0, Math.Min(MaxHosts, inHost.Count)).Select(_ => Task.Run(() =>
         {
             while (inHost.TryDequeue(out var test))
-            {
-                if (!(RunInHost(test.Request, log) ?? DotnetTest(test.Unit, log)))
-                    Interlocked.Increment(ref failed);
-            }
+                Record(test.Unit, RunInHost(test.Request, log) ?? DotnetTest(test.Unit, log));
         })).ToArray();
 
         foreach (var unit in affected.Except(hosted.Select(test => test.Unit)))
-        {
-            if (!DotnetTest(unit, log))
-                Interlocked.Increment(ref failed);
-        }
+            Record(unit, DotnetTest(unit, log));
         Task.WaitAll(workers);
         return failed > 0 ? 1 : 0;
+    }
+
+    /// <summary>
+    /// What a test project runs with: the solution's assemblies in its runtime closure, each by a hash of
+    /// its code (PeIdentity: a comment-only edit changes only the debug identity), its .deps.json, which
+    /// lists the packages it loads, and its .runsettings, which the host applies.
+    /// </summary>
+    string Inputs(ProjectCompiler unit) => string.Join("\n", builder.RuntimeClosure(unit)
+        .Append(Path.ChangeExtension(builder.InstalledPath(unit), ".deps.json"))
+        .Concat(RunSettingsFiles(unit.Unit).OfType<string>())
+        .Order(PathComparer.Instance)
+        .Select(path => $"{path} {Hash(path)}"));
+
+    /// <summary>A file's hash, read again only when its length or write time changed.</summary>
+    string Hash(string path)
+    {
+        var stamp = FileStamp.Of(path);
+        if (_hashes.TryGetValue(path, out var cached) && cached.Stamp == stamp)
+            return cached.Hash;
+        var hash = "missing";
+        if (stamp != default)
+        {
+            var bytes = File.ReadAllBytes(path);
+            try { bytes = PeIdentity.Masked(bytes); }
+            catch (Exception e) when (e is BadImageFormatException or InvalidOperationException) { } // not an assembly
+            hash = Convert.ToHexString(SHA256.HashData(bytes));
+        }
+        _hashes[path] = (stamp, hash);
+        return hash;
     }
 
     /// <summary>
@@ -135,14 +187,14 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
         }
     }
 
-    bool DotnetTest(ProjectCompiler unit, Action<string> log) =>
-        builder.RunDotnet($"test --no-build \"{unit.Unit.ProjectFile}\"", log) == 0;
+    Outcome DotnetTest(ProjectCompiler unit, Action<string> log) =>
+        builder.RunDotnet($"test --no-build \"{unit.Unit.ProjectFile}\"", log) == 0 ? new(true, "passed") : new(false, "failed");
 
     /// <summary>
-    /// Runs one assembly in a host and logs its output in one piece: true if it passed, null if the host
-    /// ran no tests, which `dotnet test` then settles.
+    /// Runs one assembly in a host and logs its output in one piece; null if the host ran no tests, which
+    /// `dotnet test` then settles.
     /// </summary>
-    bool? RunInHost(TestHostRequest request, Action<string> log)
+    Outcome? RunInHost(TestHostRequest request, Action<string> log)
     {
         var stopwatch = Stopwatch.StartNew();
         var output = new List<string>();
@@ -190,7 +242,7 @@ sealed partial class TestRunner(SolutionBuilder builder) : IDisposable
             + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}");
         lock (_hostConfigs)
             output.ForEach(log);
-        return passed;
+        return new Outcome(passed, result.Skipped > 0 ? $"{result.Passed} passed, {result.Skipped} skipped" : $"{result.Passed} passed");
     }
 
     /// <summary>An idle host for a runtime, and a new one started in its place for the next run.</summary>

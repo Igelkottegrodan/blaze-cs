@@ -7,9 +7,6 @@ using Microsoft.CodeAnalysis.Diagnostics;
 
 namespace BlazeCs;
 
-/// <summary>Where a build's output went, so `test` knows which test projects it touched.</summary>
-sealed record BuildResult(bool Success, IReadOnlyCollection<ProjectCompiler> Changed);
-
 /// <summary>
 /// A solution held compiled in memory. A build refreshes every unit from disk, recompiles the ones whose
 /// sources changed and, in dependency order, the ones whose references' public API changed, then writes
@@ -183,13 +180,13 @@ sealed class SolutionBuilder
         return [.. mismatches.Keys];
     }
 
-    public BuildResult Build(Action<string> log)
+    public bool Build(Action<string> log)
     {
         var stopwatch = Stopwatch.StartNew();
         if (ChangedMSBuildInput() is { } input)
         {
             log($"blaze-cs: {Path.GetRelativePath(_solutionDirectory, input)} changed, running dotnet build");
-            return new BuildResult(Load(log), _units);
+            return Load(log);
         }
 
         var changed = _units.AsParallel().Where(u => u.Refresh()).ToHashSet();
@@ -197,7 +194,7 @@ sealed class SolutionBuilder
         if (changed.FirstOrDefault(u => u.Unit.SlowPathReason is not null || u.StaleArguments is not null || _analyzerUnits.Contains(u)) is { } special)
         {
             log($"blaze-cs: {special.Unit.Name}: {special.Unit.SlowPathReason ?? special.StaleArguments ?? "it is an analyzer other projects load"}; running dotnet build");
-            return new BuildResult(Load(log), Downstream(changed));
+            return Load(log);
         }
 
         // Dataflow: every unit compiles as soon as its inputs are known, against the images its references
@@ -217,7 +214,7 @@ sealed class SolutionBuilder
         if (!run.Failed.IsEmpty)
         {
             log($"blaze-cs: build failed in {stopwatch.ElapsedMilliseconds} ms ({run.Failed.Count} project(s) failed or blocked)");
-            return new BuildResult(false, rebuilt);
+            return false;
         }
         var times = run.Times;
         var unaffected = run.Unaffected.Count == 0 ? "" : $"; {run.Unaffected.Count} dependents checked and unaffected";
@@ -229,7 +226,7 @@ sealed class SolutionBuilder
         if (times.Count > 1)
             log("blaze-cs: slowest: " + string.Join(", ", times.OrderByDescending(t => t.Value.Compile).Take(5)
                 .Select(t => $"{t.Key.Unit.Name} {t.Value.Compile.TotalMilliseconds:F0} ms (generators {t.Value.Generators.TotalMilliseconds:F0})")));
-        return new BuildResult(true, rebuilt);
+        return true;
     }
 
     readonly ConcurrentDictionary<ProjectCompiler, TimeSpan> _lastDuration = new();
@@ -469,6 +466,17 @@ sealed class SolutionBuilder
         return Closure(unit.AssemblyPath).FirstOrDefault(p => p.StartsWith(bin, PathComparer.Comparison)) ?? unit.AssemblyPath;
     }
 
+    /// <summary>
+    /// The solution's assemblies a test project runs with: its own, and every unit's that MSBuild copied
+    /// next to it.
+    /// </summary>
+    public IEnumerable<string> RuntimeClosure(ProjectCompiler unit)
+    {
+        var directory = Path.GetDirectoryName(InstalledPath(unit));
+        return _units.SelectMany(u => Closure(u.AssemblyPath))
+            .Where(path => PathComparer.Instance.Equals(Path.GetDirectoryName(path), directory));
+    }
+
     /// <summary>A path and every place MSBuild copies it to, transitively.</summary>
     IEnumerable<string> Closure(string path)
     {
@@ -516,18 +524,6 @@ sealed class SolutionBuilder
             var bytes = File.ReadAllBytes(path);
             return current is not null && current.Bytes.AsSpan().SequenceEqual(bytes) ? current : new Image(bytes);
         }
-    }
-
-    /// <summary>Every unit that compiles against one of these, directly or not, and the units themselves.</summary>
-    public IReadOnlyCollection<ProjectCompiler> Downstream(IEnumerable<ProjectCompiler> units)
-    {
-        var result = units.ToHashSet();
-        foreach (var unit in _units)
-        {
-            if (_dependencies[unit].Any(result.Contains))
-                result.Add(unit);
-        }
-        return result;
     }
 
     List<ProjectCompiler> TopologicalOrder(List<ProjectCompiler> units)
