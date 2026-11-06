@@ -13,7 +13,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         # The SDK the fixture solution is built and compared with; blaze-cs itself always builds on global.json's.
-        sdk: ['10.0.x', '11.0.x']
+        sdk: ['10.0.100', '10.0.x', '11.0.x']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v6
