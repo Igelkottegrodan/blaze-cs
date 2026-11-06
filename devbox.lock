@@ -54,59 +54,6 @@
         }
       }
     },
-    "dotnet-sdk_11@11.0.100-rc.3.26522.148": {
-      "last_modified": "2026-11-04T12:32:54Z",
-      "resolved": "github:NixOS/nixpkgs/13e53762c5afaf384d4614e94527a9ccfafe41d0#dotnet-sdk_11",
-      "source": "devbox-search",
-      "version": "11.0.100-rc.3.26522.148",
-      "systems": {
-        "aarch64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/bg907vnfsdkky3cygvrvl75kf2g5xxmd-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148",
-              "default": true
-            },
-            {
-              "name": "man",
-              "path": "/nix/store/rjzw2ax22amapr6kwm9pym08b1x2m7i5-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148-man",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/bg907vnfsdkky3cygvrvl75kf2g5xxmd-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148"
-        },
-        "aarch64-linux": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/r5a9y0y3wj5k901as1nlk9isamlsnhc2-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148",
-              "default": true
-            },
-            {
-              "name": "man",
-              "path": "/nix/store/by8x5cz0y7b4nq0hky8qwmj8chyxk3ja-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148-man",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/r5a9y0y3wj5k901as1nlk9isamlsnhc2-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148"
-        },
-        "x86_64-linux": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/b8lsz4r097i1vlhj01mc43ng7swy9kkm-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148",
-              "default": true
-            },
-            {
-              "name": "man",
-              "path": "/nix/store/n1kb2ddxbbh0hhlzf3089bx4s2yn985l-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148-man",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/b8lsz4r097i1vlhj01mc43ng7swy9kkm-dotnet-sdk-wrapped-11.0.100-rc.3.26522.148"
-        }
-      }
-    },
     "fontconfig@latest": {
       "last_modified": "2026-11-03T19:55:20Z",
       "resolved": "github:NixOS/nixpkgs/9d3b8db48266c17be0b5f9c6360c3ecfbac3d1f5#fontconfig",

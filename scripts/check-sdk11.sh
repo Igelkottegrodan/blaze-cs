@@ -1,8 +1,7 @@
 #!/bin/bash
 # Runs the fixture check on SDK 11 with the runtime 10 test projects still available (task check:sdk11).
 # devbox's two SDKs collide on bin/dotnet, so plain `dotnet` is SDK 10 and SDK 11 alone has no runtime 10.
-# This assembles one dotnet root from both store outputs (the SDK 11 version comes from devbox.json, so a
-# GA bump is a devbox.json/devbox.lock change only):
+# This assembles one dotnet root from both store outputs:
 #   - symlinks to everything SDK 11 ships, except `sdk`, `shared` and `host/fxr`
 #   - in those three, symlinks to each version of both SDKs
 #   - a copy of SDK 11's `dotnet` muxer (it finds its root next to itself)
@@ -12,9 +11,10 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
 
-version=$(jq -r '.packages["dotnet-sdk_11"] | if type == "object" then .version else . end' devbox.json)
-store11=$(jq -r --arg v "$version" --arg s "$(uname -m)-linux" \
-    '.packages["dotnet-sdk_11@" + $v].systems[$s].outputs[0].path' devbox.lock)
+# SDK 11 is not in devbox.json (both SDKs' bin/dotnet would collide when devbox installs the profile in a fresh
+# checkout), so it is built from this pinned nixpkgs; moving to GA is a bump of this revision.
+nixpkgs=13e53762c5afaf384d4614e94527a9ccfafe41d0
+store11=$(nix --extra-experimental-features 'nix-command flakes' build --no-link --print-out-paths "github:NixOS/nixpkgs/$nixpkgs#dotnet-sdk_11^out")
 root11=$(readlink -f "$store11/bin/dotnet" | xargs dirname)
 root10=$(dotnet --list-sdks | sed -n 's/^10\..*\[\(.*\)\/sdk\]$/\1/p' | head -1)
 for r in "$root10" "$root11"; do
