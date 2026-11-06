@@ -408,25 +408,28 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// The engine only takes method body edits (HotReloadEngine.Capabilities), and asks for a restart when one
     /// would have no effect (a static field's initializer). With nothing changed (`test --all`, or a run that
     /// failed), the project runs in a new host: in the live one, its tests would see the statics they left.
-    /// Statics carry over between hot reloaded runs too (#129).
+    /// Statics carry over between hot reloaded runs too (#129). An edit that comes before the host's session
+    /// is ready isn't held back for it: the project runs in a new host.
     /// </summary>
     (HotReloadSession? Session, TestHostUpdate? Update, string? Reason) Plan(LiveHost live, string inputs)
     {
         if (live.Process.HasExited)
             return (null, null, "the host has exited");
-        static Dictionary<string, string> Lines(string inputs) => inputs.Split('\n')
-            .ToDictionary(line => line[..line.LastIndexOf(' ')], line => line[(line.LastIndexOf(' ') + 1)..], PathComparer.Instance);
-        var before = Lines(live.Inputs);
-        var now = Lines(inputs);
+        var before = InputHashes(live.Inputs);
+        var now = InputHashes(inputs);
         if (!before.Keys.ToHashSet(PathComparer.Instance).SetEquals(now.Keys))
             return (null, null, "the set of files its tests run with changed");
         var changed = now.Where(input => before[input.Key] != input.Value).Select(input => input.Key).ToList();
         if (changed.Count == 0)
             return (null, null, "nothing its tests run with changed, and a new host starts their statics anew");
 
-        // A session still starting is waited for.
-        var session = live.Session?.GetAwaiter().GetResult();
-        if (session is null)
+        // A session still starting isn't waited for: the project runs in a new host at once.
+        Task<HotReloadSession?>? started;
+        lock (live)
+            started = live.Session;
+        if (started is not { IsCompleted: true })
+            return (null, null, "its hot reload session wasn't ready");
+        if (started.Result is not { } session)
             return (null, null, live.Failure ?? "it has no hot reload session");
         var loaded = session.Modules.ToDictionary(module => module.Loaded, PathComparer.Instance);
         if (changed.FirstOrDefault(path => !loaded.ContainsKey(path)) is { } other)
@@ -475,7 +478,9 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         }
         if (live.Session is not null)
             return; // a session that took this run's update
-        Console.WriteLine($"{DateTime.Now:O} hot reload: test host {live.Process.Id} ({Path.GetFileName(assembly)}) stays up for {unit.Unit.Name}");
+        // The host as the log names it (Stop disposes the process, after which it has no id).
+        var host = $"test host {live.Process.Id} ({Path.GetFileName(assembly)})";
+        Console.WriteLine($"{DateTime.Now:O} hot reload: {host} stays up for {unit.Unit.Name}");
         // The host's modules are copied now, before an edit replaces them on disk; the engine's work runs in the background.
         builder.WhenSettled(() =>
         {
@@ -486,14 +491,21 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                     return;
                 try
                 {
-                    var (modules, sources) = Capture(unit);
+                    var (modules, sources) = Capture(unit, live.Inputs);
                     live.Session = Task.Run(() =>
                     {
-                        try { return HotReloadSession.Start(Engine!, modules, sources); }
+                        try
+                        {
+                            if (SessionDelay > TimeSpan.Zero)
+                                Thread.Sleep(SessionDelay);
+                            var session = HotReloadSession.Start(Engine!, modules, sources);
+                            Console.WriteLine($"{DateTime.Now:O} hot reload: {host} has its session");
+                            return session;
+                        }
                         catch (Exception e)
                         {
                             live.Failure = $"its session didn't start: {e.Message}";
-                            Console.WriteLine($"{DateTime.Now:O} hot reload: {e}");
+                            Console.WriteLine($"{DateTime.Now:O} hot reload: {host} has no session: {e}");
                             return null;
                         }
                     });
@@ -502,6 +514,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 {
                     live.Failure = e.Message;
                     live.Session = Task.FromResult<HotReloadSession?>(null);
+                    Console.WriteLine($"{DateTime.Now:O} hot reload: {host} has no session: {e.Message}");
                 }
             }
         });
@@ -511,22 +524,48 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     }
 
     /// <summary>
-    /// The modules a test project's host loaded, each copied as loaded, and their units' sources, which compiled
-    /// to those bytes.
+    /// BLAZE_CS_HOT_RELOAD_DELAY=&lt;milliseconds&gt; holds back each hot reload session's start that long, so
+    /// the fixture check can send an edit before a live host's session is ready.
     /// </summary>
-    (List<LoadedModule> Modules, Dictionary<string, UnitSources> Sources) Capture(ProjectCompiler test)
+    static readonly TimeSpan SessionDelay = int.TryParse(Environment.GetEnvironmentVariable("BLAZE_CS_HOT_RELOAD_DELAY"), out var delay) && delay > 0
+        ? TimeSpan.FromMilliseconds(delay) : TimeSpan.Zero;
+
+    /// <summary>The inputs a run used (<see cref="Inputs(ProjectCompiler)"/>), by path.</summary>
+    static Dictionary<string, string> InputHashes(string inputs) => inputs.Split('\n')
+        .ToDictionary(line => line[..line.LastIndexOf(' ')], line => line[(line.LastIndexOf(' ') + 1)..], PathComparer.Instance);
+
+    /// <summary>
+    /// The modules a test project's host loaded, each copied as loaded, and their units' sources, which compiled
+    /// to those bytes. Throws if a module on disk is no longer what the host's run used (<paramref name="inputs"/>):
+    /// a session made from it would take the next build for what the host runs.
+    /// </summary>
+    (List<LoadedModule> Modules, Dictionary<string, UnitSources> Sources) Capture(ProjectCompiler test, string inputs)
     {
+        var ran = InputHashes(inputs);
         var modules = new List<LoadedModule>();
         var sources = new Dictionary<string, UnitSources>(PathComparer.Instance);
         foreach (var (unit, path) in builder.RuntimeUnits(test))
         {
             if (sources.ContainsKey(unit.Unit.AssemblyPath))
                 continue;
-            if (unit.Sources is not { } current || !builder.Reproduces(unit))
-                throw new InvalidOperationException($"{unit.Unit.Name}'s assembly on disk isn't what the daemon compiles from its sources");
-            var (snapshot, mvid, resources) = HotReloadSession.Snapshot(path, unit.PdbPath, SnapshotRoot);
-            modules.Add(new LoadedModule(unit.Unit.AssemblyPath, unit.Unit.Name, unit.Unit.ProjectFile, path, mvid, snapshot, resources));
-            sources[unit.Unit.AssemblyPath] = current;
+            // Under the unit's lock, which a compile served to a dotnet build holds from its sources to its
+            // writes: the sources, the assembly it wrote and its PDB are of one compile.
+            lock (unit)
+            {
+                if (unit.Sources is not { } current || !builder.Reproduces(unit))
+                    throw new InvalidOperationException($"{unit.Unit.Name}'s assembly on disk isn't what the daemon compiles from its sources");
+                // The same before and after the copy: the copy has the bytes the run loaded, which are the
+                // compile's (a served compile writes the assembly before MSBuild copies it next to the tests).
+                // (The copy's own hash differs: its PDB path is rewritten.)
+                bool Unchanged() => ran.TryGetValue(path, out var hash) && Hash(path) == hash && Hash(unit.AssemblyPath) == hash;
+                if (!Unchanged())
+                    throw new InvalidOperationException($"{unit.Unit.Name} changed on disk after the run, before its session started");
+                var (snapshot, mvid, resources) = HotReloadSession.Snapshot(path, unit.PdbPath, SnapshotRoot);
+                if (!Unchanged())
+                    throw new InvalidOperationException($"{unit.Unit.Name} changed on disk after the run, before its session started");
+                modules.Add(new LoadedModule(unit.Unit.AssemblyPath, unit.Unit.Name, unit.Unit.ProjectFile, path, mvid, snapshot, resources));
+                sources[unit.Unit.AssemblyPath] = current;
+            }
         }
         return (modules, sources);
     }
@@ -624,6 +663,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 {
                     _live.Remove(assembly);
                     ended.Add(live);
+                    Console.WriteLine($"{DateTime.Now:O} hot reload: test host {live.Process.Id} ({Path.GetFileName(assembly)}) ends: "
+                        + (live.Process.HasExited ? "it exited" : $"its project is no longer among the {MaxIdleHosts} that get a host"));
                 }
             }
             foreach (var (runtime, spare) in _spares.ToList())
