@@ -34,6 +34,10 @@ jobs:
       - uses: arduino/setup-task@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # The build compiles the native client; ubuntu-latest has clang, but not always zlib's headers.
+      - name: Install the native client's toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends clang zlib1g-dev
       - run: task build
       - run: task test
       - run: task pack
@@ -50,16 +54,22 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then exe=blaze-cs.exe; fi
           echo "BLAZE_CS=$RUNNER_TEMP/blaze-cs-tool/$exe" >> "$GITHUB_ENV"
       - shell: bash
+        # Twice: through the installed tool (managed only), then through the launcher in the clone, which runs
+        # the native client built by task build. Each leg's check includes the daemon handshake.
         # The fixture copy (and its daemon logs) under runner.temp on both OSes: Path.GetTempPath reads TMP on Windows, TMPDIR elsewhere.
         # Windows goes through the script task check:windows runs there, so CI covers it too.
         run: |
           export TMP="$RUNNER_TEMP" TMPDIR="$RUNNER_TEMP"
           version="$(dotnet --list-sdks | grep "^${SDK%.x}" | tail -1 | cut -d' ' -f1)"
-          if [ "$RUNNER_OS" = Windows ]; then
-            powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-windows.ps1 "$DOTNET_ROOT" "$version"
-          else
-            BLAZE_CS_SDK="$version" dotnet run tests/fixture/check.cs
-          fi
+          for launcher in "$BLAZE_CS" ""; do
+            echo "::group::fixture check through ${launcher:-the native launcher}"
+            if [ "$RUNNER_OS" = Windows ]; then
+              BLAZE_CS="$launcher" powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-windows.ps1 "$DOTNET_ROOT" "$version"
+            else
+              BLAZE_CS="$launcher" BLAZE_CS_SDK="$version" dotnet run tests/fixture/check.cs
+            fi
+            echo "::endgroup::"
+          done
         env:
           SDK: ${{ matrix.sdk }}
       - if: failure()

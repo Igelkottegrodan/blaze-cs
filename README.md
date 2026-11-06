@@ -45,13 +45,19 @@ task build
 
 On Windows, build it with the .NET SDK: `dotnet build BlazeCs.slnx`.
 
+The build also compiles the small `blaze-cs` client Native AOT, so a command that reaches a running daemon
+starts in about 5 ms instead of 60. That needs a C toolchain: clang and zlib headers on Linux, the Visual
+Studio C++ build tools on Windows. The `blaze-cs` and `blaze-cs.cmd` launchers in the clone use it; the
+installed tool is the managed CLI alone and starts in about 60 ms.
+
 ## Try it
 
 In a directory with one `.sln` or `.slnx` (or below one):
 
 ```text
 blaze-cs build                  like dotnet build
-blaze-cs test                   build, then run the test projects the edit affects
+blaze-cs test                   build, then run the test projects whose inputs changed
+blaze-cs test --all             build, then run every test project
 blaze-cs run [dotnet run args]  build, then dotnet run --no-build
 blaze-cs stop                   stop this solution's daemon
 ```
@@ -60,7 +66,7 @@ From a build in a clone instead of the tool, run `/path/to/blaze-cs/blaze-cs bui
 
 The first command starts a daemon for that solution and runs a real `dotnet build`, so it takes as long
 as one. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
-affect, and `blaze-cs test` runs the affected test projects in test hosts that are already started.
+affect, and `blaze-cs test` runs the test projects the edit changed in test hosts that are already started.
 
 The daemon exits on its own after two hours without a command, and the next command starts a new one.
 After you rebuild blaze-cs, the next command stops the daemon of the old build and starts one of the new,
@@ -110,6 +116,12 @@ its own:
   `.runsettings` that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is
   applied in the host; projects with any other `.runsettings`, and anything a host can't run, go through
   `dotnet test --no-build`.
+- **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
+  (its own, and every project output copied next to it), its `.deps.json` or its `.runsettings` differs
+  from when it last ran in this daemon, when it hasn't run in this daemon yet, or when its last run
+  failed. Assemblies are compared without their debug identity (PDB ID, timestamp, MVID), so a
+  comment-only edit in a core library reruns nothing. The others are listed as unchanged since their last run, with their result.
+  `blaze-cs test --all` runs every test project.
 - **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
   or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
   project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
@@ -144,6 +156,8 @@ its own:
   file twice fails to compile in the daemon ([#56](https://github.com/Igelkottegrodan/blaze-cs/issues/56)).
 - **Custom build steps** (an `Exec` target, such as bitwarden's `cargo build` before compile) run only in
   `dotnet build`, not in the daemon's builds. Run `dotnet build` after changing what they read.
+- **Test inputs are assemblies:** a test project's other files (data files copied to its output,
+  environment variables, anything it reads at run time) don't make it run again; use `blaze-cs test --all`.
 - **It trades memory for speed:** the daemon holds a few GB (about 2.3 GB for jellyfin).
 
 ## Contributing
@@ -154,6 +168,7 @@ on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 
 | Path | What |
 |---|---|
+| `src/BlazeCs.Client` | the Native AOT client: sends build, test and stop to a running daemon, and hands everything else to `blaze-cs.dll` |
 | `src/BlazeCs` | CLI client and daemon: binlog reading (`BuildLog`), per-project compiler (`ProjectCompiler`), scheduling and output (`SolutionBuilder`), API diff (`ApiSurface`), test runner |
 | `src/BlazeCs.TestHost` | the single-use test host (xUnit v2 and v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |

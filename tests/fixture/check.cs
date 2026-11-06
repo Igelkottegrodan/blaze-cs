@@ -1,8 +1,9 @@
 #!/usr/bin/env dotnet
-#:include ../../scripts/PeIdentity.cs
+#:include ../../src/BlazeCs/PeIdentity.cs
 // Regression check: makes each kind of edit to a copy of this fixture, rebuilds it with blaze-cs, and fails
 // unless (1) blaze-cs rebuilt exactly the expected projects, or took the expected fallback to dotnet build,
-// and (2) every assembly and scoped CSS bundle is what `dotnet build --no-incremental` produces. An assembly
+// and (2) every assembly and scoped CSS bundle is what `dotnet build --no-incremental` produces. A `test` must
+// also run exactly the test projects whose inputs changed since they last passed, and list the rest as unchanged. An assembly
 // may differ only in debug identity (PeIdentity), and only in a project blaze-cs skipped: its PDB still
 // records the old MVID of the reference that changed. After a fallback, nothing may differ.
 //
@@ -32,6 +33,8 @@ var hasNet11 = sdk is not null && Version.Parse(sdk.Split('-')[0]).Major >= 11;
 // Consumer target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
 // A case with a fallback must instead log it ("blaze-cs: <fallback>") and run dotnet build.
 string[] lib = ["Lib (net10.0)", "Lib (net8.0)"], consumer = ["Consumer (net10.0)", "Consumer (net8.0)"];
+// The test projects, and those of them that run with Lib's net10.0 build copied next to them.
+string[] libTests = ["Tests", "XunitV2Tests", "NUnitTests", "MSTestTests", "ComponentTests"], allTests = [.. libTests, .. (hasNet11 ? ["Tests11"] : Array.Empty<string>())];
 Case[] cases =
 [
     new("body", () => Replace("Lib/Greeter.cs", "\"Hello, \"", "\"Hello there, \""), lib, "build"),
@@ -58,13 +61,25 @@ Case[] cases =
         () => Replace("Lib/Greeter.cs", "    public static int Twice",
             "    public static string Wave(string name) => \"Hi, \" + name;\n\n    public static int Twice"),
         [.. consumer, .. lib], "build"),
-    // A test run must also show each rebuilt test project's tests passing (RanTests).
+    // A test run must also run exactly the test projects in Ran (by default, the rebuilt ones), list the others as
+    // unchanged since their last run, and show every test passing (RanTests). Each test project runs the first time.
+    new("first test run", () => { }, [], "test", Ran: allTests),
     new("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
     new("xUnit v2 test edit", () => Replace("XunitV2Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["XunitV2Tests"], "test"),
     // NUnitTests and MSTestTests have a .runsettings the host applies: a test checks its variable and parameter.
     new("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
     new("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
     .. (hasNet11 ? new Case[] { new Case("net11.0 test edit", () => Replace("Tests11/RuntimeTests.cs", "Edit = 0", "Edit = 1"), ["Tests11"], "test") } : []),
+    new("test without edits", () => { }, [], "test", Ran: []),
+    // The host applies NUnitTests' .runsettings, so an edit to it runs the project again.
+    new("runsettings edit", () => Replace("NUnitTests/test.runsettings", "<RunSettings>\n", "<RunSettings>\n  <!-- edited -->\n"),
+        [], "test", Ran: ["NUnitTests"]),
+    new("test --all", () => { }, [], "test --all", Ran: allTests),
+    // Lib.dll's PDB changes, and with it only Lib.dll's debug identity, so no test project runs.
+    new("comment in Lib", () => Replace("Lib/Greeter.cs", "namespace Lib;\n", "namespace Lib;\n\n// Greetings and small helpers.\n"),
+        lib, "test", Ran: []),
+    new("body in Lib", () => Replace("Lib/Greeter.cs", "Twice(int amount) => amount * 2", "Twice(int amount) => amount + amount"),
+        lib, "test", Ran: libTests),
     // Razor (Components): the Razor generator compiles .razor files, which csc gets as /additionalfile.
     new("razor markup", () => Replace("Components/Greeting.razor", "<Badge>@Text(Name)</Badge>", "<Badge><em>@Text(Name)</em></Badge>"),
         ["Components"], "build"),
@@ -110,7 +125,7 @@ var loadedProjects = 0; // from the last "loaded N projects" line a command prin
 try
 {
     Run(blaze, "build"); // starts the daemon: a real dotnet build, then a warm-up compile
-    foreach (var (name, edit, expected, command, fallback, allKept) in cases)
+    foreach (var (name, edit, expected, command, fallback, allKept, ran) in cases)
     {
         edit();
         var output = Run(blaze, command);
@@ -119,14 +134,17 @@ try
         var rebuilt = fallback is null ? Rebuilt(output) : FellBack(name, output, fallback, allKept);
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
-        if (command == "test")
-            RanTests(name, output, expected);
+        if (command.StartsWith("test", StringComparison.Ordinal))
+            RanTests(name, output, ran ?? expected);
         Verify(name, rebuilt, fallback);
     }
     ProjectRemovedAndRestored();
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
+    FailedRunsAgain();
+    AllTestsSkipped();
     DaemonLifecycle();
+    ParentFails();
     passed = true;
 }
 catch (CheckFailed failure)
@@ -215,7 +233,29 @@ void DaemonLifecycle()
     daemons = Daemons();
     if (output.Contains("another build") || daemons.Count != 3 || !Running(daemons[2].Pid) || !Regex.IsMatch(output, "^blaze-cs: up to date", RegexOptions.Multiline))
         Fail($"after an idle exit: expected the next command to start a daemon without a notice and build, got {daemons.Count} daemons:\n{output}");
-    Console.WriteLine($"ok  daemon lifecycle: another build restarted daemon {first.Pid} as {idle.Pid}, which exited on its own after 5 s idle; the next command started {daemons[2].Pid}");
+
+    // The same handover through the native client (a build has one unless it was packed as a tool): first as
+    // the client of another build, which reads its identity from the blaze-cs.dll beside it, then as this
+    // repo's launcher, whose client is the native one unless BLAZE_CS names an installed tool. Each hands
+    // the daemon over with a notice and has the CLI start the next one.
+    var native = Path.Combine(otherBuild, OperatingSystem.IsWindows() ? "blaze-cs-client.exe" : "blaze-cs-client");
+    var nativeNote = "";
+    if (File.Exists(native))
+    {
+        Handover(native, daemons[2].Pid, 4, new() { ["BLAZE_CS_IDLE_SECONDS"] = "5" });
+        Handover(blaze, Daemons()[3].Pid, 5, null);
+        nativeNote = "; the same through the native client";
+    }
+    Console.WriteLine($"ok  daemon lifecycle: another build restarted daemon {first.Pid} as {idle.Pid}, which exited on its own after 5 s idle; the next command started {daemons[2].Pid}{nativeNote}");
+}
+
+// A command whose build differs from the running daemon's: a notice, that daemon gone, one more daemon.
+void Handover(string client, int old, int expectedDaemons, Dictionary<string, string>? environment)
+{
+    var output = Run(client, "build", environment: environment);
+    var daemons = Daemons();
+    if (!output.Contains("blaze-cs: the running daemon is from another build") || daemons.Count != expectedDaemons || Running(old))
+        Fail($"daemon handshake through {Path.GetFileName(client)}: expected a notice, daemon {old} gone and {expectedDaemons} daemons, got {daemons.Count}:\n{output}");
 }
 
 static void CopyDirectory(string from, string to)
@@ -293,6 +333,28 @@ void HostCannotLoad()
     Console.WriteLine($"ok  host that can't load an assembly: failed in {failedIn.TotalSeconds:F1} s; the next run passed");
 }
 
+// A test project whose tests failed runs again on the next `test`, though nothing changed since.
+void FailedRunsAgain()
+{
+    Replace("Tests/WelcomeTests.cs", "\"Hello\"", "\"Goodbye\"");
+    try
+    {
+        for (var run = 1; run <= 2; run++)
+        {
+            var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+            if (exitCode == 0 || !Regex.IsMatch(output, @"^\s*Failed!\s+- Failed:\s+1, .* - Tests\.dll\b", RegexOptions.Multiline)
+                || run == 2 && Rebuilt(output).Count != 0)
+                Fail($"failing test, run {run}: expected Tests to run again with one test failed{(run == 2 ? " and nothing rebuilt" : "")}, got exit {exitCode}:\n{output}");
+        }
+    }
+    finally
+    {
+        Replace("Tests/WelcomeTests.cs", "\"Goodbye\"", "\"Hello\"");
+    }
+    RanTests("test after a failed run", Run(blaze, "test"), ["Tests"]);
+    Console.WriteLine("ok  failed test project: ran again with unchanged inputs, and passed once fixed");
+}
+
 // A .runsettings with anything beyond environment variables and test parameters sends its project to dotnet
 // test, which applies it; the tests still see the variable and parameter there.
 void RunSettingsTheHostDoesNotApply()
@@ -305,6 +367,82 @@ void RunSettingsTheHostDoesNotApply()
         Fail($"runsettings the host doesn't apply: expected NUnitTests to pass under dotnet test:\n{output}");
     Console.WriteLine("ok  runsettings the host doesn't apply: dotnet test ran the project");
 }
+
+// An API change in Lib whose compile, or whose writes, fail: the build fails naming the cause, and Consumer,
+// though it may compile against Lib's new image while Lib's files are written, writes nothing. Once the
+// cause is gone, the next build brings every output back to what dotnet build makes.
+void ParentFails()
+{
+    const string greet = "Greet(string person) => \"Hello there, \" + person";
+    Dictionary<string, byte[]> ConsumerOutputs(string framework) =>
+        Outputs().Where(o => o.Key.StartsWith($"Consumer/obj/Debug/{framework}/", StringComparison.Ordinal)).ToDictionary();
+    void Unchanged(string name, Dictionary<string, byte[]> before, string framework)
+    {
+        var after = ConsumerOutputs(framework);
+        if (before.Count == 0 || before.Any(o => !after.TryGetValue(o.Key, out var bytes) || !bytes.AsSpan().SequenceEqual(o.Value)))
+            Fail($"{name}: expected Consumer ({framework}) to write nothing");
+    }
+
+    var consumer10 = ConsumerOutputs("net10.0");
+    var consumer8 = ConsumerOutputs("net8.0");
+    Replace("Lib/Greeter.cs", greet, "Greet(string name) => \"Hello there, \" + person");
+    var (output, exitCode) = RunWithExit(blaze, "build", check: false);
+    if (exitCode == 0 || !output.Contains("error CS0103") || !output.Contains("blaze-cs: build failed"))
+        Fail($"failing compile in Lib: expected the build to fail with CS0103, got exit {exitCode}:\n{output}");
+    Unchanged("failing compile in Lib", consumer10, "net10.0");
+    Unchanged("failing compile in Lib", consumer8, "net8.0");
+    Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + person", greet);
+    var rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(lib))
+        Fail($"failing compile in Lib, fixed: expected blaze-cs to rebuild {string.Join(", ", lib)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+    Verify("failing compile in Lib, fixed", rebuilt, null);
+
+    // A directory where Lib's net10.0 PDB is first written makes that write fail; its assembly is already written.
+    var pdb = Directory.EnumerateFiles(Path.Combine(work, "Lib", "obj"), "Lib.pdb", SearchOption.AllDirectories)
+        .Single(p => Path.GetFileName(Path.GetDirectoryName(p)) == "net10.0");
+    var obstacle = Directory.CreateDirectory(pdb + ".blaze-cs.tmp");
+    try
+    {
+        Replace("Lib/Greeter.cs", greet, "Greet(string name) => \"Hello there, \" + name");
+        (output, exitCode) = RunWithExit(blaze, "build", check: false);
+    }
+    finally
+    {
+        obstacle.Delete();
+    }
+    if (exitCode == 0 || !output.Contains("Lib.pdb.blaze-cs.tmp") || !output.Contains("blaze-cs: build failed"))
+        Fail($"failing write in Lib: expected the build to fail naming Lib.pdb.blaze-cs.tmp, got exit {exitCode}:\n{output}");
+    Unchanged("failing write in Lib", consumer10, "net10.0");
+    Replace("Lib/Greeter.cs", "Greet(string name) => \"Hello there, \" + name", greet);
+    string[] both = [.. consumer, .. lib];
+    rebuilt = Rebuilt(Run(blaze, "build"));
+    if (!rebuilt.SetEquals(both))
+        Fail($"failing write in Lib, fixed: expected blaze-cs to rebuild {string.Join(", ", both)}, it rebuilt {string.Join(", ", rebuilt.Order())}");
+    Verify("failing write in Lib, fixed", rebuilt, null);
+}
+
+
+// With every test skipped, the warm host's summary reads like dotnet test's for each framework: "Skipped!"
+// and the same counts. The xUnit v3 project keeps its explicit test, which neither counts.
+void AllTestsSkipped()
+{
+    string[] projects = ["Tests", "XunitV2Tests", "NUnitTests", "MSTestTests"];
+    SkipTests("Tests/WelcomeTests.cs", "[Fact]", "[Fact(Skip = \"skipped\")]");
+    SkipTests("XunitV2Tests/WelcomeTests.cs", "[Fact]", "[Fact(Skip = \"skipped\")]");
+    SkipTests("NUnitTests/WelcomeTests.cs", "[Test]", "[Test, Ignore(\"skipped\")]");
+    SkipTests("MSTestTests/WelcomeTests.cs", "[TestMethod]", "[TestMethod, Ignore]");
+    var ours = Summaries(Run(blaze, "test"));
+    foreach (var project in projects)
+    {
+        var theirs = Summaries(Run("dotnet", $"test --no-build {project} -nologo"));
+        var expected = new Summary("Skipped!", 0, 0, TestCount(project), TestCount(project));
+        if (ours.GetValueOrDefault(project) != expected || theirs.GetValueOrDefault(project) != expected)
+            Fail($"all tests skipped: {project}: expected {expected} from the host and from dotnet test, got {ours.GetValueOrDefault(project)} and {theirs.GetValueOrDefault(project)}");
+    }
+    Console.WriteLine("ok  all tests skipped: the host's summary lines match dotnet test's");
+}
+
+void SkipTests(string path, string attribute, string skipped) => File.WriteAllText(Path.Combine(work, path), File.ReadAllText(Path.Combine(work, path)).Replace(attribute, skipped));
 
 void Replace(string path, string old, string replacement)
 {
@@ -351,20 +489,32 @@ HashSet<string> FellBack(string name, string output, string fallback, bool allKe
     return [];
 }
 
-// The test projects a run reports, from their summary lines ("Passed!  - Failed: 0, Passed: 2, ... - Tests.dll",
-// printed alike by the warm host and dotnet test): exactly the expected ones, once each, with all their tests
-// passed, and none through dotnet test, since the warm host must run them on the runtime each one targets.
+// The test projects' summary lines ("Passed!  - Failed: 0, Passed: 2, Skipped: 0, Total: 2, ... - Tests.dll",
+// printed alike by the warm host and dotnet test), by project.
+static Dictionary<string, Summary> Summaries(string output) =>
+    Regex.Matches(output, @"^\s*(\w+!)\s+- Failed:\s+(\d+), Passed:\s+(\d+), Skipped:\s+(\d+), Total:\s+(\d+), .* - (\S+)\.dll\b", RegexOptions.Multiline)
+        .ToDictionary(m => m.Groups[6].Value, m => new Summary(m.Groups[1].Value, int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value),
+            int.Parse(m.Groups[4].Value), int.Parse(m.Groups[5].Value)));
+
+// The test projects a run reports: exactly the expected ones, once each, with all their tests passed and
+// counted as dotnet test counts them (explicit tests that weren't asked for aren't), and none through
+// dotnet test, since the warm host must run them on the runtime each one targets. Every other test
+// project is listed as unchanged since its last run.
 void RanTests(string name, string output, string[] expected)
 {
-    var summaries = Regex.Matches(output, @"^\s*(?:Passed|Failed)!\s+- Failed:\s+(\d+), Passed:\s+(\d+), .* - (\S+)\.dll\b", RegexOptions.Multiline)
-        .Select(m => (Project: m.Groups[3].Value, Failed: int.Parse(m.Groups[1].Value), Passed: int.Parse(m.Groups[2].Value)))
-        .ToList();
-    if (!summaries.Select(s => s.Project).Order().SequenceEqual(expected.Order()))
-        Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Select(s => s.Project).Order())}:\n{output}");
+    var unchanged = Regex.Match(output, @"^blaze-cs: unchanged since last run: (.+)$", RegexOptions.Multiline) is { Success: true } line
+        ? line.Groups[1].Value.TrimEnd('\r').Split(", ").Select(project => project.Split(" (")[0]).ToList()
+        : [];
+    if (!unchanged.Order().SequenceEqual(allTests.Except(expected).Order()))
+        Fail($"{name}: expected {string.Join(", ", allTests.Except(expected).Order())} listed as unchanged since last run, got {string.Join(", ", unchanged.Order())}:\n{output}");
+    var summaries = Summaries(output);
+    if (!summaries.Keys.Order().SequenceEqual(expected.Order()))
+        Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Keys.Order())}:\n{output}");
     if (output.Contains("running dotnet test"))
         Fail($"{name}: expected the test host to run these, not dotnet test:\n{output}");
-    if (summaries.FirstOrDefault(s => s.Failed != 0 || s.Passed != TestCount(s.Project)) is { Project: not null } wrong)
-        Fail($"{name}: {wrong.Project}: expected {TestCount(wrong.Project)} tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
+    foreach (var (project, summary) in summaries)
+        if (summary != new Summary("Passed!", 0, TestCount(project), 0, TestCount(project)))
+            Fail($"{name}: {project}: expected {TestCount(project)} tests passed and no others, got {summary}:\n{output}");
 }
 
 // Each test project has its two tests and RunsOnTargetRuntime, plus AppliesRunSettings where it has a .runsettings.
@@ -437,4 +587,6 @@ static void Fail(string message) => throw new CheckFailed(message);
 
 sealed class CheckFailed(string message) : Exception(message);
 
-sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null, bool AllKept = false);
+sealed record Summary(string Label, int Failed, int Passed, int Skipped, int Total);
+
+sealed record Case(string Name, Action Edit, string[] Expected, string Command, string? Fallback = null, bool AllKept = false, string[]? Ran = null);
