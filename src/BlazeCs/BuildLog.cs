@@ -16,6 +16,11 @@ sealed record CompileUnit(string Name, string ProjectFile, string ProjectDirecto
     /// <summary>The reference assembly csc writes (/refout:), if any.</summary>
     public string? ReferenceAssemblyPath => PathArgument("/refout:");
 
+    /// <summary>Identifies the unit as a build names it: its project file, and the target framework in its name.</summary>
+    public string Key => KeyOf(ProjectFile, Name);
+
+    public static string KeyOf(string projectFile, string name) => projectFile + '|' + name;
+
     string? PathArgument(string prefix) =>
         Arguments.LastOrDefault(a => a.StartsWith(prefix, StringComparison.Ordinal)) is { } argument
             ? Path.GetFullPath(argument[prefix.Length..].Trim('"'), ProjectDirectory)
@@ -23,8 +28,11 @@ sealed record CompileUnit(string Name, string ProjectFile, string ProjectDirecto
 }
 
 /// <summary>What the daemon learns from a `dotnet build -bl` binlog.</summary>
+/// <param name="Units">The csc invocations that ran: an incremental build runs csc only where something changed.</param>
+/// <param name="Compiled">Every C# project (or target framework of one) the build ran CoreCompile for, whether csc ran
+/// or the target was up to date, as <see cref="CompileUnit.Key"/>: the units the solution builds.</param>
 /// <param name="Copies">Every file copy MSBuild made or confirmed up to date, source to destination.</param>
-sealed record BuildLogInfo(IReadOnlyList<CompileUnit> Units, IReadOnlyList<(string From, string To)> Copies);
+sealed record BuildLogInfo(IReadOnlyList<CompileUnit> Units, IReadOnlySet<string> Compiled, IReadOnlyList<(string From, string To)> Copies);
 
 static partial class BuildLog
 {
@@ -40,6 +48,7 @@ static partial class BuildLog
         var realPaths = new Dictionary<string, string>(PathComparer.Instance);
         var dotnetRoot = Path.GetDirectoryName(Path.GetDirectoryName(RealPath(sdkDirectory, realPaths)))!;
         var units = new List<CompileUnit>();
+        var compiled = new HashSet<string>(PathComparer.Instance);
         var copies = new List<(string, string)>();
         foreach (var project in build.FindChildrenRecursive<Project>())
         {
@@ -54,18 +63,22 @@ static partial class BuildLog
                     copies.AddRange(CopiesOf(task, projectDirectory));
             }
 
+            var name = Path.GetFileNameWithoutExtension(project.ProjectFile)
+                + (string.IsNullOrEmpty(project.TargetFramework) ? "" : $" ({project.TargetFramework})");
+            // Skipped as up to date, CoreCompile still has its node: that is how a project csc didn't run for shows.
+            if (targets.Any(t => t.Name == "CoreCompile" && t.SourceFilePath?.EndsWith("Microsoft.CSharp.Core.targets", PathComparer.Comparison) == true))
+                compiled.Add(CompileUnit.KeyOf(project.ProjectFile, name));
+
             var csc = targets.Where(t => t.Name == "CoreCompile")
                 .SelectMany(t => t.Children.OfType<MSBuildTask>())
                 .FirstOrDefault(t => t.Name == "Csc");
             if (csc?.CommandLineArguments is not { } commandLine)
                 continue;
 
-            var name = Path.GetFileNameWithoutExtension(project.ProjectFile)
-                + (string.IsNullOrEmpty(project.TargetFramework) ? "" : $" ({project.TargetFramework})");
             var unit = new CompileUnit(name, project.ProjectFile, projectDirectory, CompilerArguments(commandLine), null);
             units.Add(unit with { SlowPathReason = SlowPathReason(targets, unit.AssemblyPath, dotnetRoot, realPaths) });
         }
-        return new BuildLogInfo(units, copies);
+        return new BuildLogInfo(units, compiled, copies);
     }
 
     /// <summary>csc's arguments without the compiler executable in front.</summary>

@@ -1,5 +1,5 @@
 #!/usr/bin/env dotnet
-#:include PeIdentity.cs
+#:include ../src/BlazeCs/PeIdentity.cs
 // Compares assemblies pairwise, ignoring only their debug identity (see PeIdentity).
 //
 // usage: dotnet run pe-equal.cs -- <list file of "a b" path pairs>

@@ -2,9 +2,6 @@ using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
 
 namespace BlazeCs;
 
@@ -14,27 +11,24 @@ namespace BlazeCs;
 /// </summary>
 static class Program
 {
-    const string Usage = "usage: blaze-cs build | test | run [-- app arguments] | stop";
+    const string Usage = "usage: blaze-cs build | test [--all] | run [-- app arguments] | stop";
 
     static int Main(string[] args)
     {
         if (args is ["daemon", var solution])
             return RunDaemon(solution);
-        if (args.Length == 0 || args[0] is not ("build" or "test" or "run" or "stop"))
+        if (args.Length == 0 || args[0] is not ("build" or "test" or "run" or "stop") || args[0] == "test" && args is not (["test"] or ["test", "--all"]))
         {
             Console.Error.WriteLine(Usage);
             return 2;
         }
 
-        var solutionPath = FindSolution(Environment.CurrentDirectory);
+        var solutionPath = DaemonClient.FindSolution(Environment.CurrentDirectory);
         if (solutionPath is null)
-        {
-            Console.Error.WriteLine("blaze-cs: no .sln or .slnx file here or in any parent directory");
             return 2;
-        }
 
         var command = args[0];
-        var exitCode = Send(solutionPath, command == "run" ? "build" : command);
+        var exitCode = Send(solutionPath, new Request(command == "run" ? "build" : command, Daemon.Build, All: args is ["test", "--all"]));
         if (command != "run" || exitCode != 0)
             return exitCode;
 
@@ -59,7 +53,7 @@ static class Program
         {
             // Before anything JIT-compiles a method that mentions a Roslyn type.
             var sdkDirectory = SdkRoslyn.Install(Path.GetDirectoryName(solutionPath)!);
-            return Daemon.Run(solutionPath, SocketPath(solutionPath), sdkDirectory);
+            return Daemon.Run(solutionPath, DaemonClient.SocketPath(solutionPath), sdkDirectory);
         }
         catch (Exception e)
         {
@@ -68,10 +62,11 @@ static class Program
         }
     }
 
-    static int Send(string solutionPath, string command)
+    static int Send(string solutionPath, Request request)
     {
-        var socketPath = SocketPath(solutionPath);
-        var socket = Connect(socketPath);
+        var command = request.Command;
+        var socketPath = DaemonClient.SocketPath(solutionPath);
+        var socket = DaemonClient.Connect(socketPath);
         for (var restarted = false; ; restarted = true)
         {
             if (socket is null)
@@ -94,7 +89,7 @@ static class Program
 
             using (socket)
             {
-                var exitCode = Exchange(socket, command, out var otherBuild);
+                var exitCode = DaemonClient.Exchange(socket, command, Daemon.Build, request.All, out var otherBuild);
                 if (otherBuild is not { } daemonProcess)
                     return exitCode;
                 if (restarted)
@@ -102,64 +97,9 @@ static class Program
                     Console.Error.WriteLine("blaze-cs: the new daemon is from another build too");
                     return 1;
                 }
-                Console.Error.WriteLine("blaze-cs: the running daemon is from another build of blaze-cs; restarting it");
-                WaitForExit(daemonProcess);
+                DaemonClient.WaitForRestart(daemonProcess);
             }
             socket = null;
-        }
-    }
-
-    /// <summary>
-    /// Sends the command and relays the output. A daemon of another build answers with its process id
-    /// instead, and exits.
-    /// </summary>
-    static int Exchange(Socket socket, string command, out int? otherBuildProcess)
-    {
-        otherBuildProcess = null;
-        using var stream = new NetworkStream(socket);
-        using var writer = new StreamWriter(stream) { AutoFlush = true };
-        using var reader = new StreamReader(stream);
-        writer.WriteLine(JsonSerializer.Serialize(new Request(command, Daemon.Build)));
-        while (reader.ReadLine() is { } line)
-        {
-            if (line.StartsWith(Daemon.ExitPrefix, StringComparison.Ordinal))
-                return int.Parse(line[Daemon.ExitPrefix.Length..]);
-            if (line.StartsWith(Daemon.RestartPrefix, StringComparison.Ordinal))
-            {
-                otherBuildProcess = int.Parse(line[Daemon.RestartPrefix.Length..]);
-                return 0;
-            }
-            Console.WriteLine(line);
-        }
-        Console.Error.WriteLine("blaze-cs: lost the daemon mid-command");
-        return 1;
-    }
-
-    /// <summary>So the new daemon doesn't start beside one still shutting down.</summary>
-    static void WaitForExit(int processId)
-    {
-        try
-        {
-            using var process = Process.GetProcessById(processId);
-            process.WaitForExit(TimeSpan.FromSeconds(30));
-        }
-        catch (ArgumentException) { } // already gone
-    }
-
-    static Socket? Connect(string socketPath)
-    {
-        if (!File.Exists(socketPath))
-            return null;
-        var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        try
-        {
-            socket.Connect(new UnixDomainSocketEndPoint(socketPath));
-            return socket;
-        }
-        catch (SocketException)
-        {
-            socket.Dispose();
-            return null;
         }
     }
 
@@ -198,7 +138,7 @@ static class Program
         var deadline = Stopwatch.StartNew();
         while (deadline.Elapsed < TimeSpan.FromSeconds(30))
         {
-            if (Connect(socketPath) is { } socket)
+            if (DaemonClient.Connect(socketPath) is { } socket)
                 return socket;
             Thread.Sleep(20);
         }
@@ -266,30 +206,7 @@ static class Program
             }
         }
     }
-
-    /// <summary>Per solution, under the runtime directory: socket paths must stay short.</summary>
-    static string SocketPath(string solutionPath)
-    {
-        var hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(solutionPath)))[..16];
-        var directory = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR") is { Length: > 0 } runtime ? runtime : Path.GetTempPath();
-        return Path.Combine(directory, $"blaze-cs-{hash}.sock");
-    }
-
-    static string? FindSolution(string directory)
-    {
-        for (var current = new DirectoryInfo(directory); current is not null; current = current.Parent)
-        {
-            var solutions = current.EnumerateFiles("*.sln").Concat(current.EnumerateFiles("*.slnx")).ToList();
-            if (solutions.Count == 1)
-                return solutions[0].FullName;
-            if (solutions.Count > 1)
-            {
-                Console.Error.WriteLine($"blaze-cs: more than one solution in {current.FullName}");
-                return null;
-            }
-        }
-        return null;
-    }
 }
 
-sealed record Request(string Command, Guid Build);
+/// <param name="All">For `test`: run every test project, not only those whose inputs changed.</param>
+sealed record Request(string Command, Guid Build, bool All = false);
