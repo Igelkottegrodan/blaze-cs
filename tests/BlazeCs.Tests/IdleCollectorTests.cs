@@ -11,10 +11,29 @@ public class IdleCollectorTests
 {
     static readonly TimeSpan Delay = TimeSpan.FromMilliseconds(100);
 
-    /// <summary>Long enough after <see cref="Delay"/> for a scheduled collection to have run.</summary>
+    /// <summary>
+    /// How long a check that nothing happened waits, and how long after a collection a second one, if
+    /// scheduled, would have run.
+    /// </summary>
     static readonly TimeSpan Settled = TimeSpan.FromMilliseconds(1000);
 
+    /// <summary>
+    /// How long a check waits for something that should happen: a loaded CI runner (Windows, with the other
+    /// tests in parallel) can take longer than <see cref="Settled"/> to run a timer's continuation.
+    /// </summary>
+    static readonly TimeSpan Patience = TimeSpan.FromSeconds(30);
+
     int _collections;
+
+    /// <summary>Waits until a collection has run, then for <see cref="Settled"/>, and checks there was only one.</summary>
+    async Task CollectedOnce()
+    {
+        var deadline = DateTime.UtcNow + Patience;
+        while (Volatile.Read(ref _collections) == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        await Task.Delay(Settled, TestContext.Current.CancellationToken);
+        Assert.Equal(1, Volatile.Read(ref _collections));
+    }
 
     IdleCollector Collector() => new(Delay, () => Interlocked.Increment(ref _collections));
 
@@ -25,8 +44,7 @@ public class IdleCollectorTests
         collector.Idle();
         Assert.Equal(0, _collections);
 
-        await Task.Delay(Settled, TestContext.Current.CancellationToken);
-        Assert.Equal(1, _collections);
+        await CollectedOnce();
     }
 
     [Fact]
@@ -47,8 +65,7 @@ public class IdleCollectorTests
         collector.Idle();
         collector.Idle();
 
-        await Task.Delay(Settled, TestContext.Current.CancellationToken);
-        Assert.Equal(1, _collections);
+        await CollectedOnce();
     }
 
     [Fact]
@@ -62,8 +79,7 @@ public class IdleCollectorTests
         Assert.Equal(0, _collections);
 
         warmUp.SetException(new InvalidOperationException("a failed warm-up is still finished"));
-        await Task.Delay(Settled, TestContext.Current.CancellationToken);
-        Assert.Equal(1, _collections);
+        await CollectedOnce();
     }
 
     [Fact]
@@ -90,13 +106,13 @@ public class IdleCollectorTests
             release.Wait();
         });
         collector.Idle();
-        Assert.True(started.Wait(Settled, TestContext.Current.CancellationToken));
+        Assert.True(started.Wait(Patience, TestContext.Current.CancellationToken));
 
         var busy = Task.Run(collector.Busy, TestContext.Current.CancellationToken);
         await Task.Delay(Delay, TestContext.Current.CancellationToken);
         Assert.False(busy.IsCompleted);
 
         release.Set();
-        await busy.WaitAsync(Settled, TestContext.Current.CancellationToken);
+        await busy.WaitAsync(Patience, TestContext.Current.CancellationToken);
     }
 }
