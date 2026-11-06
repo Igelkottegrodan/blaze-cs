@@ -20,13 +20,22 @@ namespace BlazeCs;
 sealed class MSBuildHost
 {
     /// <summary>
-    /// The head of BuildDependsOn, up to and including Compile, without the pre-build event (a project with one
-    /// falls back): Compile alone skips PrepareResources, and with it every /resource: argument, and BeforeBuild,
-    /// with any target hooked to it. First the check a real build runs before BeforeBuild, with the SDK's checks
-    /// that run before it (CheckForDuplicateItems): run first, they see the items as evaluated, not those a
-    /// target before CoreCompile adds.
+    /// The targets a real build runs up to and including Compile, from the project's own BuildDependsOn (up to
+    /// CoreBuild) and CoreBuildDependsOn (up to Compile), so a target a project or an import puts in front of
+    /// them runs too. Compile alone skips PrepareResources, and with it every /resource: argument, and
+    /// BeforeBuild, with any target hooked to it. The pre-build event is among them, but a project with one falls
+    /// back first. First the check a real build runs before BeforeBuild, with the SDK's checks that run before
+    /// it (CheckForDuplicateItems): run first, they see the items as evaluated, not those a target before
+    /// CoreCompile adds. Null when the lists don't lead to Compile.
     /// </summary>
-    static readonly string[] CompileTargets = ["_CheckForInvalidConfigurationAndPlatform", "BeforeBuild", "BuildOnlySettings", "PrepareForBuild", "ResolveReferences", "PrepareResources", "ResolveKeySource", "Compile"];
+    static string[]? CompileTargets(ProjectInstance project)
+    {
+        static string[] Targets(string list) => list.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        string[] build = Targets(project.GetPropertyValue("BuildDependsOn")), core = Targets(project.GetPropertyValue("CoreBuildDependsOn"));
+        var coreBuild = Array.FindIndex(build, t => t.Equals("CoreBuild", StringComparison.OrdinalIgnoreCase));
+        var compile = Array.FindIndex(core, t => t.Equals("Compile", StringComparison.OrdinalIgnoreCase));
+        return coreBuild < 0 || compile < 0 ? null : ["_CheckForInvalidConfigurationAndPlatform", .. build[..coreBuild], .. core[..(compile + 1)]];
+    }
 
     /// <summary>Added to the global properties of the unit's real build for the design-time pass.</summary>
     static readonly Dictionary<string, string> DesignTime = new()
@@ -72,8 +81,12 @@ sealed class MSBuildHost
         _evaluated.Clear();
     }
 
-    /// <summary>One unit to evaluate again: its project file and the global properties its last real build had.</summary>
-    public sealed record Request(string Key, string ProjectFile, IReadOnlyDictionary<string, string> GlobalProperties);
+    /// <summary>
+    /// One unit to evaluate again: its project file, the global properties its last real build had, and how the
+    /// edit's changed compiler settings are read (<see cref="ProjectFileEdit.MoreThanCompilerInput"/>): an import
+    /// that reads one does more with it than csc, and the edit falls back.
+    /// </summary>
+    public sealed record Request(string Key, string ProjectFile, IReadOnlyDictionary<string, string> GlobalProperties, IReadOnlyList<string> ChangedSettings);
 
     /// <summary>A unit's csc arguments from the pass, and its evaluated RunSettingsFilePath as a full path, if any.</summary>
     public sealed record Evaluated(string[] Arguments, string? RunSettingsFilePath);
@@ -134,6 +147,7 @@ sealed class MSBuildHost
             }
 
             var units = new Dictionary<string, Evaluated>(PathComparer.Instance);
+            var importTexts = new Dictionary<string, string>(PathComparer.Instance);
             foreach (var request in requests)
             {
                 var globalProperties = new Dictionary<string, string>(request.GlobalProperties);
@@ -149,7 +163,17 @@ sealed class MSBuildHost
                         && (t.BeforeTargets.Contains("PreBuildEvent", StringComparison.OrdinalIgnoreCase)
                             || t.AfterTargets.Contains("PreBuildEvent", StringComparison.OrdinalIgnoreCase))))
                     return (null, $"{name}: it has a pre-build step");
-                var result = manager.BuildRequest(new BuildRequestData(project, CompileTargets, null, BuildRequestDataFlags.ProvideProjectStateAfterBuild));
+                // A compiler setting an import reads may also add a copied item, or turn on a target after CoreCompile.
+                foreach (var import in project.ImportPaths.Where(path => !path.StartsWith(sdk, PathComparer.Comparison)))
+                {
+                    if (!importTexts.TryGetValue(import, out var text))
+                        importTexts[import] = text = File.Exists(import) ? File.ReadAllText(import) : "";
+                    if (ProjectFileEdit.ReadBeyondCompilerInput(text, request.ChangedSettings) is { } read)
+                        return (null, $"{name}: the edit to {Path.GetFileName(request.ProjectFile)} changes more than csc's input ({read}), which {Path.GetFileName(import)} reads)");
+                }
+                if (CompileTargets(project) is not { } targets)
+                    return (null, $"{name}: its BuildDependsOn and CoreBuildDependsOn don't lead to Compile");
+                var result = manager.BuildRequest(new BuildRequestData(project, targets, null, BuildRequestDataFlags.ProvideProjectStateAfterBuild));
                 if (result.OverallResult != BuildResultCode.Success)
                     return (null, $"{name}: the design-time build failed: {errors.Text ?? result.Exception?.Message ?? "no error logged"}");
                 var state = result.ProjectStateAfterBuild ?? project;

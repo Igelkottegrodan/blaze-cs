@@ -167,6 +167,26 @@ Case[] cases =
     // The pass doesn't run a pre-build step, which a real build runs even when nothing else changed.
     new("project file edit with a pre-build step", () => Replace("Consumer/Consumer.csproj", "<!-- edited -->", "<!-- edited again -->"),
         [], "build", "Consumer: it has a pre-build step; running dotnet build"),
+    // A compiler setting, so the pass takes it; the pass must also run AddPrependedSource, which
+    // Directory.Build.targets puts in front of BuildDependsOn, or Lib loses Prepended.cs.
+    new("project file LangVersion",
+        () => Replace("Lib/Lib.csproj", "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>",
+            "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>\n    <LangVersion>latest</LangVersion>"),
+        lib, "build", Logged: "evaluated Lib.csproj in process in"),
+    // An import that reads a compiler setting may do more with it than csc: here, copy a file.
+    new("Directory.Build.targets reads a compiler setting",
+        () =>
+        {
+            File.WriteAllText(Path.Combine(work, "Lib/copied.txt"), "copied when overflow checks are on\n");
+            Replace("Directory.Build.targets", "</Project>",
+                "  <ItemGroup Condition=\"'$(CheckForOverflowUnderflow)' == 'true'\">\n"
+                + "    <None Include=\"$(MSBuildProjectDirectory)/copied.txt\" CopyToOutputDirectory=\"PreserveNewest\" Condition=\"Exists('$(MSBuildProjectDirectory)/copied.txt')\" />\n"
+                + "  </ItemGroup>\n</Project>");
+        },
+        [], "build", "Directory.Build.targets changed, running dotnet build"),
+    new("project file setting an import reads",
+        () => Replace("Lib/Lib.csproj", "<LangVersion>latest</LangVersion>", "<LangVersion>latest</LangVersion>\n    <CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>"),
+        [], "build", "Lib: the edit to Lib.csproj changes more than csc's input ($(CheckForOverflowUnderflow), which Directory.Build.targets reads); running dotnet build"),
 ];
 
 if (Directory.Exists(work))

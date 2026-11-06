@@ -30,8 +30,13 @@ static class ProjectFileEdit
     /// and whitespace, only compiler properties and compiler items in the project's top-level groups;
     /// otherwise what else it changes, such as <c>&lt;None Update="data.txt"&gt;</c>.
     /// </summary>
-    public static string? MoreThanCompilerInput(string before, string after)
+    /// <param name="changed">
+    /// How the compiler settings the edit changes are read, such as <c>$(DefineConstants</c> or <c>@(Compile</c>:
+    /// an import that reads one may do more with it than csc does, which only MSBuild can tell.
+    /// </param>
+    public static string? MoreThanCompilerInput(string before, string after, out string[] changed)
     {
+        changed = [];
         XElement old, now;
         try
         {
@@ -49,15 +54,36 @@ static class ProjectFileEdit
         // The rest of the file is the same; a compiler setting it reads, in a condition or another property,
         // is more than a compiler setting.
         var rest = now.ToString(SaveOptions.DisableFormatting);
-        foreach (var name in oldCompiler.Keys.Union(newCompiler.Keys, StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal))
-        {
-            if (oldCompiler.GetValueOrDefault(name) == newCompiler.GetValueOrDefault(name))
-                continue;
-            var reference = name[0] == '$' ? $"$({name[1..]}" : $"@({name[1..]}";
-            if (rest.Contains(reference, StringComparison.OrdinalIgnoreCase))
-                return $"{reference}), which the project file reads elsewhere";
-        }
+        changed = [.. oldCompiler.Keys.Union(newCompiler.Keys, StringComparer.OrdinalIgnoreCase)
+            .Where(name => oldCompiler.GetValueOrDefault(name) != newCompiler.GetValueOrDefault(name))
+            .Select(name => (name[0] == '$' ? "$(" : "@(") + name[1..])
+            .Order(StringComparer.Ordinal)];
+        if (changed.FirstOrDefault(reference => rest.Contains(reference, StringComparison.OrdinalIgnoreCase)) is { } read)
+            return $"{read}), which the project file reads elsewhere";
         return null;
+    }
+
+    /// <summary>
+    /// The first of <paramref name="references"/> (from <see cref="MoreThanCompilerInput"/>) that an imported
+    /// file reads for more than csc's input: outside its comments and its top-level compiler properties and
+    /// items, so a Directory.Build.props that appends to DefineConstants or NoWarn reads nothing. Null if none.
+    /// </summary>
+    public static string? ReadBeyondCompilerInput(string import, IReadOnlyList<string> references)
+    {
+        if (references.Count == 0)
+            return null;
+        string rest;
+        try
+        {
+            var project = XElement.Parse(import);
+            StripCompilerInput(project);
+            rest = project.ToString(SaveOptions.DisableFormatting);
+        }
+        catch (XmlException)
+        {
+            rest = import;
+        }
+        return references.FirstOrDefault(reference => rest.Contains(reference, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>

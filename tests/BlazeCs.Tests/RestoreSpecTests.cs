@@ -18,7 +18,7 @@ public class RestoreSpecTests
             }{{string.Concat(projects.Select(p => $$""", "{{p}}": { "version": "1.0.0" }"""))}}
           }
         }
-        """;
+        """.ReplaceLineEndings("\n");
 
     const string LibReference = "\"/s/Lib/Lib.csproj\": { \"projectPath\": \"/s/Lib/Lib.csproj\" }";
 

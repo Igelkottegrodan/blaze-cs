@@ -1007,13 +1007,15 @@ sealed partial class SolutionBuilder
         }
         // The pass gives csc's arguments and nothing else the build does.
         var texts = new Dictionary<string, string>(PathComparer.Instance);
+        var changedSettings = new Dictionary<string, string[]>(PathComparer.Instance);
         foreach (var path in edited.Order(StringComparer.Ordinal))
         {
             texts[path] = File.ReadAllText(path);
             if (!_projectTexts.TryGetValue(path, out var before))
                 return FallBack($"{Path.GetFileNameWithoutExtension(path)}: its project file wasn't read at the last build");
-            if (ProjectFileEdit.MoreThanCompilerInput(before, texts[path]) is { } more)
+            if (ProjectFileEdit.MoreThanCompilerInput(before, texts[path], out var settings) is { } more)
                 return FallBack($"{Path.GetFileNameWithoutExtension(path)}: the edit to {Path.GetFileName(path)} changes more than csc's input ({more})");
+            changedSettings[path] = settings;
         }
         if (_msbuildUnavailable is { } unavailable)
             return FallBack($"in-process MSBuild: {unavailable}");
@@ -1035,7 +1037,7 @@ sealed partial class SolutionBuilder
         try
         {
             var (units, fallback) = _msbuild.Pass(
-                [.. reached.Select(u => new MSBuildHost.Request(u.Unit.Key, u.Unit.ProjectFile, _globalProperties[u.Unit.Key]))], edited);
+                [.. reached.Select(u => new MSBuildHost.Request(u.Unit.Key, u.Unit.ProjectFile, _globalProperties[u.Unit.Key], changedSettings[u.Unit.ProjectFile]))], edited);
             if (fallback is not null)
                 return FallBack(fallback);
             evaluated = units!;

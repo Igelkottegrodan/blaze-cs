@@ -298,8 +298,9 @@ and the SDK's `CheckForDuplicateItems` runs before it, so that check sees the it
 item again. The fixture's `Lib` does that, and the pass failed with `NETSDK1022`, which the real build doesn't
 raise.
 
-It also runs `BeforeBuild` after that check, as `BuildDependsOn` does, so a target hooked to it (one that adds a
-generated `Compile` item, say) runs in the pass. The pre-build event doesn't run: a project with a non-empty
+It also runs what the project's own `BuildDependsOn` lists before `CoreBuild`, and what its `CoreBuildDependsOn`
+lists up to `Compile`, as evaluated: `BeforeBuild` with any target hooked to it, and any target a project or an
+import puts in front of either list (a code generator hooked the classic way, say). A fixed list missed those. The pre-build event doesn't run: a project with a non-empty
 `PreBuildEvent`, or a target whose `BeforeTargets` or `AfterTargets` names `PreBuildEvent`, falls back with
 `Lib: it has a pre-build step`.
 
@@ -313,8 +314,10 @@ What the implementation does beyond the tables below, from the review of its fir
   differs falls back, naming it: `Lib: the edit to Lib.csproj changes more than csc's input (<None
   Update="data.txt">)`. That covers files the build copies, the runtimeconfig and deps.json
   (`InvariantGlobalization`, `RollForward`), the apphost (`OutputType`), packages, references and every
-  target, a weaving one after `CoreCompile` included. A compiler property that the rest of the file reads (in a
-  condition or another property) falls back too. An import that reads one is the remaining gap.
+  target, a weaving one after `CoreCompile` included. A changed compiler setting that something else reads falls
+  back too: the rest of the project file, or any import outside the SDK (a copy item or a weaving target under
+  a condition on it). References from a compiler property itself don't count, so a Directory.Build.props that
+  appends to `DefineConstants` or `NoWarn` doesn't make every such edit fall back.
 - **The restore check compares the projects restore reaches.** `GenerateRestoreGraphFile` also lists a project
   only a `ReferenceOutputAssembly="false"` reference leads to (the fixture's `Generator`, from `Consumer`). The
   spec restore writes leaves it out: restore follows each framework's `projectReferences`. Both specs are cut

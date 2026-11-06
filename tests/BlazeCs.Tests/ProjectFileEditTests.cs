@@ -8,7 +8,8 @@ namespace BlazeCs.Tests;
 /// </summary>
 public class ProjectFileEditTests
 {
-    const string Project = """
+    // LF on every checkout: a Windows checkout of this file has CRLF, and the edits below name LF.
+    static readonly string Project = """
         <Project Sdk="Microsoft.NET.Sdk">
           <PropertyGroup>
             <TargetFramework>net10.0</TargetFramework>
@@ -18,7 +19,7 @@ public class ProjectFileEditTests
             <ProjectReference Include="../Lib/Lib.csproj" />
           </ItemGroup>
         </Project>
-        """;
+        """.ReplaceLineEndings("\n");
 
     static string Edit(string from, string to)
     {
@@ -26,7 +27,7 @@ public class ProjectFileEditTests
         return Project.Replace(from, to);
     }
 
-    static string? After(string from, string to) => ProjectFileEdit.MoreThanCompilerInput(Project, Edit(from, to));
+    static string? After(string from, string to) => ProjectFileEdit.MoreThanCompilerInput(Project, Edit(from, to), out _);
 
     const string End = "</Project>";
 
@@ -66,10 +67,31 @@ public class ProjectFileEditTests
     {
         var before = Edit("<Nullable>enable</Nullable>", "<Nullable>enable</Nullable><DefineConstants>A</DefineConstants><Marker>$(DefineConstants)</Marker>");
         var after = before.Replace("<DefineConstants>A</DefineConstants>", "<DefineConstants>B</DefineConstants>");
-        Assert.Equal("$(DefineConstants), which the project file reads elsewhere", ProjectFileEdit.MoreThanCompilerInput(before, after));
+        Assert.Equal("$(DefineConstants), which the project file reads elsewhere", ProjectFileEdit.MoreThanCompilerInput(before, after, out _));
     }
+
+    // The daemon looks for these in the project's imports, which may read a compiler setting for more than csc.
+    [Fact]
+    public void NamesHowTheChangedSettingsAreRead()
+    {
+        var after = Edit("<Nullable>enable</Nullable>", "<Nullable>disable</Nullable><DefineConstants>FLAG</DefineConstants>")
+            .Replace(End, "  <ItemGroup><Compile Include=\"Extra.txt\" /></ItemGroup>\n</Project>");
+        Assert.Null(ProjectFileEdit.MoreThanCompilerInput(Project, after, out var changed));
+        Assert.Equal(["$(DefineConstants", "$(Nullable", "@(Compile"], changed);
+        Assert.Null(ProjectFileEdit.MoreThanCompilerInput(Project, Project.Replace(End, "  <!-- edited -->\n</Project>"), out changed));
+        Assert.Empty(changed);
+    }
+
+    [Theory]
+    [InlineData("a copy item under a condition", "<ItemGroup Condition=\"$(DefineConstants.Contains('COPY'))\"><None Include=\"data.txt\" CopyToOutputDirectory=\"Always\" /></ItemGroup>", "$(DefineConstants")]
+    [InlineData("a target after CoreCompile", "<Target Name=\"Weave\" AfterTargets=\"CoreCompile\" Condition=\"'$(Optimize)' == 'true'\" />", "$(Optimize")]
+    [InlineData("a target that reads the sources", "<Target Name=\"Lint\" BeforeTargets=\"CoreCompile\"><Exec Command=\"lint @(Compile)\" /></Target>", "@(Compile")]
+    [InlineData("a define appended to", "<PropertyGroup><DefineConstants>$(DefineConstants);SHARED</DefineConstants><NoWarn>$(NoWarn);CS1591</NoWarn></PropertyGroup>", null)]
+    [InlineData("a comment", "<!-- $(DefineConstants) $(Optimize) -->", null)]
+    public void FindsAnImportThatReadsAChangedSetting(string _, string import, string? expected) =>
+        Assert.Equal(expected, ProjectFileEdit.ReadBeyondCompilerInput($"<Project>{import}</Project>", ["$(DefineConstants", "$(Optimize", "@(Compile"]));
 
     [Fact]
     public void FallsBackOnAFileThatDoesNotParse() =>
-        Assert.StartsWith("the file doesn't parse", ProjectFileEdit.MoreThanCompilerInput(Project, Project.Replace(End, "")));
+        Assert.StartsWith("the file doesn't parse", ProjectFileEdit.MoreThanCompilerInput(Project, Project.Replace(End, ""), out _));
 }
