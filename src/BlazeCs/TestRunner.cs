@@ -25,7 +25,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// </summary>
     const int MaxHosts = 4;
 
-    readonly ConcurrentBag<Process> _idleHosts = [];
+    // Idle hosts by runtime version: a test project runs on the runtime it targets, as under `dotnet test`.
+    readonly ConcurrentDictionary<string, ConcurrentBag<Process>> _idleHosts = [];
     readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(PathComparer.Instance);
 
     public int Run(IReadOnlyCollection<ProjectCompiler> changed, Action<string> log)
@@ -90,7 +91,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     {
         var stopwatch = Stopwatch.StartNew();
         var output = new List<string>();
-        var host = TakeHost();
+        var host = TakeHost(RuntimeVersion(assembly));
         try { host.StandardInput.WriteLine($"{framework} {assembly}"); }
         catch (IOException) { } // it died while idle: no result, so the run fails below
 
@@ -118,7 +119,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var fallback = result.Unsupported ?? (result is { Total: 0, Error: null } ? "the test host found no tests" : null);
         if (fallback is not null)
         {
-            lock (_idleHosts)
+            lock (_hostConfigs)
             {
                 output.ForEach(log);
                 log($"blaze-cs: {name}: {fallback}; running dotnet test");
@@ -131,28 +132,78 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             output.Add($"blaze-cs: {name}: {result.Error}");
         output.Add($"{(passed ? "Passed!" : "Failed!")}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
             + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}");
-        lock (_idleHosts)
+        lock (_hostConfigs)
             output.ForEach(log);
         return passed;
     }
 
-    /// <summary>An idle host, and a new one started in its place for the next run.</summary>
-    Process TakeHost()
+    /// <summary>An idle host for a runtime, and a new one started in its place for the next run.</summary>
+    Process TakeHost(string? runtime)
     {
+        var idleHosts = _idleHosts.GetOrAdd(runtime ?? "", _ => []);
         Process? host = null;
-        while (host is null && _idleHosts.TryTake(out var idle))
+        while (host is null && idleHosts.TryTake(out var idle))
         {
             if (idle.HasExited)
                 idle.Dispose();
             else
                 host = idle;
         }
-        host ??= StartHost();
-        _idleHosts.Add(StartHost());
+        host ??= StartHost(runtime);
+        idleHosts.Add(StartHost(runtime));
         return host;
     }
 
-    static Process StartHost()
+    /// <summary>
+    /// The runtime a test assembly targets, from its runtimeconfig.json: "10.0.0" for a release, the exact
+    /// version for a preview (as a preview SDK writes it); null (the host's own) when that can't be read.
+    /// </summary>
+    static string? RuntimeVersion(string assembly)
+    {
+        try
+        {
+            using var config = JsonDocument.Parse(File.ReadAllText(Path.ChangeExtension(assembly, ".runtimeconfig.json")));
+            var options = config.RootElement.GetProperty("runtimeOptions");
+            IEnumerable<JsonElement> frameworks = options.TryGetProperty("frameworks", out var many) ? many.EnumerateArray()
+                : options.TryGetProperty("framework", out var one) ? [one] : [];
+            foreach (var framework in frameworks)
+            {
+                if (framework.GetProperty("name").GetString() == "Microsoft.NETCore.App")
+                {
+                    var version = framework.GetProperty("version").GetString()!;
+                    return version.Contains('-') ? version : $"{Version.Parse(version).Major}.0.0";
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or JsonException or KeyNotFoundException or FormatException or InvalidOperationException) { }
+        return null;
+    }
+
+    readonly Dictionary<string, string> _hostConfigs = [];
+
+    /// <summary>
+    /// A runtimeconfig.json that asks for one version of the runtime and ASP.NET Core, which the host then
+    /// runs on (the latest installed patch of it, as for a project of that target framework).
+    /// </summary>
+    string HostConfig(string runtime)
+    {
+        lock (_hostConfigs)
+        {
+            if (!_hostConfigs.TryGetValue(runtime, out var path))
+            {
+                path = Path.Combine(Path.GetTempPath(), $"blaze-cs-testhost-{Environment.ProcessId}-{_hostConfigs.Count}.runtimeconfig.json");
+                File.WriteAllText(path, $$"""
+                    { "runtimeOptions": { "tfm": "net{{Version.Parse(runtime.Split('-')[0]).Major}}.0", "frameworks": [
+                        { "name": "Microsoft.NETCore.App", "version": "{{runtime}}" },
+                        { "name": "Microsoft.AspNetCore.App", "version": "{{runtime}}" } ] } }
+                    """);
+                _hostConfigs[runtime] = path;
+            }
+            return path;
+        }
+    }
+
+    Process StartHost(string? runtime)
     {
         var start = new ProcessStartInfo("dotnet")
         {
@@ -160,7 +211,14 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
         };
-        start.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, "blaze-cs-testhost.dll"));
+        var host = Path.Combine(AppContext.BaseDirectory, "blaze-cs-testhost.dll");
+        if (runtime is null)
+            start.ArgumentList.Add(host);
+        else
+        {
+            foreach (var argument in new[] { "exec", "--runtimeconfig", HostConfig(runtime), host })
+                start.ArgumentList.Add(argument);
+        }
         // Tests run with the runtime's defaults, as under `dotnet test`, not the daemon's tuning.
         foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
             start.Environment.Remove(variable);
@@ -177,8 +235,13 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
 
     public void Dispose()
     {
-        while (_idleHosts.TryTake(out var host))
-            Stop(host);
+        foreach (var idleHosts in _idleHosts.Values)
+        {
+            while (idleHosts.TryTake(out var host))
+                Stop(host);
+        }
+        foreach (var config in _hostConfigs.Values)
+            File.Delete(config);
     }
 
     /// <summary>

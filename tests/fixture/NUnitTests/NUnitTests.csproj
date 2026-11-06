@@ -8,4 +8,8 @@
   <ItemGroup>
     <ProjectReference Include="../Consumer/Consumer.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The runtime the tests must report: the major version of this project's own target framework. -->
+    <AssemblyMetadata Include="TargetRuntimeMajor" Value="$([System.Version]::Parse($(TargetFrameworkVersion.Substring(1))).Major)" />
+  </ItemGroup>
 </Project>

@@ -15,6 +15,11 @@ var root = Path.GetFullPath(Path.Combine(fixture, "../.."));
 var work = Path.Combine(Path.GetTempPath(), "blaze-cs-fixture");
 var blaze = Path.Combine(root, OperatingSystem.IsWindows() ? "blaze-cs.cmd" : "blaze-cs");
 
+// BLAZE_CS_SDK=<version> checks against another SDK than the repo's pin, such as a .NET 11 one.
+var sdk = Environment.GetEnvironmentVariable("BLAZE_CS_SDK") is { Length: > 0 } pinned ? pinned : null;
+// Tests11 (net11.0) joins the solution only under a .NET 11 or newer SDK; the pin is 10.
+var hasNet11 = sdk is not null && Version.Parse(sdk.Split('-')[0]).Major >= 11;
+
 // (name, edit, units blaze-cs must rebuild, command, fallback); the edits build on each other. Lib and
 // Consumer target net8.0 and net10.0, and blaze-cs names each target framework's unit "Project (tfm)".
 // A case with a fallback must instead log it ("blaze-cs: <fallback>") and run dotnet build.
@@ -49,6 +54,7 @@ Case[] cases =
     new("xUnit v3 test edit", () => Replace("Tests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["Tests"], "test"),
     new("NUnit test edit", () => Replace("NUnitTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["NUnitTests"], "test"),
     new("MSTest test edit", () => Replace("MSTestTests/WelcomeTests.cs", "\"you\"", "\"tester\""), ["MSTestTests"], "test"),
+    .. (hasNet11 ? new Case[] { new Case("net11.0 test edit", () => Replace("Tests11/RuntimeTests.cs", "Edit = 0", "Edit = 1"), ["Tests11"], "test") } : []),
     // Razor (Components): the Razor generator compiles .razor files, which csc gets as /additionalfile.
     new("razor markup", () => Replace("Components/Greeting.razor", "<Badge>@Text(Name)</Badge>", "<Badge><em>@Text(Name)</em></Badge>"),
         ["Components"], "build"),
@@ -76,12 +82,15 @@ Case[] cases =
 if (Directory.Exists(work))
     Directory.Delete(work, recursive: true);
 CopyFixture(fixture, work);
-// BLAZE_CS_SDK=<version> checks against another SDK than the repo's pin, such as a .NET 11 one.
-if (Environment.GetEnvironmentVariable("BLAZE_CS_SDK") is { Length: > 0 } sdk)
+if (sdk is not null)
     File.WriteAllText(Path.Combine(work, "global.json"),
         $$"""{ "sdk": { "version": "{{sdk}}", "allowPrerelease": true, "rollForward": "latestFeature" } }""");
 else
     File.Copy(Path.Combine(root, "global.json"), Path.Combine(work, "global.json"));
+if (hasNet11)
+    Replace("Fixture.slnx", "</Solution>", "  <Project Path=\"Tests11/Tests11.csproj\" />\n</Solution>");
+else
+    Directory.Delete(Path.Combine(work, "Tests11"), recursive: true);
 var passed = false;
 try
 {
@@ -182,7 +191,8 @@ HashSet<string> FellBack(string name, string output, string fallback)
 }
 
 // The test projects a run reports, from their summary lines ("Passed!  - Failed: 0, Passed: 2, ... - Tests.dll",
-// printed alike by the warm host and dotnet test): exactly the expected ones, once each, with both tests passed.
+// printed alike by the warm host and dotnet test): exactly the expected ones, once each, with all their tests
+// passed, and none through dotnet test, since the warm host must run them on the runtime each one targets.
 void RanTests(string name, string output, string[] expected)
 {
     var summaries = Regex.Matches(output, @"^\s*(?:Passed|Failed)!\s+- Failed:\s+(\d+), Passed:\s+(\d+), .* - (\S+)\.dll\b", RegexOptions.Multiline)
@@ -190,9 +200,14 @@ void RanTests(string name, string output, string[] expected)
         .ToList();
     if (!summaries.Select(s => s.Project).Order().SequenceEqual(expected.Order()))
         Fail($"{name}: expected tests of {string.Join(", ", expected)} to run, ran {string.Join(", ", summaries.Select(s => s.Project).Order())}:\n{output}");
-    if (summaries.FirstOrDefault(s => s is not { Failed: 0, Passed: 2 }) is { Project: not null } wrong)
-        Fail($"{name}: {wrong.Project}: expected 2 tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
+    if (output.Contains("running dotnet test"))
+        Fail($"{name}: expected the test host to run these, not dotnet test:\n{output}");
+    if (summaries.FirstOrDefault(s => s.Failed != 0 || s.Passed != TestCount(s.Project)) is { Project: not null } wrong)
+        Fail($"{name}: {wrong.Project}: expected {TestCount(wrong.Project)} tests passed and none failed, got {wrong.Passed} passed, {wrong.Failed} failed:\n{output}");
 }
+
+// Each test project has its two tests and RunsOnTargetRuntime, except these.
+static int TestCount(string project) => project switch { "ComponentTests" => 2, "Tests11" => 1, _ => 3 };
 
 // Compares what blaze-cs wrote with a full MSBuild rebuild of the same sources. After a fallback, MSBuild
 // built everything, so every output must be identical.

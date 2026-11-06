@@ -7,7 +7,8 @@
       "version": "latest",
       "outputs": ["lib"]
     },
-    "go-task": "latest"
+    "go-task": "latest",
+    "dotnet-sdk_11": "11.0.100-rc.3.26522.148"
   },
   "env": {
     "LD_LIBRARY_PATH": "$DEVBOX_PACKAGES_DIR/lib"
