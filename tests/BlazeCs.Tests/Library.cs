@@ -6,7 +6,7 @@ namespace BlazeCs.Tests;
 /// <summary>Compiles small C# sources the way the SDK's csc does: deterministic, nullable on, C# 14.</summary>
 static class Library
 {
-    static readonly MetadataReference[] Framework = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+    public static readonly MetadataReference[] Framework = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
         .Split(Path.PathSeparator)
         .Where(path => Path.GetFileName(path) is var name && (name.StartsWith("System.", StringComparison.Ordinal) || name is "netstandard.dll" or "mscorlib.dll"))
         .Select(path => (MetadataReference)MetadataReference.CreateFromFile(path))

@@ -1,0 +1,9 @@
+root = true
+
+# For the analyzer check (check.cs, AnalyzerWarnings): CA1825 (zero-length array allocations) is a warning
+# everywhere but in Lib/Quiet.cs and in Consumer (Consumer/.editorconfig).
+[*.cs]
+dotnet_diagnostic.CA1825.severity = warning
+
+[Lib/Quiet.cs]
+dotnet_diagnostic.CA1825.severity = none
