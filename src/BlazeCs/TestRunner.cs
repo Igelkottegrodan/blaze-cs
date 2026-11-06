@@ -4,6 +4,9 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Xml;
 using System.Xml.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Text;
 
 namespace BlazeCs;
 
@@ -20,8 +23,11 @@ sealed record TestHostRequest(string Framework, string Assembly, string? RunSett
 /// Runs the test projects whose inputs changed since they last passed in this daemon. xUnit (v2 and
 /// v3), NUnit and MSTest projects run in test host processes, longest first, like `dotnet test` runs
 /// projects side by side; the rest go through `dotnet test --no-build`. A host runs one assembly and
-/// exits. Idle hosts wait already started for each runtime the test projects target, as many as run at
-/// once, so a run doesn't wait for a runtime to start.
+/// exits. Idle hosts wait for the most recently run test projects, one each and at most MaxIdleHosts,
+/// each on the runtime its project targets and with that project's run made ready (the test host's
+/// Prepare: its NuGet packages loaded, its framework rehearsed), so a run of one of them starts neither a
+/// runtime nor the framework cold. A spare host, started for no project, waits on each runtime the
+/// hosted projects target: a project without a host of its own takes it, so its run starts no runtime.
 /// </summary>
 sealed class TestRunner(SolutionBuilder builder) : IDisposable
 {
@@ -32,14 +38,37 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     /// </summary>
     const int MaxHosts = 4;
 
-    // Idle hosts by runtime version: a test project runs on the runtime it targets, as under `dotnet test`.
-    // "" is the host's own runtime, for an assembly whose runtimeconfig.json can't be read.
-    readonly Dictionary<string, List<Process>> _idleHosts = [];
-    // Idle hosts to keep per runtime: as many as run at once, but no more than its hosted test projects.
-    Dictionary<string, int> _targets = [];
-    // Held while hosts start, so concurrent refills don't overshoot a target.
+    /// <summary>
+    /// Idle hosts kept: as many as run at once. One holds its project's packages and compiled framework code,
+    /// about 80 MB on jellyfin, most of it file mappings.
+    /// </summary>
+    const int MaxIdleHosts = MaxHosts;
+
+    // Idle hosts by test assembly, each prepared for that project.
+    readonly Dictionary<string, IdleHost> _idleHosts = new(PathComparer.Instance);
+    // The projects that keep one, as of the last Prestart: the most recently run first.
+    List<HostTarget> _targets = [];
+    // Spare hosts by runtime version, and the runtimes that keep one, as of the last Prestart.
+    readonly Dictionary<string, Process> _spares = [];
+    HashSet<string> _spareRuntimes = [];
+    // Hosted test projects by their last run in this daemon, by assembly, the most recent first.
+    readonly List<string> _recent = [];
+    // Held while hosts start, so concurrent refills don't start two for one project.
     readonly object _refilling = new();
     bool _disposed;
+    // Warm-up assemblies by test assembly, with the key each was compiled for, and every one written, to delete.
+    readonly Dictionary<string, (HostKey Key, string? Path)> _warmUps = new(PathComparer.Instance);
+    readonly List<string> _warmUpFiles = [];
+
+    /// <summary>
+    /// What a host is prepared from: its project's framework, runtime and .runsettings, and a hash of its
+    /// deps.json (the packages it loads) and .runsettings. A host whose key changed is stopped unused.
+    /// </summary>
+    readonly record struct HostKey(string Framework, string Runtime, string? RunSettings, string Inputs);
+
+    sealed record HostTarget(ProjectCompiler Unit, string Assembly, HostKey Key);
+
+    sealed record IdleHost(Process Process, HostKey Key);
     readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(PathComparer.Instance);
 
     /// <summary>
@@ -90,7 +119,18 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var workers = Enumerable.Range(0, Math.Min(MaxHosts, inHost.Count)).Select(_ => Task.Run(() =>
         {
             while (inHost.TryDequeue(out var test))
-                Record(test.Unit, RunInHost(test.Request, log) ?? DotnetTest(test.Unit, log));
+            {
+                var outcome = RunInHost(test.Request, log);
+                if (outcome is not null)
+                {
+                    lock (_recent)
+                    {
+                        _recent.Remove(test.Request.Assembly);
+                        _recent.Insert(0, test.Request.Assembly);
+                    }
+                }
+                Record(test.Unit, outcome ?? DotnetTest(test.Unit, log));
+            }
         })).ToArray();
 
         foreach (var unit in affected.Except(hosted.Select(test => test.Unit)))
@@ -178,7 +218,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var stopwatch = Stopwatch.StartNew();
         var output = new List<string>();
         var assembly = request.Assembly;
-        var host = TakeHost(RuntimeVersion(assembly));
+        var host = TakeHost(assembly, Key(request.Framework, assembly, request.RunSettings));
         try { host.StandardInput.WriteLine(JsonSerializer.Serialize(request)); }
         catch (IOException) { } // it died while idle: no result, so the run fails below
 
@@ -227,79 +267,224 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     }
 
     /// <summary>
-    /// Works out how many idle hosts each runtime needs from the test projects loaded, and starts the missing
-    /// ones in the background: the daemon calls it after loading and after each command, so a run finds them
-    /// ready.
+    /// Works out which test projects keep an idle host, the most recently run first, and starts the missing
+    /// hosts in the background, stopping those no longer wanted or prepared from what has changed since: the
+    /// daemon calls it after loading and after each command, so a run finds its host ready.
     /// </summary>
     public void Prestart()
     {
-        // Read now: the next command may change the units while the hosts start.
-        var targets = builder.Units.Where(u => Framework(u) is not null && InHost(u.Unit, _ => { }, out _))
-            .GroupBy(u => RuntimeVersion(builder.InstalledPath(u)))
-            .ToDictionary(g => g.Key, g => Math.Min(MaxHosts, g.Count()));
+        // Read now: the next command may change the units while the hosts start. Projects not run in this
+        // daemon yet come after the others, in the solution's order.
+        List<string> recent;
+        lock (_recent)
+            recent = [.. _recent];
+        var hosted = builder.Units
+            .Select(u => (Unit: u, Assembly: builder.InstalledPath(u), Framework: Framework(u)))
+            .Where(test => test.Framework is not null)
+            .OrderBy(test => recent.IndexOf(test.Assembly) is var index and >= 0 ? index : int.MaxValue)
+            .Select(test => (test.Unit, test.Assembly, test.Framework, Applies: InHost(test.Unit.Unit, _ => { }, out var runSettings), RunSettings: runSettings))
+            .Where(test => test.Applies)
+            .ToList();
+        var targets = hosted.Take(MaxIdleHosts)
+            .Select(test => new HostTarget(test.Unit, test.Assembly, Key(test.Framework!, test.Assembly, test.RunSettings)))
+            .ToList();
+        var runtimes = hosted.Select(test => RuntimeVersion(test.Assembly)).ToHashSet();
         lock (_idleHosts)
-            _targets = targets;
-        Task.Run(() =>
         {
-            foreach (var runtime in targets.Keys)
-                Refill(runtime);
-        });
+            _targets = targets;
+            _spareRuntimes = runtimes;
+            foreach (var (assembly, idle) in _idleHosts.ToList())
+            {
+                if (idle.Process.HasExited || !targets.Any(target => PathComparer.Instance.Equals(target.Assembly, assembly) && target.Key == idle.Key))
+                {
+                    _idleHosts.Remove(assembly);
+                    Stop(idle.Process);
+                }
+            }
+            foreach (var (runtime, spare) in _spares.ToList())
+            {
+                if (spare.HasExited || !runtimes.Contains(runtime))
+                {
+                    _spares.Remove(runtime);
+                    Stop(spare);
+                }
+            }
+        }
+        Task.Run(Refill);
     }
 
-    /// <summary>Starts hosts until a runtime has all its idle ones.</summary>
-    void Refill(string runtime)
+    /// <summary>
+    /// Starts a host for each project that should have one and hasn't, the most recently run first, then the
+    /// missing spares.
+    /// </summary>
+    void Refill()
     {
         lock (_refilling)
         {
-            while (true)
+            List<HostTarget> missing;
+            lock (_idleHosts)
+                missing = _disposed ? [] : [.. _targets.Where(target => !_idleHosts.ContainsKey(target.Assembly))];
+            foreach (var target in missing)
             {
+                var host = StartHost(target.Key.Runtime, (target.Key.Framework, target.Assembly, target.Key.RunSettings, WarmUp(target)));
                 lock (_idleHosts)
                 {
-                    if (_disposed || IdleHosts(runtime).Count >= _targets.GetValueOrDefault(runtime))
-                        return;
-                }
-                var host = StartHost(runtime);
-                lock (_idleHosts)
-                {
-                    if (!_disposed)
+                    // A Prestart since may have dropped it.
+                    if (!_disposed && _targets.Contains(target) && !_idleHosts.ContainsKey(target.Assembly))
                     {
-                        IdleHosts(runtime).Add(host);
+                        _idleHosts[target.Assembly] = new IdleHost(host, target.Key);
                         continue;
                     }
                 }
                 Stop(host);
-                return;
+                if (_disposed)
+                    return;
             }
+            RefillSpares();
         }
     }
 
-    List<Process> IdleHosts(string runtime)
+    /// <summary>Starts a spare host for each runtime that should have one and hasn't.</summary>
+    void RefillSpares()
     {
-        if (!_idleHosts.TryGetValue(runtime, out var idle))
-            _idleHosts[runtime] = idle = [];
-        return idle;
-    }
-
-    /// <summary>An idle host for a runtime, or a new one if none is ready; the pool refills in the background.</summary>
-    Process TakeHost(string runtime)
-    {
-        Process? host = null;
-        lock (_idleHosts)
+        lock (_refilling)
         {
-            var idle = IdleHosts(runtime);
-            while (host is null && idle.Count > 0)
+            List<string> missing;
+            lock (_idleHosts)
+                missing = _disposed ? [] : [.. _spareRuntimes.Where(runtime => !_spares.ContainsKey(runtime))];
+            foreach (var runtime in missing)
             {
-                var candidate = idle[0];
-                idle.RemoveAt(0);
-                if (candidate.HasExited)
-                    candidate.Dispose();
-                else
-                    host = candidate;
+                var host = StartHost(runtime, null);
+                lock (_idleHosts)
+                {
+                    if (!_disposed && _spareRuntimes.Contains(runtime) && _spares.TryAdd(runtime, host))
+                        continue;
+                }
+                Stop(host);
+                if (_disposed)
+                    return;
             }
         }
-        _ = Task.Run(() => Refill(runtime));
-        return host ?? StartHost(runtime);
     }
+
+    /// <summary>What a host for a test project is prepared from, as of now.</summary>
+    HostKey Key(string framework, string assembly, string? runSettings) => new(framework, RuntimeVersion(assembly), runSettings,
+        Hash(Path.ChangeExtension(assembly, ".deps.json")) + (runSettings is null ? "" : " " + Hash(runSettings)));
+
+    /// <summary>
+    /// The idle host prepared for a test project, if it was prepared from what the project has now; otherwise
+    /// the spare on its runtime, replaced in the background, or a new host: a host started for no project
+    /// loads everything when the run starts.
+    /// </summary>
+    Process TakeHost(string assembly, HostKey key)
+    {
+        IdleHost? idle;
+        lock (_idleHosts)
+            _idleHosts.Remove(assembly, out idle);
+        if (idle is not null && idle.Key == key && !idle.Process.HasExited)
+            return idle.Process;
+        if (idle is not null)
+            Stop(idle.Process);
+        Process? spare;
+        lock (_idleHosts)
+            _spares.Remove(key.Runtime, out spare);
+        if (spare is null)
+            return StartHost(key.Runtime, null);
+        _ = Task.Run(RefillSpares);
+        if (!spare.HasExited)
+            return spare;
+        spare.Dispose();
+        return StartHost(key.Runtime, null);
+    }
+
+    /// <summary>
+    /// A few tests in a project's framework, compiled against the project's own references (so against its
+    /// version of the framework), which a host started for the project runs while it waits, so the
+    /// framework's code is compiled before the project's tests need it; null if they don't compile. Compiled
+    /// again when the host's key changes. Only Refill calls it.
+    /// </summary>
+    string? WarmUp(HostTarget target)
+    {
+        if (_warmUps.TryGetValue(target.Assembly, out var cached) && cached.Key == target.Key)
+            return cached.Path;
+        // Named as its file: MSTest loads a test assembly by its file's name.
+        var name = $"blaze-cs-warmup-{Environment.ProcessId}-{_warmUpFiles.Count}";
+        // No CSharpCompilationOptions constructor: its parameters differ between the Roslyn this is built
+        // against and an older SDK's.
+        var compilation = CSharpCompilation.Create(name, [CSharpSyntaxTree.ParseText(SourceText.From(WarmUpSource(target.Key.Framework)))],
+            target.Unit.MetadataReferences);
+        compilation = compilation.WithOptions(compilation.Options.WithOutputKind(OutputKind.DynamicallyLinkedLibrary));
+        using var image = new MemoryStream();
+        string? path = null;
+        if (compilation.Emit(image).Success)
+        {
+            path = Path.Combine(Path.GetTempPath(), name + ".dll");
+            File.WriteAllBytes(path, image.ToArray());
+            _warmUpFiles.Add(path);
+        }
+        _warmUps[target.Assembly] = (target.Key, path);
+        return path;
+    }
+
+    /// <summary>A plain test and an async one with data, in each framework's attributes.</summary>
+    static string WarmUpSource(string framework) => framework switch
+    {
+        "xunit3" or "xunit2" => """
+            using Xunit;
+
+            public class WarmUp
+            {
+                [Fact]
+                public void Fact() => Assert.Equal(2, 1 + 1);
+
+                [Theory]
+                [InlineData(1)]
+                [InlineData(2)]
+                public async System.Threading.Tasks.Task Theory(int value)
+                {
+                    await System.Threading.Tasks.Task.Yield();
+                    Assert.True(value > 0);
+                }
+            }
+            """,
+        "nunit" => """
+            using NUnit.Framework;
+
+            public class WarmUp
+            {
+                [Test]
+                public void Test() => Assert.That(1 + 1, Is.EqualTo(2));
+
+                [TestCase(1)]
+                [TestCase(2)]
+                public async System.Threading.Tasks.Task Case(int value)
+                {
+                    await System.Threading.Tasks.Task.Yield();
+                    Assert.That(value, Is.GreaterThan(0));
+                }
+            }
+            """,
+        "mstest" => """
+            using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+            [TestClass]
+            public class WarmUp
+            {
+                [TestMethod]
+                public void Method() => Assert.AreEqual(2, 1 + 1);
+
+                [TestMethod]
+                [DataRow(1)]
+                [DataRow(2)]
+                public async System.Threading.Tasks.Task Row(int value)
+                {
+                    await System.Threading.Tasks.Task.Yield();
+                    Assert.IsTrue(value > 0);
+                }
+            }
+            """,
+        _ => throw new ArgumentOutOfRangeException(nameof(framework), framework, null),
+    };
 
     /// <summary>
     /// The runtime a test assembly targets, from its runtimeconfig.json: "10.0.0" for a release, the exact
@@ -350,7 +535,11 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         }
     }
 
-    Process StartHost(string runtime)
+    /// <summary>
+    /// Starts a host on a runtime; for a project (its framework, assembly, .runsettings and warm-up assembly),
+    /// one that gets the project's run ready while it waits.
+    /// </summary>
+    Process StartHost(string runtime, (string Framework, string Assembly, string? RunSettings, string? WarmUp)? project)
     {
         var start = new ProcessStartInfo("dotnet")
         {
@@ -366,6 +555,15 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
             foreach (var argument in new[] { "exec", "--runtimeconfig", HostConfig(runtime), host })
                 start.ArgumentList.Add(argument);
         }
+        if (project is var (framework, assembly, runSettings, warmUp))
+        {
+            start.ArgumentList.Add(framework);
+            start.ArgumentList.Add(assembly);
+            if (runSettings is not null)
+                start.ArgumentList.Add($"--run-settings={runSettings}");
+            if (warmUp is not null)
+                start.ArgumentList.Add($"--warm-up={warmUp}");
+        }
         // Tests run with the runtime's defaults, as under `dotnet test`, not the daemon's tuning.
         foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
             start.Environment.Remove(variable);
@@ -373,24 +571,40 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         return Process.Start(start)!;
     }
 
-    static void Stop(Process host)
+    /// <summary>
+    /// Kills a host, and once the runner is disposed, waits until it is gone: Windows keeps the files it has
+    /// loaded, which Dispose deletes. A run doesn't wait for its host to go.
+    /// </summary>
+    void Stop(Process host)
     {
-        try { host.Kill(entireProcessTree: true); }
+        try
+        {
+            host.Kill(entireProcessTree: true);
+            if (_disposed)
+                host.WaitForExit();
+        }
         catch (InvalidOperationException) { }
         host.Dispose();
     }
 
     public void Dispose()
     {
+        List<Process> idle;
         lock (_idleHosts)
         {
             _disposed = true;
-            foreach (var host in _idleHosts.Values.SelectMany(idle => idle))
-                Stop(host);
+            idle = [.. _idleHosts.Values.Select(host => host.Process), .. _spares.Values];
             _idleHosts.Clear();
+            _spares.Clear();
         }
-        foreach (var config in _hostConfigs.Values)
-            File.Delete(config);
+        foreach (var host in idle)
+            Stop(host);
+        // A refill holds it while it compiles a warm-up assembly or starts a host.
+        lock (_refilling)
+        {
+            foreach (var file in _hostConfigs.Values.Concat(_warmUpFiles))
+                File.Delete(file);
+        }
     }
 
     /// <summary>

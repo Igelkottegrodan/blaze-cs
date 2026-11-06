@@ -35,6 +35,8 @@ var hasNet11 = sdk is not null && Version.Parse(sdk.Split('-')[0]).Major >= 11;
 string[] lib = ["Lib (net10.0)", "Lib (net8.0)"], consumer = ["Consumer (net10.0)", "Consumer (net8.0)"];
 // The test projects, and those of them that run with Lib's net10.0 build copied next to them.
 string[] libTests = ["Tests", "XunitV2Tests", "NUnitTests", "MSTestTests", "ComponentTests"], allTests = [.. libTests, .. (hasNet11 ? ["Tests11"] : Array.Empty<string>())];
+// Idle test hosts the daemon keeps, one per test project (TestRunner.MaxIdleHosts).
+const int HostCap = 4;
 Case[] cases =
 [
     new("body", () => Replace("Lib/Greeter.cs", "\"Hello, \"", "\"Hello there, \""), lib, "build"),
@@ -147,7 +149,8 @@ try
     Run(blaze, "build"); // starts the daemon: a real dotnet build; the warm-up compile runs after it returns
     // The next command reports the warm-up, which must reproduce every assembly.
     WarmedUpIdentical("start", Run(blaze, "build"));
-    var prestarted = PrestartedHosts();
+    var prestarted = IdleHosts("before any test command");
+    Console.WriteLine($"ok  {prestarted.Count} idle test hosts before any test command, one each for {string.Join(", ", prestarted.Select(h => h.Project).Order())}, and a spare per runtime");
     foreach (var (name, edit, expected, command, fallback, allKept, ran) in cases)
     {
         edit();
@@ -158,11 +161,16 @@ try
         if (!rebuilt.SetEquals(expected))
             Fail($"{name}: expected blaze-cs to rebuild {string.Join(", ", expected)}, it rebuilt {string.Join(", ", rebuilt.Order())}:\n{output}");
         if (command.StartsWith("test", StringComparison.Ordinal))
+        {
             RanTests(name, output, ran ?? expected);
-        if (name == "first test run")
-            TookEveryHost(prestarted);
+            if (name == "first test run")
+                TookEveryHost(prestarted);
+            else
+                IdleHosts(name, ran ?? expected);
+        }
         Verify(name, rebuilt, fallback);
     }
+    PreparedHostsSeeNewBytes();
     ProjectRemovedAndRestored();
     HostCannotLoad();
     RunSettingsTheHostDoesNotApply();
@@ -171,6 +179,7 @@ try
     WarmUpAfterFirstCommand();
     DaemonLifecycle();
     ParentFails();
+    StopThenCommandAtOnce();
     HostsStopWithTheDaemon();
     passed = true;
 }
@@ -324,42 +333,133 @@ static void CopyDirectory(string from, string to)
         CopyDirectory(directory, Path.Combine(to, Path.GetFileName(directory)));
 }
 
-// Hosts wait idle before any test command, one per test project that runs at once on each runtime: the five
-// net10.0 projects make the runner's four, and Tests11 has one more under SDK 11. Returns their processes.
-List<int> PrestartedHosts()
+// Hosts wait idle for the test projects run most recently (before any run, the solution's first ones), one
+// each and HostCap at most: after a run of HostCap projects or fewer, each of them has one. Each host is
+// started for its project, whose framework and assembly it names on its command line. One spare, started
+// for no project, waits on each runtime the test projects target (one runtimeconfig.json each). Returns
+// the projects' hosts.
+List<(int Pid, string Project)> IdleHosts(string when, string[]? ran = null)
 {
-    var expected = hasNet11 ? 5 : 4;
+    var expected = Math.Min(HostCap, allTests.Length);
+    var runtimes = hasNet11 ? 2 : 1;
+    var mustHave = ran is { Length: <= HostCap } ? ran : [];
     var deadline = Stopwatch.StartNew();
-    List<(int Pid, string Command)> hosts;
-    while ((hosts = TestHostProcesses()).Count != expected && deadline.Elapsed < TimeSpan.FromSeconds(30))
+    var hosts = Hosts();
+    bool Settled()
+    {
+        var prepared = hosts.Where(h => h.Project != "").ToList();
+        var spares = hosts.Where(h => h.Project == "").ToList();
+        return prepared.Count == expected && prepared.Select(h => h.Project).Distinct().Count() == expected
+            && prepared.All(h => allTests.Contains(h.Project)) && mustHave.All(project => prepared.Any(h => h.Project == project))
+            && spares.Count == runtimes && spares.Select(h => h.Runtime).Distinct().Count() == runtimes;
+    }
+    while (!Settled() && deadline.Elapsed < TimeSpan.FromSeconds(30))
+    {
         Thread.Sleep(100);
-    // One runtimeconfig.json per runtime, named by the daemon's pid and the runtime's number.
-    var runtimes = hosts.Select(h => Regex.Match(h.Command, @"blaze-cs-testhost-\d+-\d+\.runtimeconfig\.json").Value).Distinct().Count();
-    if (hosts.Count != expected || runtimes != (hasNet11 ? 2 : 1))
-        Fail($"expected {expected} idle test hosts on {(hasNet11 ? 2 : 1)} runtime(s) before any test command, found {hosts.Count} on {runtimes}:\n{string.Join("\n", hosts.Select(h => h.Command))}");
-    Console.WriteLine($"ok  {hosts.Count} idle test hosts on {runtimes} runtime(s), started before any test command");
-    return [.. hosts.Select(h => h.Pid)];
+        hosts = Hosts();
+    }
+    if (!Settled())
+        Fail($"{when}: expected {expected} idle test hosts, one per test project{(mustHave.Length > 0 ? ", " + string.Join(", ", mustHave) + " among them" : "")}, "
+            + $"and {runtimes} spare(s), one per runtime, found:\n" + string.Join("\n", TestHostProcesses().Select(h => h.Command)));
+    return [.. hosts.Where(h => h.Project != "").Select(h => (h.Pid, h.Project))];
+
+    List<(int Pid, string Project, string Runtime)> Hosts() =>
+        [.. TestHostProcesses().Select(h => (h.Pid,
+            Path.GetFileNameWithoutExtension(Regex.Match(h.Command, @"blaze-cs-testhost\.dll""? \w+ ""?(.+?\.dll)""?(?: |$)").Groups[1].Value),
+            Regex.Match(h.Command, @"blaze-cs-testhost-\d+-\d+\.runtimeconfig\.json").Value))];
 }
 
-// A run of every test project takes a waiting host for each runtime's projects, and the pool is full again after.
-void TookEveryHost(List<int> prestarted)
+// A run of every test project takes the waiting host of each project that has one, and the hosts are back after.
+void TookEveryHost(List<(int Pid, string Project)> prestarted)
 {
-    var taken = prestarted.Where(pid => !Running(pid)).Count();
+    var taken = prestarted.Where(host => !Running(host.Pid)).Count();
     if (taken != prestarted.Count)
         Fail($"expected the first test run to take all {prestarted.Count} pre-started hosts, {taken} are gone");
-    PrestartedHosts();
-    Console.WriteLine($"ok  the first test run took the {taken} pre-started hosts, and the pool refilled");
+    IdleHosts("after the first test run");
+    Console.WriteLine($"ok  the first test run took the {taken} hosts started for {string.Join(", ", prestarted.Select(h => h.Project).Order())}; "
+        + $"each test project's host is one of at most {HostCap}, with a spare per runtime, and they are back after each run");
+}
+
+// A host waiting for its project has loaded the project's packages and run its warm-up assembly, and loaded
+// none of the solution's outputs (on Linux, where its mapped files show it), so a project reference rebuilt
+// after the host started is the new bytes when the run loads it: an edit to Consumer fails each test
+// project's greeting test with the new text, whether its host was waiting or started for the run; undone,
+// the tests pass again.
+void PreparedHostsSeeNewBytes()
+{
+    var hosts = IdleHosts("before the Consumer edit");
+    if (OperatingSystem.IsLinux())
+        hosts.ForEach(NoProjectOutputLoaded);
+    Replace("Consumer/Welcome.cs", "=> Lib.Greeter.Greet(who)", "=> Lib.Greeter.Greet(who).Replace(\"Hello\", \"Howdy\")");
+    var (output, exitCode) = RunWithExit(blaze, "test", check: false);
+    var summaries = Summaries(output);
+    if (exitCode == 0 || !Rebuilt(output).SetEquals(consumer) || !output.Contains("Howdy") || !summaries.Keys.Order().SequenceEqual(libTests.Order())
+        || libTests.Any(project => summaries[project] != new Summary("Failed!", 1, TestCount(project) - 1, 0, TestCount(project))))
+        Fail($"Consumer edit: expected {string.Join(", ", libTests)} to run with Consumer's new bytes, each failing its greeting test on \"Howdy\", got exit {exitCode}:\n{output}");
+    Replace("Consumer/Welcome.cs", ".Replace(\"Hello\", \"Howdy\")", "");
+    output = Run(blaze, "test");
+    if (!Rebuilt(output).SetEquals(consumer))
+        Fail($"Consumer edit undone: expected blaze-cs to rebuild {string.Join(", ", consumer)}:\n{output}");
+    RanTests("Consumer edit undone", output, libTests);
+    Verify("Consumer edit undone", [.. consumer], null);
+    Console.WriteLine($"ok  Consumer edit: every test project saw its new bytes, among them in the hosts waiting for {string.Join(", ", hosts.Select(h => h.Project).Order())}"
+        + (OperatingSystem.IsLinux() ? ", which had loaded no project output" : ""));
+}
+
+// Linux: a host's mapped assemblies, once it has its warm-up assembly, include none of the solution's projects.
+void NoProjectOutputLoaded((int Pid, string Project) host)
+{
+    string[] projects = ["Lib", "Consumer", "App", "Generator", "Components", .. allTests];
+    var deadline = Stopwatch.StartNew();
+    List<string> mapped;
+    while (!(mapped = Mapped(host.Pid)).Any(file => file.StartsWith("blaze-cs-warmup-", StringComparison.Ordinal)) && deadline.Elapsed < TimeSpan.FromSeconds(30))
+        Thread.Sleep(100);
+    var outputs = mapped.Where(file => projects.Contains(Path.GetFileNameWithoutExtension(file))).ToList();
+    if (!mapped.Any(file => file.StartsWith("blaze-cs-warmup-", StringComparison.Ordinal)) || outputs.Count > 0)
+        Fail($"host {host.Pid} for {host.Project}: expected its warm-up assembly loaded and no project output, it has mapped {string.Join(", ", mapped)}");
+}
+
+static List<string> Mapped(int pid)
+{
+    try
+    {
+        return [.. File.ReadLines($"/proc/{pid}/maps").Select(line => line.IndexOf('/') is var start and >= 0 ? line[start..] : "")
+            .Where(path => path.EndsWith(".dll", StringComparison.Ordinal)).Select(Path.GetFileName).OfType<string>().Distinct()];
+    }
+    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+    {
+        return [];
+    }
 }
 
 // Stopping the daemon takes its test hosts with it, and so does killing it: a host exits when the daemon's
 // end of its stdin closes.
+// A command right after `stop` starts a new daemon while the stopped one may still be exiting (stopping its
+// test hosts); once it is gone, the next command reaches the new daemon: the stopped one must not take the
+// new one's socket file with it, which left that daemon running unreachable, with its hosts, beside a third.
+void StopThenCommandAtOnce()
+{
+    var stopped = Daemons().Last().Pid;
+    Run(blaze, "stop");
+    Run(blaze, "build");
+    var started = Daemons().Last().Pid;
+    var deadline = Stopwatch.StartNew();
+    while (Running(stopped) && deadline.Elapsed < TimeSpan.FromSeconds(30))
+        Thread.Sleep(100);
+    var output = Run(blaze, "build");
+    if (Running(stopped) || started == stopped || Daemons().Last().Pid != started || !Running(started))
+        Fail($"stop, then build at once: expected daemon {stopped} gone and the next build served by daemon {started}, the one the first build started; "
+            + $"daemons: {string.Join(", ", Daemons().Select(d => $"{d.Pid}{(Running(d.Pid) ? " (running)" : "")}"))}:\n{output}");
+    Console.WriteLine("ok  stop, then a command at once: the new daemon kept its socket once the stopped one had exited");
+}
+
 void HostsStopWithTheDaemon()
 {
-    PrestartedHosts();
+    IdleHosts("before stop");
     Run(blaze, "stop");
     NoHostsLeft("blaze-cs stop");
     Run(blaze, "build"); // a new daemon, with new hosts
-    PrestartedHosts();
+    IdleHosts("after a new daemon started");
     var daemon = Process.GetProcessById(Daemons().Last().Pid);
     daemon.Kill();
     daemon.WaitForExit();

@@ -67,7 +67,8 @@ From a build in a clone instead of the tool, run `/path/to/blaze-cs/blaze-cs bui
 The first command starts a daemon for that solution and runs a real `dotnet build`, so it takes as long
 as one. It returns once the daemon has loaded what that build did; the daemon then compiles the solution
 once in memory, to check it matches the build byte for byte, and the next command waits for that. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
-affect, and `blaze-cs test` runs the test projects the edit changed in test hosts that are already started.
+affect, and `blaze-cs test` runs the test projects the edit changed in test hosts that are already started
+and ready for them.
 
 The daemon exits on its own after two hours without a command, and the next command starts a new one.
 After you rebuild blaze-cs, the next command stops the daemon of the old build and starts one of the new,
@@ -89,7 +90,9 @@ against it: 6 to 8.5× faster. Against plain `dotnet build` it is +785%, +1509% 
 
 | Test loop | `dotnet test` | `blaze-cs test` | Speed increase |
 |---|---:|---:|---:|
-| Edit a test file, rerun its project (219 tests) | 4.54 s | **0.68 s** | **+568%** |
+| Edit a test file, rerun its project (219 tests) | 4.54 s | **0.47 s** | **+868%** |
+
+The test loop row is the median of 7 runs.
 
 Speed increase is how much more work fits in the same time: `(old time / new time − 1) × 100`.
 
@@ -113,9 +116,14 @@ its own:
   member (or whose source generators' output changes). Changes that code can reach without naming them
   (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
 - **Started tests.** xUnit (v2 and v3), NUnit and MSTest assemblies run in-process in test hosts that the
-  daemon starts ahead of time; each host runs one assembly and exits, and a new one takes its place. A
-  `.runsettings` (the project's evaluated `RunSettingsFilePath`, wherever it is set, as for `dotnet test`) that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is
-  applied in the host; projects with any other `.runsettings`, and anything a host can't run, go through
+  daemon starts ahead of time; each host runs one assembly and exits. A host waits for each of the four
+  test projects run most recently, with the project's NuGet packages loaded and its test framework
+  already run once on a few tests of blaze-cs's own, so the framework's code is compiled before the
+  build finishes. It loads none of the solution's outputs until the run, so a rebuilt reference is always
+  the new bytes. Any other test project takes a spare host, one per runtime, already started. A
+  `.runsettings` (the project's evaluated `RunSettingsFilePath`, wherever it is set, as for `dotnet test`)
+  that sets only `RunConfiguration` `EnvironmentVariables` and `TestRunParameters` is applied in the
+  host; projects with any other `.runsettings`, and anything a host can't run, go through
   `dotnet test --no-build`.
 - **Only tests whose inputs changed.** `blaze-cs test` runs a test project when an assembly it runs with
   (its own, and every project output copied next to it), its `.deps.json` or its `.runsettings` differs
