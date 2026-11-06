@@ -29,7 +29,13 @@ sealed class ProjectAnalyzers(ImmutableArray<DiagnosticAnalyzer> analyzers, Anal
     /// Analyzers whose diagnostics outside a member can depend on that member's body: those with symbol-start
     /// actions (a type's end action reports on its fields from what its methods do, as CA2213 and IDISP002 do)
     /// or semantic model actions (unused usings). They analyze whole files; the rest, after a body edit, only
-    /// the member. Sorted on the first analysis, from the actions each registers.
+    /// the member. Sorted on the first analysis, from the actions each registers, as Visual Studio sorts them.
+    /// <para>
+    /// A symbol action on a type, or a node action on a type declaration, could read the members' bodies too,
+    /// but sorting those as whole-file takes in far more analyzers (jellyfin: 130 of 504 with both, mostly CA
+    /// naming and design rules; 73 with the node actions alone, mostly StyleCop's documentation rules), and made a body edit in BaseItem.cs 100 to 150 ms longer. So they analyze the member;
+    /// the README states the gap.
+    /// </para>
     /// </summary>
     Task<(ImmutableArray<DiagnosticAnalyzer> WholeFile, ImmutableArray<DiagnosticAnalyzer> PerMember)>? _kinds;
 
@@ -69,9 +75,11 @@ sealed class ProjectAnalyzers(ImmutableArray<DiagnosticAnalyzer> analyzers, Anal
             logAnalyzerExecutionTime: false));
         var withAnalyzers = With(analyzers, concurrent: true);
         var (wholeFile, perMember) = await LazyInitializer.EnsureInitialized(ref _kinds, () => Sort(withAnalyzers)).ConfigureAwait(false);
-        // One thread for them: binding the whole file again, alongside the emit that binds it too, slows the
-        // emit less (jellyfin's BaseItem.cs) than spread over many.
-        var wholeFileAnalyzers = wholeFile.IsEmpty ? null : With(wholeFile, concurrent: false);
+        // With the suppressors, which every analysis applies to what it found. Not concurrent: each file's
+        // whole-file pass runs on one thread (files run side by side), as binding the whole file again
+        // alongside the emit, which binds it too, slows the emit less (jellyfin's BaseItem.cs) than spread
+        // over many.
+        var wholeFileAnalyzers = wholeFile.IsEmpty ? null : With(wholeFile.AddRange(analyzers.Where(a => a is DiagnosticSuppressor)), concurrent: false);
         var files = await Task.WhenAll(trees.Select(async tree =>
         {
             var edit = _byFile.TryGetValue(tree.FilePath, out var last) ? BodyEdit.Between(last.Tree, tree, cancellationToken) : null;
@@ -122,6 +130,8 @@ sealed class ProjectAnalyzers(ImmutableArray<DiagnosticAnalyzer> analyzers, Anal
                 var actions = await withAnalyzers.GetAnalyzerTelemetryInfoAsync(analyzer, CancellationToken.None).ConfigureAwait(false);
                 (actions.SymbolStartActionsCount > 0 || actions.SemanticModelActionsCount > 0 ? wholeFile : perMember).Add(analyzer);
             }
+            Console.WriteLine($"{DateTime.Now:O} analyzers: {wholeFile.Count} see across members, so after a body edit they analyze the whole file "
+                + $"({string.Join(", ", wholeFile.Select(a => a.GetType().Name))}); {perMember.Count} analyze the member");
             return (wholeFile.ToImmutable(), perMember.ToImmutable());
         }
         catch (Exception e)

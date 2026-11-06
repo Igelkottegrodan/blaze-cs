@@ -155,7 +155,12 @@ its own:
   for the files the edit touched only: not for the other files of those projects, nor for a dependent
   the edit changes without touching its files. After a body edit, the rest of the file reports what the
   member-at-a-time analyzers reported at its last analysis, even if an edit elsewhere (a signature in
-  another file) has changed that since. A file's first edit after the daemon starts runs every analyzer
+  another file) has changed that since. An analyzer counts as member-at-a-time unless it registers a
+  symbol-start or semantic-model action, as in Visual Studio; so one that reads the members' bodies from
+  an action on the type (a symbol action on the type, or a node action on its declaration) keeps its
+  warnings outside the edited member until the file's next analysis that isn't a body edit. (Counting those
+  as whole-file too would rerun 73 to 130 of jellyfin's 504 analyzers on the whole file, mostly naming,
+  design and documentation rules, and add 100 to 150 ms to a body edit.) A file's first edit after the daemon starts runs every analyzer
   on the whole file, which on a large file with many analyzers takes longer than the compile (jellyfin's
   3,100-line `BaseItem.cs`: that build takes 0.15 to 0.4 s longer; later body edits in it add 5 to 40 ms).
   An analyzer that reports in another file than the one it analyzes (a partial type's other part) is

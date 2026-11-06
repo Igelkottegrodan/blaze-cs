@@ -86,6 +86,14 @@ public sealed class ProjectAnalyzersTests : IDisposable
     }
 
     [Fact]
+    public async Task AppliesSuppressorsToTheWholeFileAnalyzers()
+    {
+        var (compilation, config) = Project("", ("A.cs", "class A { int _f; }"));
+        Assert.Single(await Analyze([new UnreadFieldAnalyzer()], config, compilation, "A.cs"));
+        Assert.Empty(await Analyze([new UnreadFieldAnalyzer(), new UnreadFieldSuppressor()], config, compilation, "A.cs"));
+    }
+
+    [Fact]
     public async Task AnAnalysisIsTheBaselineOnlyOnceCommitted()
     {
         const string before = "class A\n{\n    void Other() { }\n\n    void Bad() { }\n}\n";
@@ -223,6 +231,20 @@ public sealed class ProjectAnalyzersTests : IDisposable
                     }
                 });
             }, SymbolKind.NamedType);
+        }
+    }
+
+    [DiagnosticAnalyzer(LanguageNames.CSharp)]
+    sealed class UnreadFieldSuppressor : DiagnosticSuppressor
+    {
+        static readonly SuppressionDescriptor Rule = new("SPR002", "TST002", "Unused is fine here");
+
+        public override ImmutableArray<SuppressionDescriptor> SupportedSuppressions => [Rule];
+
+        public override void ReportSuppressions(SuppressionAnalysisContext context)
+        {
+            foreach (var diagnostic in context.ReportedDiagnostics)
+                context.ReportSuppression(Suppression.Create(Rule, diagnostic));
         }
     }
 
