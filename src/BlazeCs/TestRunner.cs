@@ -11,15 +11,6 @@ using Microsoft.CodeAnalysis.Text;
 namespace BlazeCs;
 
 /// <summary>
-/// What the test host reports for one test assembly. Unsupported means it ran nothing (it doesn't know
-/// this framework version), so `dotnet test` runs the project instead.
-/// </summary>
-sealed record TestHostResult(int Total, int Passed, int Failed, int Skipped, string? Error, string? Unsupported);
-
-/// <summary>What a test host runs: a framework, an assembly, and the .runsettings it applies, if any.</summary>
-sealed record TestHostRequest(string Framework, string Assembly, string? RunSettings);
-
-/// <summary>
 /// Runs the test projects whose inputs changed since they last passed in this daemon. xUnit (v2 and
 /// v3), NUnit and MSTest projects run in test host processes, longest first, like `dotnet test` runs
 /// projects side by side; the rest go through `dotnet test --no-build`. A host runs one assembly and
@@ -31,8 +22,6 @@ sealed record TestHostRequest(string Framework, string Assembly, string? RunSett
 /// </summary>
 sealed class TestRunner(SolutionBuilder builder) : IDisposable
 {
-    public const string ResultPrefix = "\u0001result:";
-
     /// <summary>
     /// Hosts running at once: tests parallelize inside an assembly too, so a few are enough.
     /// </summary>
@@ -219,24 +208,8 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var output = new List<string>();
         var assembly = request.Assembly;
         var host = TakeHost(assembly, Key(request.Framework, assembly, request.RunSettings));
-        try { host.StandardInput.WriteLine(JsonSerializer.Serialize(request)); }
-        catch (IOException) { } // it died while idle: no result, so the run fails below
-
-        TestHostResult? result = null;
-        while (host.StandardOutput.ReadLine() is { } line)
-        {
-            // Test output may end mid-line, with the result after it.
-            var start = line.IndexOf(ResultPrefix, StringComparison.Ordinal);
-            if (start < 0)
-            {
-                output.Add(line);
-                continue;
-            }
-            if (start > 0)
-                output.Add(line[..start]);
-            result = JsonSerializer.Deserialize<TestHostResult>(line[(start + ResultPrefix.Length)..])!;
-            break;
-        }
+        // A host that died while idle gives no result, so the run fails below.
+        var result = Send(host, request) ? ReadResult(host, output) : null;
         Stop(host);
         result ??= new TestHostResult(0, 0, 0, 0, Error: "the test host exited mid-run", Unsupported: null);
         _lastDuration[assembly] = stopwatch.Elapsed;
@@ -264,6 +237,39 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         lock (_hostConfigs)
             output.ForEach(log);
         return new Outcome(passed, result.Skipped > 0 ? $"{result.Passed} passed, {result.Skipped} skipped" : $"{result.Passed} passed");
+    }
+
+    /// <summary>Writes a message to a host (Protocol.cs); false if it has died.</summary>
+    internal static bool Send(Process host, TestHostMessage message)
+    {
+        try
+        {
+            host.StandardInput.WriteLine(JsonSerializer.Serialize(message));
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>A host's output up to its next result, added to <paramref name="output"/>, and that result; null if it exits first.</summary>
+    internal static TestHostResult? ReadResult(Process host, List<string> output)
+    {
+        while (host.StandardOutput.ReadLine() is { } line)
+        {
+            // Test output may end mid-line, with the result after it.
+            var start = line.IndexOf(TestHostProtocol.ResultPrefix, StringComparison.Ordinal);
+            if (start < 0)
+            {
+                output.Add(line);
+                continue;
+            }
+            if (start > 0)
+                output.Add(line[..start]);
+            return JsonSerializer.Deserialize<TestHostResult>(line[(start + TestHostProtocol.ResultPrefix.Length)..])!;
+        }
+        return null;
     }
 
     /// <summary>
@@ -565,8 +571,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                 start.ArgumentList.Add($"--warm-up={warmUp}");
         }
         // Tests run with the runtime's defaults, as under `dotnet test`, not the daemon's tuning.
-        foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
+        foreach (var variable in new[] { "DOTNET_gcServer", "DOTNET_GCConserveMemory", "DOTNET_TieredPGO", "DOTNET_TC_CallCountingDelayMs" })
             start.Environment.Remove(variable);
+        // Not DOTNET_MODIFIABLE_ASSEMBLIES=debug, which lets a host take updates (Protocol.cs): nothing sends
+        // any yet, and on the fixture it makes each run 50 to 120 ms slower, with the same methods compiled.
         // A host exits when its stdin closes, so the daemon dying any way takes every host with it.
         return Process.Start(start)!;
     }

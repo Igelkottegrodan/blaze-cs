@@ -112,9 +112,12 @@ static class Program
 
         // The daemon lives for many builds of a large heap: server GC, and the JIT straight to optimized
         // code for hot compiler paths. Measured on jellyfin, a body edit's compile went from ~1 s to ~0.3 s.
+        // GCConserveMemory has the server GC compact rather than grow the heap: jellyfin's RSS after 15
+        // edits fell by ~200 MB at no cost in build time.
         var environment = new Dictionary<string, string>
         {
             ["DOTNET_gcServer"] = "1",
+            ["DOTNET_GCConserveMemory"] = "9",
             ["DOTNET_TieredPGO"] = "0",
             ["DOTNET_TC_CallCountingDelayMs"] = "0",
         };

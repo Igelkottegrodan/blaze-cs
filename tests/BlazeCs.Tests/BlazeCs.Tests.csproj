@@ -3,6 +3,9 @@
     <OutputType>Exe</OutputType>
     <!-- Not artifacts/bin: that is the shipped daemon's directory, which must not carry a Roslyn of its own. -->
     <OutDir>$(MSBuildThisFileDirectory)../../artifacts/tests/</OutDir>
+    <!-- The analyzers ProjectAnalyzersTests runs are test doubles, not shipped analyzers: the rules for
+         authoring an analyzer project (netstandard2.0, release tracking, extended rules) don't apply. -->
+    <NoWarn>$(NoWarn);RS1036;RS1041;RS2008</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <!-- The daemon excludes Roslyn's runtime assets and loads the SDK's; the tests run on the exact
@@ -10,5 +13,9 @@
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="$(RoslynVersion)" />
     <PackageReference Include="xunit.v3" Version="3.2.2" />
     <ProjectReference Include="../../src/BlazeCs/BlazeCs.csproj" />
+    <!-- Test frameworks' packages, in artifacts/kits, for the hot reload tests. -->
+    <ProjectReference Include="../TestHostKits/XunitV3Kit/XunitV3Kit.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../TestHostKits/NUnitKit/NUnitKit.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../TestHostKits/MSTestKit/MSTestKit.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

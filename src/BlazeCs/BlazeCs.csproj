@@ -12,6 +12,8 @@
   <ItemGroup>
     <!-- The test host runs from the CLI's directory, so the tool package carries it too. -->
     <ProjectReference Include="..\BlazeCs.TestHost\BlazeCs.TestHost.csproj" />
+    <!-- What the daemon and the test host say to each other. -->
+    <Compile Include="..\BlazeCs.TestHost\Protocol.cs" Link="TestHostProtocol.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- Compiled against RoslynVersion (Directory.Build.props); at run time the daemon loads the Roslyn

@@ -1,0 +1,9 @@
+<Project>
+  <!-- A kit is a test framework's packages and nothing else, at the versions the fixture's test projects
+       use: the hot reload tests compile a test assembly of their own into a copy of its output. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)../../artifacts/kits/$(MSBuildProjectName)/</OutDir>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+</Project>

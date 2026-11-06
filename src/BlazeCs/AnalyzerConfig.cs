@@ -9,7 +9,8 @@ namespace BlazeCs;
 
 /// <summary>
 /// The .editorconfig and .globalconfig files of one project, answering what csc's internal
-/// providers answer: options for generators, and per-file severities for compiler warnings.
+/// providers answer: options for generators and analyzers, and per-file severities for compiler and
+/// analyzer warnings.
 /// </summary>
 sealed class ProjectConfig
 {
@@ -29,11 +30,13 @@ sealed class ProjectConfig
 
     public AnalyzerConfigOptionsResult? Global => _set?.GlobalConfigOptions;
 
-    public AnalyzerConfigOptionsProvider GeneratorOptions() => new OptionsProvider(this);
+    /// <summary>The options generators and analyzers read, per file and global.</summary>
+    public AnalyzerConfigOptionsProvider Options() => new OptionsProvider(this);
 
     /// <summary>
     /// Severities from config files, with errors lowered to warnings: the fast path never fails a
-    /// build over a warning, because the analyzers and suppressors that might silence it don't run.
+    /// build over a warning, because not all that might silence it runs (suppressors see only the
+    /// analyzer diagnostics of edited files, not compiler warnings).
     /// </summary>
     public SyntaxTreeOptionsProvider TreeOptions() => new TreeOptionsProvider(this);
 
