@@ -1,21 +1,40 @@
-# blaze-cs
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/outrun/header-dark.png">
+    <img alt="blaze-cs" src="docs/brand/outrun/header-light.png" width="440" height="190">
+  </picture>
+</p>
 
-> **Very experimental.** This is a spike: it has been tried on one real solution
-> ([jellyfin](https://github.com/jellyfin/jellyfin)) on Linux, and nothing else. Expect rough edges,
-> and keep `dotnet build` and your CI as the final word.
->
-> Runs on Linux and Windows (10 1803+ / Server 2019+); CI checks both on the fixture solution. macOS is untested.
+<h3 align="center">Faster rebuilds for C# solutions.</h3>
 
-Faster rebuilds for C# solutions. Type `blaze-cs build` where you would type `dotnet build`: a daemon
-keeps your solution compiled in memory, and after an edit it rebuilds only what the edit can affect.
-`blaze-cs test` then runs the affected test projects in test hosts that are already started.
+<p align="center">Type <code>blaze-cs build</code> wherever you'd type <code>dotnet build</code>.<br>A warm daemon, and only the work your edit needs.</p>
 
-It is influenced by **[blaze](https://github.com/indexable-inc/blaze)**, which does this for Rust ("type
-`blaze` wherever you'd type `cargo`"). blaze-cs borrows the idea, a warm daemon that holds the project
-compiled and does minimal work per edit, and applies it to .NET on top of Roslyn and MSBuild instead
-of writing a compiler.
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#try-it">Try it</a> ·
+  <a href="#how-fast">How fast</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#good-to-know">Good to know</a>
+</p>
 
-## What it does
+<p align="center"><b>Very experimental.</b> Tried on one real solution (<a href="https://github.com/jellyfin/jellyfin">jellyfin</a>), on Linux.<br>Keep <code>dotnet build</code> and your CI as the final word.</p>
+
+## Install
+
+It needs the .NET 10 or 11 SDK for the solution you build. The repo itself pins SDK 10 and builds on it
+with [devbox](https://www.jetify.com/devbox):
+
+```sh
+git clone https://github.com/igelkottegrodan/blaze-cs && cd blaze-cs
+devbox shell          # .NET SDK 10.0.403, go-task, hyperfine, fontconfig
+task build
+```
+
+On Windows, build it with the .NET SDK: `dotnet build BlazeCs.slnx`.
+
+## Try it
+
+In a directory with one `.sln` or `.slnx` (or below one):
 
 ```text
 blaze-cs build                  like dotnet build
@@ -24,45 +43,13 @@ blaze-cs run [dotnet run args]  build, then dotnet run --no-build
 blaze-cs stop                   stop this solution's daemon
 ```
 
-Run it in a directory with one `.sln` or `.slnx` (or below one). The first command starts a daemon for
-that solution and runs a real `dotnet build`, so it takes as long as one. Later commands talk to the warm
-daemon:
+Run it as `/path/to/blaze-cs/blaze-cs build` (on Windows, `\path\to\blaze-cs\blaze-cs.cmd build`).
 
-- **Same output as `dotnet build`.** The daemon takes each project's exact compiler arguments from the
-  binlog of that build and compiles with the Roslyn that ships with your SDK. It writes the same files
-  to `obj/` and `bin/`, so your IDE, `dotnet run`, `dotnet test` and later `dotnet build`s keep working.
-  On jellyfin, every one of its 41 assemblies comes out byte-identical to `dotnet build`'s.
-- **Only what changed.** It recompiles the projects whose sources changed. When a project's public API
-  changes, it diffs the API member by member and recompiles only the dependents that use a changed
-  member (or whose source generators' output changes). Changes that code can reach without naming them
-  (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
-- **Started tests.** xUnit v3, NUnit and MSTest assemblies run in-process in test hosts that the daemon
-  starts ahead of time; each host runs one assembly and exits, and a new one takes its place. xUnit v2,
-  projects with a `.runsettings`, and anything a host can't run go through `dotnet test --no-build`.
-- **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
-  or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
-  project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
-  Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon.
+The first command starts a daemon for that solution and runs a real `dotnet build`, so it takes as long
+as one. Then change a method and build again: the daemon, still running, rebuilds only what the edit can
+affect, and `blaze-cs test` runs the affected test projects in test hosts that are already started.
 
-## Trying it
-
-It needs the .NET 10 or 11 SDK for the solution you build. The repo itself pins SDK 10 and builds on it with [devbox](https://www.jetify.com/devbox):
-
-```sh
-git clone https://github.com/igelkottegrodan/blaze-cs && cd blaze-cs
-devbox shell          # .NET SDK 10.0.403, go-task, hyperfine, fontconfig
-task build
-cd /path/to/your/solution
-/path/to/blaze-cs/blaze-cs build
-```
-
-On Windows, build it with the .NET SDK (`dotnet build BlazeCs.slnx`) and run `\path\to\blaze-cs\blaze-cs.cmd build`.
-
-To work on blaze-cs, `task check` runs the fixture check (`tests/fixture/check.cs`). In devbox on WSL,
-`task check:windows` also runs it on native Windows, for SDK 10 and 11: it installs them into
-`%LOCALAPPDATA%\blaze-cs\dotnet` on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
-
-## Numbers
+## How fast
 
 On jellyfin (41 projects, 17 xUnit v3 test projects), Linux x86-64 with 32 cores, mean of 8 runs per edit.
 Each edit is in `MediaBrowser.Controller`, a project in the middle of the dependency graph:
@@ -82,15 +69,36 @@ blaze-cs doesn't run analyzers, so the fair comparison is the middle column: 6 t
 To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timings) and
 `task verify -- body|signature|file` (compares output with `dotnet build --no-incremental`).
 
-## Limitations
+## How it works
 
+A daemon keeps your solution compiled in memory, with Roslyn and MSBuild under it instead of a compiler of
+its own:
+
+- **Same output as `dotnet build`.** The daemon takes each project's exact compiler arguments from the
+  binlog of that build and compiles with the Roslyn that ships with your SDK. It writes the same files
+  to `obj/` and `bin/`, so your IDE, `dotnet run`, `dotnet test` and later `dotnet build`s keep working.
+  On jellyfin, every one of its 41 assemblies comes out byte-identical to `dotnet build`'s.
+- **Only what changed.** It recompiles the projects whose sources changed. When a project's public API
+  changes, it diffs the API member by member and recompiles only the dependents that use a changed
+  member (or whose source generators' output changes). Changes that code can reach without naming them
+  (interfaces, operators, `foreach`/`using` patterns, base types, …) recompile every dependent.
+- **Started tests.** xUnit v3, NUnit and MSTest assemblies run in-process in test hosts that the daemon
+  starts ahead of time; each host runs one assembly and exits, and a new one takes its place. xUnit v2,
+  projects with a `.runsettings`, and anything a host can't run go through `dotnet test --no-build`.
+- **Falls back when unsure.** A changed `.csproj`, `.props`, `.targets`, `.editorconfig`, `global.json`
+  or NuGet file, a new or deleted `.razor`/`.cshtml`, a changed scoped CSS file (`.razor.css`), or a
+  project that an IL weaver (such as Fody) rewrites after compile, goes through a real `dotnet build`.
+  Edits to existing `.razor` files, `_Imports.razor` included, compile in the daemon.
+
+## Good to know
+
+- **Linux and Windows** (10 1803+ / Server 2019+); CI checks both on the fixture solution. macOS is
+  untested. jellyfin and the numbers above are Linux, and the benchmark scripts are Linux-only.
 - **Warnings:** analyzers and diagnostic suppressors don't run, and warnings-as-errors are reported
   as warnings. Run `dotnet build` or CI for warnings.
 - **Skipped dependents' PDBs:** a dependent the API diff skipped keeps its DLL. Its code is identical, but
   its PDB still records the old ID of the reference that changed, so its bytes differ from a fresh build
   until the next `dotnet build` recompiles it.
-- **Platforms:** Windows is covered only by the fixture check in CI; jellyfin and the numbers above are
-  Linux, and the benchmark scripts are Linux-only.
 - **Tested on:** one solution. Multi-targeting is covered by the fixture check (`net8.0;net10.0`), not
   by a real solution. .NET 11 (RC3) is covered by the fixture check
   (`BLAZE_CS_SDK=<version> task check`) and by hand on a `net11.0` fixture. NUnit and MSTest run in the test host only in the fixture check (two tests each).
@@ -99,9 +107,13 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
   renders one. MVC views and Razor Pages (`.cshtml`), Blazor WebAssembly, other static web assets
   (`wwwroot/`, `.razor.js`), and Razor, NUnit and MSTest on a real solution, and large graphs are
   untested. The host doesn't apply NUnit or MSTest settings beyond the defaults.
-- **Memory:** the daemon holds a few GB (about 2.3 GB for jellyfin).
+- **It trades memory for speed:** the daemon holds a few GB (about 2.3 GB for jellyfin).
 
-## Layout
+## Contributing
+
+`task check` runs the fixture check (`tests/fixture/check.cs`). In devbox on WSL, `task check:windows`
+also runs it on native Windows, for SDK 10 and 11: it installs them into `%LOCALAPPDATA%\blaze-cs\dotnet`
+on first use and leaves the system-wide SDK alone. On Linux, CI checks Windows.
 
 | Path | What |
 |---|---|
@@ -109,3 +121,17 @@ To reproduce, clone jellyfin into `bench/jellyfin`, then run `task bench` (timin
 | `src/BlazeCs.TestHost` | the single-use test host (xUnit v3, NUnit, MSTest) |
 | `scripts/` | benchmark edits, timing, and output verification |
 | `tests/fixture/` | a small solution and `check.cs` (`task check`), which makes each kind of edit, checks which projects blaze-cs rebuilt, and compares its output with `dotnet build --no-incremental` (runs in CI) |
+| `docs/brand/outrun/` | the header above and `gen.cs`, which draws it (`dotnet run docs/brand/outrun/gen.cs`) |
+
+## Credits
+
+blaze-cs is influenced by **[blaze](https://github.com/indexable-inc/blaze)**, which does this for Rust
+("type `blaze` wherever you'd type `cargo`"). blaze-cs borrows the idea, a warm daemon that holds the
+project compiled and does minimal work per edit, and its README's layout and pixel-letter header. Thank you
+also to the people who built:
+
+- [Roslyn](https://github.com/dotnet/roslyn), the compiler blaze-cs drives
+- [MSBuild](https://github.com/dotnet/msbuild) and [MSBuild Structured Log](https://github.com/KirillOsenkov/MSBuildStructuredLog), whose binlogs give each project's compiler arguments
+- [xUnit](https://xunit.net), [NUnit](https://nunit.org) and [MSTest](https://github.com/microsoft/testfx), whose runners the test host loads
+
+None of these projects endorses blaze-cs.
