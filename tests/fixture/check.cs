@@ -141,7 +141,7 @@ var passed = false;
 var loadedProjects = 0; // from the last "loaded N projects" line a command printed
 try
 {
-    Run(blaze, "build"); // starts the daemon: a real dotnet build, then a warm-up compile
+    Run(blaze, "build"); // starts the daemon: a real dotnet build; the warm-up compile runs after it returns
     var prestarted = PrestartedHosts();
     foreach (var (name, edit, expected, command, fallback, allKept, ran) in cases)
     {
@@ -163,6 +163,7 @@ try
     RunSettingsTheHostDoesNotApply();
     FailedRunsAgain();
     AllTestsSkipped();
+    WarmUpAfterFirstCommand();
     DaemonLifecycle();
     ParentFails();
     HostsStopWithTheDaemon();
@@ -224,6 +225,8 @@ bool Running(int pid)
 // command, from this repo's build again, starts a daemon without a word about it.
 void DaemonLifecycle()
 {
+    // The daemons this step starts, after the ones before it.
+    var earlier = Daemons().Count - 1;
     var first = Daemons().Last();
     // A copy of the build whose assembly has another MVID, which is its identity.
     CopyDirectory(Path.Combine(root, "artifacts", "bin"), otherBuild);
@@ -237,7 +240,7 @@ void DaemonLifecycle()
     File.WriteAllBytes(assembly, bytes);
 
     var output = Run("dotnet", $"\"{assembly}\" build", environment: new() { ["BLAZE_CS_IDLE_SECONDS"] = "5" });
-    var daemons = Daemons();
+    var daemons = Daemons()[earlier..];
     if (!output.Contains("blaze-cs: the running daemon is from another build") || daemons.Count != 2 || daemons[0] != first)
         Fail($"daemon handshake: expected a notice and a second daemon after the first ({first.Pid}), got {daemons.Count} daemons:\n{output}");
     if (Running(first.Pid))
@@ -251,8 +254,8 @@ void DaemonLifecycle()
         Fail($"idle exit: expected daemon {idle.Pid} to log that it was idle for 5 s, exit and remove {idle.Socket} within 60 s:\n{ReadLog("daemon.log")}");
 
     output = Run(blaze, "build");
-    daemons = Daemons();
-    if (output.Contains("another build") || daemons.Count != 3 || !Running(daemons[2].Pid) || !Regex.IsMatch(output, "^blaze-cs: up to date", RegexOptions.Multiline))
+    daemons = Daemons()[earlier..];
+    if (output.Contains("another build") || daemons.Count != 3 || !Running(daemons[2].Pid) || !output.Contains("blaze-cs: warming up in the background"))
         Fail($"after an idle exit: expected the next command to start a daemon without a notice and build, got {daemons.Count} daemons:\n{output}");
 
     // The same handover through the native client (a build has one unless it was packed as a tool): first as
@@ -263,8 +266,8 @@ void DaemonLifecycle()
     var nativeNote = "";
     if (File.Exists(native))
     {
-        Handover(native, daemons[2].Pid, 4, new() { ["BLAZE_CS_IDLE_SECONDS"] = "5" });
-        Handover(blaze, Daemons()[3].Pid, 5, null);
+        Handover(native, daemons[2].Pid, earlier + 4, new() { ["BLAZE_CS_IDLE_SECONDS"] = "5" });
+        Handover(blaze, Daemons()[earlier + 3].Pid, earlier + 5, null);
         nativeNote = "; the same through the native client";
     }
     Console.WriteLine($"ok  daemon lifecycle: another build restarted daemon {first.Pid} as {idle.Pid}, which exited on its own after 5 s idle; the next command started {daemons[2].Pid}{nativeNote}");
@@ -277,6 +280,34 @@ void Handover(string client, int old, int expectedDaemons, Dictionary<string, st
     var daemons = Daemons();
     if (!output.Contains("blaze-cs: the running daemon is from another build") || daemons.Count != expectedDaemons || Running(old))
         Fail($"daemon handshake through {Path.GetFileName(client)}: expected a notice, daemon {old} gone and {expectedDaemons} daemons, got {daemons.Count}:\n{output}");
+}
+
+// A daemon's first command returns once the solution is loaded, and the warm-up compile finishes after it;
+// the next command waits for it and reports it. Here a build outside blaze-cs compiled Lib with a new file
+// while no daemon ran, so Lib's cached csc arguments are stale: the warm-up finds that, and the next command
+// reloads with fresh ones (dotnet build --no-incremental) before it builds.
+void WarmUpAfterFirstCommand()
+{
+    Run(blaze, "stop");
+    File.WriteAllText(Path.Combine(work, "Lib/Outside.cs"), "namespace Lib;\n\ninternal static class Outside\n{\n}\n");
+    Run("dotnet", "build Fixture.slnx -nologo -v:q -clp:ErrorsOnly");
+
+    var first = Run(blaze, "build");
+    var returned = DateTimeOffset.Now;
+    if (!first.Contains("blaze-cs: warming up in the background") || first.Contains("warmed up") || first.Contains("stale"))
+        Fail($"first command: expected it to return once loaded, before the warm-up reports:\n{first}");
+
+    var next = Run(blaze, "build");
+    var finished = Regex.Matches(ReadLog("daemon.log"), @"^(\S+) blaze-cs: warmed up in", RegexOptions.Multiline).LastOrDefault();
+    if (finished is null || DateTimeOffset.Parse(finished.Groups[1].Value) <= returned)
+        Fail($"first command: expected the warm-up to finish after it returned at {returned:O}:\n{ReadLog("daemon.log")}");
+    var warmUps = Regex.Matches(next, @"^blaze-cs: warmed up in \d+ ms; (\d+)/(\d+) assemblies identical", RegexOptions.Multiline);
+    var stale = next.IndexOf("its cached compiler arguments are stale; running dotnet build --no-incremental", StringComparison.Ordinal);
+    if (warmUps.Count != 2 || warmUps[0].Groups[1].Value == warmUps[0].Groups[2].Value || warmUps[1].Groups[1].Value != warmUps[1].Groups[2].Value
+        || !Regex.IsMatch(next, @"^blaze-cs: Lib \(net\d+\.0\): its cached", RegexOptions.Multiline)
+        || !(warmUps[0].Index < stale && stale < warmUps[1].Index) || !Regex.IsMatch(next, "^blaze-cs: up to date", RegexOptions.Multiline))
+        Fail($"next command: expected the first warm-up's report, Lib's stale arguments, a reload with every assembly identical, then a build:\n{next}");
+    Verify("warm-up after the first command", [], "reload");
 }
 
 static void CopyDirectory(string from, string to)
