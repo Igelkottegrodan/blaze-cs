@@ -66,7 +66,7 @@ static class DaemonClient
     /// as it arrives. A daemon of another build answers with its process id instead (otherBuildProcess)
     /// and exits.
     /// </summary>
-    public static int Exchange(Socket socket, string command, Guid build, out int? otherBuildProcess)
+    public static int Exchange(Socket socket, string command, Guid build, bool all, out int? otherBuildProcess)
     {
         otherBuildProcess = null;
         using var stream = new NetworkStream(socket);
@@ -74,7 +74,7 @@ static class DaemonClient
         using var reader = new StreamReader(stream);
         // Written by hand, not with JsonSerializer: reflection-based serialization costs ~30 ms of JIT at
         // start-up, and the command is one of a few fixed words.
-        writer.WriteLine($"{{\"Command\":\"{command}\",\"Build\":\"{build}\"}}");
+        writer.WriteLine($"{{\"Command\":\"{command}\",\"Build\":\"{build}\",\"All\":{(all ? "true" : "false")}}}");
         while (reader.ReadLine() is { } line)
         {
             if (line.StartsWith(ExitPrefix, StringComparison.Ordinal))

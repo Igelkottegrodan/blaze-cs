@@ -25,10 +25,15 @@ sealed class ProjectCompiler
     readonly Dictionary<string, FileStamp> _additionalFiles = new(PathComparer.Instance);
     readonly Dictionary<string, AdditionalText> _additionalTexts = new(PathComparer.Instance);
     readonly Dictionary<string, FileStamp> _inputs = new(PathComparer.Instance);
-    readonly HashSet<string> _ignoredOnDisk;
+    /// <summary>
+    /// Config and analyzer files as csc last read them, by stamp and content hash: a change means a new
+    /// unit (see <see cref="Matches"/>). A full build rewrites them unchanged, which the hash settles.
+    /// </summary>
+    readonly Dictionary<string, (FileStamp Stamp, string Hash)> _fixed = new(PathComparer.Instance);
+    HashSet<string> _ignoredOnDisk;
     /// <summary>Extensions the SDK's globs turn into additional files: .razor and .cshtml under the Razor SDK.</summary>
     readonly string[] _globbedAdditional;
-    readonly HashSet<string> _ignoredAdditionalOnDisk;
+    HashSet<string> _ignoredAdditionalOnDisk;
     readonly Func<CommandLineReference, MetadataReference> _resolveReference;
     CSharpCompilation _compilation;
     GeneratorDriver? _driver;
@@ -91,6 +96,8 @@ sealed class ProjectCompiler
         _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(PathComparer.Instance);
         foreach (var resource in ResourcePaths())
             _inputs[resource] = FileStamp.Of(resource);
+        foreach (var path in ConfigPaths.Concat(AnalyzerPaths))
+            _fixed[path] = (FileStamp.Of(path), HashOf(path));
 
         _compilation = CSharpCompilation.Create(
             _args.CompilationName,
@@ -226,6 +233,70 @@ sealed class ProjectCompiler
 
         _compilation = compilation;
         return changed;
+    }
+
+    /// <summary>
+    /// Whether this unit stands for a csc run with these arguments: the same ones, with the config and
+    /// analyzer files they name unchanged since csc read them (their contents live in this unit's options
+    /// and generator driver, not in the arguments).
+    /// </summary>
+    public bool Matches(CompileUnit unit) =>
+        Unit.Name == unit.Name && Unit.ProjectFile == unit.ProjectFile && Unit.ProjectDirectory == unit.ProjectDirectory
+        && Unit.SlowPathReason == unit.SlowPathReason
+        && Unit.Arguments.AsSpan().SequenceEqual(unit.Arguments)
+        && FixedUnchanged();
+
+    bool FixedUnchanged()
+    {
+        foreach (var (path, (stamp, hash)) in _fixed.ToList())
+        {
+            var current = FileStamp.Of(path);
+            if (current == stamp)
+                continue;
+            if (!File.Exists(path) || HashOf(path) != hash)
+                return false;
+            _fixed[path] = (current, hash); // rewritten with the same content
+        }
+        return true;
+    }
+
+    static string HashOf(string path) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)));
+
+    /// <summary>
+    /// After a real build with these arguments: csc's source list is the truth again, so a file the daemon
+    /// added that csc didn't get goes, and a source or additional file on disk that csc didn't get is one
+    /// MSBuild excludes. Then refreshes as usual. True if anything the unit compiles from changed.
+    /// </summary>
+    public bool Realign()
+    {
+        var order = new List<string>();
+        var changed = false;
+        foreach (var file in _args.SourceFiles)
+        {
+            if (!_sources.ContainsKey(file.Path))
+            {
+                if (!File.Exists(file.Path))
+                    continue;
+                _sources[file.Path] = SourceFile.Read(file.Path, this);
+                changed = true;
+            }
+            order.Add(file.Path);
+        }
+        foreach (var extra in _sources.Keys.Except(order, PathComparer.Instance).ToList())
+        {
+            _sources.Remove(extra);
+            changed = true;
+        }
+        if (changed || !order.SequenceEqual(_order, PathComparer.Instance))
+        {
+            _order.Clear();
+            _order.AddRange(order);
+            _compilation = _compilation.RemoveAllSyntaxTrees().AddSyntaxTrees(_order.Select(path => _sources[path].Tree));
+            changed = true;
+        }
+        _ignoredOnDisk = DiscoverFiles([".cs"]).Where(path => !_sources.ContainsKey(path)).ToHashSet(PathComparer.Instance);
+        _ignoredAdditionalOnDisk = DiscoverFiles(_globbedAdditional).Where(path => !_additionalFiles.ContainsKey(path)).ToHashSet(PathComparer.Instance);
+        return Refresh() | changed;
     }
 
     /// <summary>Picks up new images of the units this one references; true if any reference changed.</summary>

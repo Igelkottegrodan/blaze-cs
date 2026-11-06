@@ -11,13 +11,13 @@ namespace BlazeCs;
 /// </summary>
 static class Program
 {
-    const string Usage = "usage: blaze-cs build | test | run [-- app arguments] | stop";
+    const string Usage = "usage: blaze-cs build | test [--all] | run [-- app arguments] | stop";
 
     static int Main(string[] args)
     {
         if (args is ["daemon", var solution])
             return RunDaemon(solution);
-        if (args.Length == 0 || args[0] is not ("build" or "test" or "run" or "stop"))
+        if (args.Length == 0 || args[0] is not ("build" or "test" or "run" or "stop") || args[0] == "test" && args is not (["test"] or ["test", "--all"]))
         {
             Console.Error.WriteLine(Usage);
             return 2;
@@ -28,7 +28,7 @@ static class Program
             return 2;
 
         var command = args[0];
-        var exitCode = Send(solutionPath, command == "run" ? "build" : command);
+        var exitCode = Send(solutionPath, new Request(command == "run" ? "build" : command, Daemon.Build, All: args is ["test", "--all"]));
         if (command != "run" || exitCode != 0)
             return exitCode;
 
@@ -62,8 +62,9 @@ static class Program
         }
     }
 
-    static int Send(string solutionPath, string command)
+    static int Send(string solutionPath, Request request)
     {
+        var command = request.Command;
         var socketPath = DaemonClient.SocketPath(solutionPath);
         var socket = DaemonClient.Connect(socketPath);
         for (var restarted = false; ; restarted = true)
@@ -88,7 +89,7 @@ static class Program
 
             using (socket)
             {
-                var exitCode = DaemonClient.Exchange(socket, command, Daemon.Build, out var otherBuild);
+                var exitCode = DaemonClient.Exchange(socket, command, Daemon.Build, request.All, out var otherBuild);
                 if (otherBuild is not { } daemonProcess)
                     return exitCode;
                 if (restarted)
@@ -207,4 +208,5 @@ static class Program
     }
 }
 
-sealed record Request(string Command, Guid Build);
+/// <param name="All">For `test`: run every test project, not only those whose inputs changed.</param>
+sealed record Request(string Command, Guid Build, bool All = false);

@@ -25,7 +25,7 @@ static class Program
             return RunCli(args);
 
         // The daemon is the CLI's build, so the identity sent is the CLI's, not this executable's.
-        var exitCode = DaemonClient.Exchange(socket, command, CliBuild(), out var otherBuild);
+        var exitCode = DaemonClient.Exchange(socket, command, CliBuild(), all: false, out var otherBuild);
         if (otherBuild is not { } daemonProcess)
             return exitCode;
         // The daemon has handed over and exits; the CLI starts one of its own build.
