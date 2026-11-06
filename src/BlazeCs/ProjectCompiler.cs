@@ -428,15 +428,6 @@ sealed class ProjectCompiler
         }
     }
 
-    readonly record struct FileStamp(long Length, DateTime Modified)
-    {
-        public static FileStamp Of(string path)
-        {
-            var info = new FileInfo(path);
-            return info.Exists ? new FileStamp(info.Length, info.LastWriteTimeUtc) : default;
-        }
-    }
-
     sealed record SourceFile(string Path, FileStamp Stamp, SyntaxTree Tree)
     {
         public static SourceFile Read(string path, ProjectCompiler owner)
@@ -448,5 +439,15 @@ sealed class ProjectCompiler
             var tree = CSharpSyntaxTree.ParseText(text, owner._args.ParseOptions, path);
             return new SourceFile(path, stamp, tree);
         }
+    }
+}
+
+/// <summary>A file as of when it was read: a different length or write time means it changed.</summary>
+readonly record struct FileStamp(long Length, DateTime Modified)
+{
+    public static FileStamp Of(string path)
+    {
+        var info = new FileInfo(path);
+        return info.Exists ? new FileStamp(info.Length, info.LastWriteTimeUtc) : default;
     }
 }

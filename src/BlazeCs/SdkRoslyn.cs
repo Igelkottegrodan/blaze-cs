@@ -100,12 +100,14 @@ static class SdkRoslyn
 /// Loads analyzer assemblies (generators) one load context per directory, so each package keeps its
 /// own dependencies, while Roslyn itself and the framework stay shared with the daemon. Each assembly
 /// loads from a copy under the shadow directory: Windows locks a loaded file, and a generator project in
-/// the solution must stay buildable while the daemon holds its generator.
+/// the solution must stay buildable while the daemon holds its generator. Once a file a context copied
+/// changes, the directory gets a new context, so the new build loads.
 /// </summary>
 sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
 {
     readonly Dictionary<string, DirectoryContext> _contexts = new(PathComparer.Instance);
     readonly string _shadowDirectory;
+    int _created;
 
     /// <param name="shadowRoot">Shared by daemons of one solution; each copies into its own subdirectory
     /// and removes the ones earlier daemons left.</param>
@@ -130,8 +132,8 @@ sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
         DirectoryContext? context;
         lock (_contexts)
         {
-            if (!_contexts.TryGetValue(directory, out context))
-                _contexts[directory] = context = new DirectoryContext(directory, Path.Combine(_shadowDirectory, _contexts.Count.ToString()));
+            if (!_contexts.TryGetValue(directory, out context) || context.Stale)
+                _contexts[directory] = context = new DirectoryContext(directory, Path.Combine(_shadowDirectory, (_created++).ToString()));
         }
         return context.LoadCopy(fullPath);
     }
@@ -143,14 +145,23 @@ sealed class AnalyzerLoader : Microsoft.CodeAnalysis.IAnalyzerAssemblyLoader
 
     sealed class DirectoryContext(string directory, string shadow) : AssemblyLoadContext($"analyzers:{directory}")
     {
+        readonly Dictionary<string, FileStamp> _copied = new(PathComparer.Instance);
+
+        /// <summary>Whether a file it copied has changed since.</summary>
+        public bool Stale
+        {
+            get { lock (_copied) return _copied.Any(entry => FileStamp.Of(entry.Key) != entry.Value); }
+        }
+
         public Assembly LoadCopy(string path)
         {
             var copy = Path.Combine(shadow, Path.GetFileName(path));
-            lock (this)
+            lock (_copied)
             {
-                if (!File.Exists(copy))
+                if (!_copied.ContainsKey(path))
                 {
                     Directory.CreateDirectory(shadow);
+                    _copied[path] = FileStamp.Of(path);
                     File.Copy(path, copy);
                 }
             }
