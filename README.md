@@ -147,6 +147,10 @@ its own:
   `.blaze-cs/daemon.log` says why. The assemblies on disk are still what `dotnet build` makes. Limits:
   - Static state carries over from one hot reloaded run to the next, which `dotnet test` starts fresh, so
     tests that depend on it can pass or fail where `dotnet test` doesn't ([#129](https://github.com/Igelkottegrodan/blaze-cs/issues/129)).
+    That includes statics computed by code an edit changed: a `static readonly` field whose initializer
+    calls an edited method, a `Lazy<T>` whose lambda was edited, a cache filled before the edit. They keep
+    the value the old code computed. So a hot reloaded run's summary line ends in `(hot reloaded)`, and its
+    pass doesn't count: the next `test` runs that project again in a new host, even with nothing changed.
   - A delta to a project output the tests hadn't loaded yet loads it from the daemon's copy in
     `.blaze-cs/hotreload/`, so its `Assembly.Location` is that copy, not the `bin/` file.
   - Not on Windows yet: a host that stays up would keep the project outputs it loaded locked.

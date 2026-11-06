@@ -23,6 +23,9 @@ public class WelcomeTests
     public void ReadsGreeting() => Assert.Equal("Hello", Lib.Salutation.Greeting());
 
     [Fact]
+    public void Computes() => Assert.Equal(1, Lib.Salutation.Value);
+
+    [Fact]
     public void RunsOnTargetRuntime() => Assert.Equal(
         typeof(WelcomeTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>().Single(a => a.Key == "TargetRuntimeMajor").Value,
         Environment.Version.Major.ToString());

@@ -13,10 +13,11 @@ namespace BlazeCs;
 //    - Update (TestHostUpdate): the host applies each delta to the assembly whose module version id it
 //      names (loading it from the delta's baseline if the tests haven't loaded it), with
 //      MetadataUpdater.ApplyUpdate, then runs the same test assembly again with a new runner (so the
-//      framework discovers its tests anew) and reports a result, back to 2. An update without deltas runs
-//      the tests again as they are. A delta it can't apply ends it: that result has Unsupported and
-//      CannotHotReload set, and ran nothing. An assembly loaded from a baseline has the baseline's
-//      Assembly.Location (the daemon's copy), not the path the tests would have loaded it from.
+//      framework discovers its tests anew) and reports a result, back to 2. A delta it can't apply ends
+//      it: that result has Unsupported and CannotHotReload set, and ran nothing. So does an update without
+//      deltas: the daemon runs unchanged tests in a new host, where their statics start anew. An assembly
+//      loaded from a baseline has the baseline's Assembly.Location (the daemon's copy), not the path the
+//      tests would have loaded it from.
 //    - Exit (TestHostExit): the host exits.
 //    Otherwise CannotHotReload says why, and the host exits after that one run, as hosts always did.
 // A line the host can't read, or a message out of turn, gets a result with Error and CannotHotReload set
@@ -47,7 +48,7 @@ abstract record TestHostMessage;
 /// <summary>What a test host runs: a framework (xunit3, xunit2, nunit, mstest), an assembly, and the .runsettings it applies, if any.</summary>
 sealed record TestHostRequest(string Framework, string Assembly, string? RunSettings) : TestHostMessage;
 
-/// <summary>Deltas to apply, in order, before the host runs its test assembly again; none runs the tests again as they are.</summary>
+/// <summary>Deltas to apply, in order, before the host runs its test assembly again; at least one.</summary>
 sealed record TestHostUpdate(TestHostDelta[] Deltas) : TestHostMessage;
 
 /// <summary>Ends a host that waits for an update.</summary>

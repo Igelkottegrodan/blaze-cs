@@ -69,6 +69,22 @@ public class HotReloadTests
         Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the host should exit after a failed update");
     }
 
+    // The daemon runs unchanged tests in a new host, not as an update without deltas: the old host keeps the
+    // statics their last run left.
+    [Fact]
+    public void AnUpdateWithoutDeltasRunsNothingAndEndsTheHost()
+    {
+        using var subject = new Subject("xunit3");
+        using var host = new Host(hotReload: true);
+        Assert.Null(host.Send(subject.Run).CannotHotReload);
+
+        var result = host.Send(new TestHostUpdate([]));
+        Assert.Equal(0, result.Total);
+        Assert.Contains("it has no deltas", result.Unsupported);
+        Assert.NotNull(result.CannotHotReload);
+        Assert.True(host.Process.WaitForExit(TimeSpan.FromSeconds(30)), "the host should exit after a failed update");
+    }
+
     /// <summary>
     /// A host's work ends with the exit message, with stdin closing while it waits for an update, or with its
     /// one run when it can't hot reload, and then the process ends too: a foreground thread a test started

@@ -129,14 +129,20 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
     readonly ConcurrentDictionary<string, TimeSpan> _lastDuration = new(PathComparer.Instance);
 
     /// <summary>
-    /// Each test project's last run in this daemon, by assembly, if it passed: the inputs it ran with and
-    /// its result. A project without one (never run here, or it failed) runs next time.
+    /// Each test project's last run in this daemon, by assembly, if it passed in a new host: the inputs it ran
+    /// with and its result. A project without one (never run here, it failed, or its pass was hot reloaded) runs
+    /// next time. A hot reloaded pass doesn't count: statics its tests read may have been computed by code
+    /// edited since (a static readonly field's initializer calling it, a Lazy, a cache), so the next run checks
+    /// it in a new host, where they start anew.
     /// </summary>
     readonly ConcurrentDictionary<string, (string Inputs, string Result)> _passed = new(PathComparer.Instance);
     readonly ConcurrentDictionary<string, (FileStamp Stamp, string Hash)> _hashes = new(PathComparer.Instance);
 
-    /// <summary>What a test run reports: whether it passed, and in a few words for the next unchanged run.</summary>
-    readonly record struct Outcome(bool Passed, string Result);
+    /// <summary>
+    /// What a test run reports: whether it passed, in a few words for the next unchanged run, and whether it
+    /// ran in a host that took the edit as a delta.
+    /// </summary>
+    readonly record struct Outcome(bool Passed, string Result, bool HotReloaded = false);
 
     /// <param name="all">Run every test project, not only those whose inputs changed since they passed.</param>
     public int Run(bool all, Action<string> log)
@@ -164,12 +170,13 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         var failed = 0;
         void Record(ProjectCompiler unit, Outcome outcome)
         {
-            if (outcome.Passed)
+            if (outcome is { Passed: true, HotReloaded: false })
                 _passed[unit.Unit.AssemblyPath] = (inputs[unit], outcome.Result);
             else
             {
                 _passed.TryRemove(unit.Unit.AssemblyPath, out _);
-                Interlocked.Increment(ref failed);
+                if (!outcome.Passed)
+                    Interlocked.Increment(ref failed);
             }
         }
 
@@ -311,8 +318,11 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         return Report(assembly, result, stopwatch, output, log);
     }
 
-    /// <summary>Logs a host's run of a test assembly in one piece, as `dotnet test` reports it; null if it ran no tests.</summary>
-    Outcome? Report(string assembly, TestHostResult result, Stopwatch stopwatch, List<string> output, Action<string> log)
+    /// <summary>
+    /// Logs a host's run of a test assembly in one piece, as `dotnet test` reports it, with "(hot reloaded)" after
+    /// the summary of a run in a host that took the edit as a delta; null if it ran no tests.
+    /// </summary>
+    Outcome? Report(string assembly, TestHostResult result, Stopwatch stopwatch, List<string> output, Action<string> log, bool hotReloaded = false)
     {
         _lastDuration[assembly] = stopwatch.Elapsed;
         var name = Path.GetFileName(assembly);
@@ -334,10 +344,10 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
         // As `dotnet test` labels it: a run that only skipped tests is "Skipped!".
         var label = !passed ? "Failed!" : result is { Passed: 0, Skipped: > 0 } ? "Skipped!" : "Passed!";
         output.Add($"{label}  - Failed: {result.Failed,5}, Passed: {result.Passed,5}, Skipped: {result.Skipped,5}, "
-            + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}");
+            + $"Total: {result.Total,5}, Duration: {stopwatch.ElapsedMilliseconds} ms - {name}{(hotReloaded ? " (hot reloaded)" : "")}");
         lock (_hostConfigs)
             output.ForEach(log);
-        return new Outcome(passed, result.Skipped > 0 ? $"{result.Passed} passed, {result.Skipped} skipped" : $"{result.Passed} passed");
+        return new Outcome(passed, result.Skipped > 0 ? $"{result.Passed} passed, {result.Skipped} skipped" : $"{result.Passed} passed", hotReloaded);
     }
 
     /// <summary>
@@ -377,7 +387,7 @@ sealed class TestRunner(SolutionBuilder builder) : IDisposable
                     }
                     else
                         End(live);
-                    return Report(request.Assembly, result, stopwatch, output, log);
+                    return Report(request.Assembly, result, stopwatch, output, log, hotReloaded: true);
                 }
             }
         }

@@ -321,6 +321,8 @@ static partial class Program
     /// </summary>
     static string? Apply(TestHostUpdate update, TestContext context)
     {
+        if (update.Deltas.Length == 0)
+            return "the test host couldn't apply the update: it has no deltas";
         List<Type>? updatedTypes = [];
         try
         {
