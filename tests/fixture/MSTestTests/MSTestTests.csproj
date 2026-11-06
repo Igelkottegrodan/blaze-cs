@@ -1,7 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <RunSettingsFilePath>$(MSBuildProjectDirectory)/test.runsettings</RunSettingsFilePath>
-  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="MSTest" Version="4.5.2" />
   </ItemGroup>

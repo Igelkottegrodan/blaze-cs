@@ -1,0 +1,8 @@
+<Project>
+  <!-- A shared .runsettings, set from a Directory.Build.props as a repo does for several test projects: neither
+       this project's file nor its directory names it. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+  <PropertyGroup>
+    <RunSettingsFilePath>$(MSBuildThisFileDirectory)../settings/shared.runsettings</RunSettingsFilePath>
+  </PropertyGroup>
+</Project>

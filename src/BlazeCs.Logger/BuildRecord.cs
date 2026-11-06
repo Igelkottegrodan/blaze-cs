@@ -10,7 +10,9 @@ sealed record BuildRecord(List<CompileRecord> Compiles, List<ProjectRecord> Comp
 
 /// <summary>A project, or one target framework of it.</summary>
 /// <param name="TargetFramework">The TargetFramework global property: set for each framework of a multi-targeting project.</param>
-sealed record ProjectRecord(string ProjectFile, string? TargetFramework);
+/// <param name="RunSettingsFilePath">The project's evaluated RunSettingsFilePath, the .runsettings `dotnet test`
+/// applies, as a full path; null when it is empty.</param>
+sealed record ProjectRecord(string ProjectFile, string? TargetFramework, string? RunSettingsFilePath);
 
 /// <summary>One csc run: a project, or one target framework of it.</summary>
 /// <param name="TargetFramework">The TargetFramework global property: set for each framework of a multi-targeting project.</param>
